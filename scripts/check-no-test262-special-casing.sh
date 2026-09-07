@@ -153,7 +153,7 @@ case $hash_status in
         : > "$unexpected_hashes"
         while IFS= read -r occurrence; do
             case $occurrence in
-                src/unicode_*"$unicode_source_sha"*) ;;
+                src/unicode_*"$unicode_source_sha"*|src/generated/unicode/unicode_*"$unicode_source_sha"*) ;;
                 *) printf '%s\n' "$occurrence" >> "$unexpected_hashes" ;;
             esac
         done <<< "$hash_output"

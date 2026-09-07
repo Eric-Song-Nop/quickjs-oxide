@@ -6,7 +6,7 @@
 //! regeneration oracle.
 
 mod tables {
-    include!("unicode_property_tables.rs");
+    include!("generated/unicode/unicode_property_tables.rs");
 }
 
 fn lookup<'a>(aliases: &[(&str, u16)], ranges: &'a [&'a [u32]], name: &str) -> Option<&'a [u32]> {

@@ -6,7 +6,7 @@
 //! the pinned engine's exact table boundaries.
 
 mod ident_tables {
-    include!("unicode_ident_tables.rs");
+    include!("generated/unicode/unicode_ident_tables.rs");
 }
 
 const INDEX_BLOCK_LEN: usize = 32;

@@ -14,7 +14,7 @@ fi
 source_dir=$1
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$script_dir/.." && pwd)
-output_file=${2:-"$root/src/unicode_property_tables.rs"}
+output_file=${2:-"$root/src/generated/unicode/unicode_property_tables.rs"}
 helper=$root/tests/fixtures/inputs/dump_unicode_properties.c
 
 sha256_file() {

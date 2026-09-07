@@ -12,7 +12,7 @@ use std::cell::Cell;
 use crate::value::{JsString, JsStringError};
 
 mod tables {
-    include!("unicode_case_tables.rs");
+    include!("generated/unicode/unicode_case_tables.rs");
 }
 
 const RUN_TYPE_U: u32 = 0;

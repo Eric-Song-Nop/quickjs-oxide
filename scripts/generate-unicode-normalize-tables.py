@@ -35,6 +35,8 @@ def parse_args() -> argparse.Namespace:
         type=pathlib.Path,
         default=pathlib.Path(__file__).resolve().parent.parent
         / "src"
+        / "generated"
+        / "unicode"
         / "unicode_normalize_tables.rs",
     )
     return parser.parse_args()

@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use crate::value::{JsString, JsStringError};
 
 mod tables {
-    include!("unicode_normalize_tables.rs");
+    include!("generated/unicode/unicode_normalize_tables.rs");
 }
 
 const INDEX_BLOCK_LEN: usize = 32;
