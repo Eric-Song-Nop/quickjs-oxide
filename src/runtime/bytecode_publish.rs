@@ -12,9 +12,11 @@ use crate::bytecode::{
     DynamicEnvironmentSource, EvalVariableSource, Instruction, MAX_LOCAL_SLOTS, WithObjectSource,
     verify_parts,
 };
+use crate::function::metadata::{
+    EvalBinding, EvalCallerProfile, EvalCallerVariableTarget, EvalKind, EvalRootBinding, EvalScope,
+};
 use crate::heap::{
-    EvalBinding, EvalCallerProfile, EvalCallerVariableTarget, EvalEnvironmentPhaseContext,
-    EvalKind, EvalRootBinding, EvalScope, parameter_initializer_visible_locals,
+    EvalEnvironmentPhaseContext, parameter_initializer_visible_locals,
     validate_class_initializer_bytecode_layout, validate_derived_constructor_bytecode_layout,
     validate_eval_environment_phase_layout, validate_parameter_bytecode_layout,
     validate_parameter_initializer_scope_layout, validate_pattern_parameter_bytecode_layout,
@@ -347,34 +349,40 @@ fn verify_eval_super_pseudo_bindings(
         }
         seen_roles[role_index] = true;
         let authenticated = match (role, binding.source) {
-            (SuperPseudoRole::DerivedThis, crate::heap::EvalBindingSource::Local(index)) => {
-                derived_this_local == Some(index)
-            }
-            (SuperPseudoRole::ActiveFunction, crate::heap::EvalBindingSource::Local(index)) => {
-                active_function_local == Some(index)
-            }
-            (SuperPseudoRole::NewTarget, crate::heap::EvalBindingSource::Local(index)) => {
-                new_target_local == Some(index)
-            }
-            (SuperPseudoRole::DerivedThis, crate::heap::EvalBindingSource::Closure(index)) => {
-                derived_this_origins
-                    .get(usize::from(index))
-                    .copied()
-                    .unwrap_or(false)
-            }
-            (SuperPseudoRole::ActiveFunction, crate::heap::EvalBindingSource::Closure(index)) => {
-                active_function_origins
-                    .get(usize::from(index))
-                    .copied()
-                    .unwrap_or(false)
-            }
-            (SuperPseudoRole::NewTarget, crate::heap::EvalBindingSource::Closure(index)) => {
-                new_target_origins
-                    .get(usize::from(index))
-                    .copied()
-                    .unwrap_or(false)
-            }
-            (_, crate::heap::EvalBindingSource::Argument(_)) => false,
+            (
+                SuperPseudoRole::DerivedThis,
+                crate::function::metadata::EvalBindingSource::Local(index),
+            ) => derived_this_local == Some(index),
+            (
+                SuperPseudoRole::ActiveFunction,
+                crate::function::metadata::EvalBindingSource::Local(index),
+            ) => active_function_local == Some(index),
+            (
+                SuperPseudoRole::NewTarget,
+                crate::function::metadata::EvalBindingSource::Local(index),
+            ) => new_target_local == Some(index),
+            (
+                SuperPseudoRole::DerivedThis,
+                crate::function::metadata::EvalBindingSource::Closure(index),
+            ) => derived_this_origins
+                .get(usize::from(index))
+                .copied()
+                .unwrap_or(false),
+            (
+                SuperPseudoRole::ActiveFunction,
+                crate::function::metadata::EvalBindingSource::Closure(index),
+            ) => active_function_origins
+                .get(usize::from(index))
+                .copied()
+                .unwrap_or(false),
+            (
+                SuperPseudoRole::NewTarget,
+                crate::function::metadata::EvalBindingSource::Closure(index),
+            ) => new_target_origins
+                .get(usize::from(index))
+                .copied()
+                .unwrap_or(false),
+            (_, crate::function::metadata::EvalBindingSource::Argument(_)) => false,
         };
         if !authenticated {
             return Err(RuntimeError::Engine(Error::internal(
@@ -581,8 +589,8 @@ fn verify_eval_scope_topology(
             .position(|scope| {
                 matches!(
                     scope.kind,
-                    crate::heap::EvalScopeKind::FunctionRoot
-                        | crate::heap::EvalScopeKind::Parameter
+                    crate::function::metadata::EvalScopeKind::FunctionRoot
+                        | crate::function::metadata::EvalScopeKind::Parameter
                 )
             })
             .map(|offset| segment_start + offset)
@@ -597,11 +605,11 @@ fn verify_eval_scope_topology(
         let synthetic_root_segment = synthetic_eval_tree && segment_count == function_depth;
         let imported_segment = synthetic_eval_tree && segment_start >= imported_scope_start;
         match environment.scopes[function_anchor].kind {
-            crate::heap::EvalScopeKind::FunctionRoot => {
+            crate::function::metadata::EvalScopeKind::FunctionRoot => {
                 let expected_body = if final_segment || synthetic_root_segment {
-                    crate::heap::EvalScopeKind::ProgramBody
+                    crate::function::metadata::EvalScopeKind::ProgramBody
                 } else {
-                    crate::heap::EvalScopeKind::FunctionBody
+                    crate::function::metadata::EvalScopeKind::FunctionBody
                 };
                 if function_anchor == segment_start
                     || (!imported_segment
@@ -609,8 +617,8 @@ fn verify_eval_scope_topology(
                     || (imported_segment
                         && !matches!(
                             environment.scopes[function_anchor - 1].kind,
-                            crate::heap::EvalScopeKind::FunctionBody
-                                | crate::heap::EvalScopeKind::ProgramBody
+                            crate::function::metadata::EvalScopeKind::FunctionBody
+                                | crate::function::metadata::EvalScopeKind::ProgramBody
                         ))
                 {
                     return Err(RuntimeError::Engine(Error::internal(format!(
@@ -622,15 +630,15 @@ fn verify_eval_scope_topology(
                     ))));
                 }
             }
-            crate::heap::EvalScopeKind::Parameter => {
+            crate::function::metadata::EvalScopeKind::Parameter => {
                 if synthetic_root_segment
                     || environment.scopes[segment_start..function_anchor]
                         .iter()
                         .any(|scope| {
                             matches!(
                                 scope.kind,
-                                crate::heap::EvalScopeKind::FunctionBody
-                                    | crate::heap::EvalScopeKind::ProgramBody
+                                crate::function::metadata::EvalScopeKind::FunctionBody
+                                    | crate::function::metadata::EvalScopeKind::ProgramBody
                             )
                         })
                 {
@@ -642,7 +650,7 @@ fn verify_eval_scope_topology(
             _ => unreachable!("function anchor kind was selected above"),
         }
         let body_exclusive_end = if environment.scopes[function_anchor].kind
-            == crate::heap::EvalScopeKind::FunctionRoot
+            == crate::function::metadata::EvalScopeKind::FunctionRoot
         {
             function_anchor.saturating_sub(1)
         } else {
@@ -653,10 +661,10 @@ fn verify_eval_scope_topology(
             .any(|scope| {
                 matches!(
                     scope.kind,
-                    crate::heap::EvalScopeKind::FunctionRoot
-                        | crate::heap::EvalScopeKind::Parameter
-                        | crate::heap::EvalScopeKind::FunctionBody
-                        | crate::heap::EvalScopeKind::ProgramBody
+                    crate::function::metadata::EvalScopeKind::FunctionRoot
+                        | crate::function::metadata::EvalScopeKind::Parameter
+                        | crate::function::metadata::EvalScopeKind::FunctionBody
+                        | crate::function::metadata::EvalScopeKind::ProgramBody
                 )
             })
         {
@@ -672,17 +680,20 @@ fn verify_eval_scope_topology(
             let source_matches_segment = if segment_count == 0 && module_root {
                 matches!(
                     binding.source,
-                    crate::heap::EvalBindingSource::Local(_)
-                        | crate::heap::EvalBindingSource::Closure(_)
+                    crate::function::metadata::EvalBindingSource::Local(_)
+                        | crate::function::metadata::EvalBindingSource::Closure(_)
                 )
             } else if segment_count == 0 {
                 matches!(
                     binding.source,
-                    crate::heap::EvalBindingSource::Local(_)
-                        | crate::heap::EvalBindingSource::Argument(_)
+                    crate::function::metadata::EvalBindingSource::Local(_)
+                        | crate::function::metadata::EvalBindingSource::Argument(_)
                 )
             } else {
-                matches!(binding.source, crate::heap::EvalBindingSource::Closure(_))
+                matches!(
+                    binding.source,
+                    crate::function::metadata::EvalBindingSource::Closure(_)
+                )
             };
             if !source_matches_segment {
                 return Err(RuntimeError::Engine(Error::internal(
@@ -766,7 +777,8 @@ fn verify_eval_imported_suffix(
                     "eval imported binding metadata disagrees with its caller profile",
                 )));
             }
-            let crate::heap::EvalBindingSource::Closure(closure) = actual.source else {
+            let crate::function::metadata::EvalBindingSource::Closure(closure) = actual.source
+            else {
                 return Err(RuntimeError::Engine(Error::internal(
                     "eval imported binding did not use a closure relay",
                 )));
@@ -791,8 +803,8 @@ fn verify_eval_imported_suffix(
             .filter(|kind| {
                 matches!(
                     **kind,
-                    crate::heap::EvalScopeKind::FunctionRoot
-                        | crate::heap::EvalScopeKind::Parameter
+                    crate::function::metadata::EvalScopeKind::FunctionRoot
+                        | crate::function::metadata::EvalScopeKind::Parameter
                 )
             })
             .count(),
@@ -857,7 +869,7 @@ fn verify_eval_environments(
             ))
         })?;
         match environment.variable_environment {
-            crate::heap::EvalVariableEnvironment::Global => {
+            crate::function::metadata::EvalVariableEnvironment::Global => {
                 // Authored Script code always resolves its caller variable
                 // environment through the global Program segment, even when
                 // the Script itself is strict. A synthetic strict eval root
@@ -876,18 +888,20 @@ fn verify_eval_environments(
                     .find(|scope| {
                         matches!(
                             scope.kind,
-                            crate::heap::EvalScopeKind::FunctionBody
-                                | crate::heap::EvalScopeKind::ProgramBody
+                            crate::function::metadata::EvalScopeKind::FunctionBody
+                                | crate::function::metadata::EvalScopeKind::ProgramBody
                         )
                     })
-                    .is_none_or(|scope| scope.kind != crate::heap::EvalScopeKind::ProgramBody)
+                    .is_none_or(|scope| {
+                        scope.kind != crate::function::metadata::EvalScopeKind::ProgramBody
+                    })
                 {
                     return Err(RuntimeError::Engine(Error::internal(
                         "global eval variable environment has no current Program body scope",
                     )));
                 }
             }
-            crate::heap::EvalVariableEnvironment::StrictLocal(index) => {
+            crate::function::metadata::EvalVariableEnvironment::StrictLocal(index) => {
                 if !environment.caller_strict || index != first_function_anchor {
                     return Err(RuntimeError::Engine(Error::internal(
                         "strict eval variable environment has the wrong function anchor",
@@ -904,15 +918,18 @@ fn verify_eval_environments(
                 let anchor = &environment.scopes[usize::from(index)];
                 if !matches!(
                     anchor.kind,
-                    crate::heap::EvalScopeKind::FunctionRoot
-                        | crate::heap::EvalScopeKind::Parameter
+                    crate::function::metadata::EvalScopeKind::FunctionRoot
+                        | crate::function::metadata::EvalScopeKind::Parameter
                 ) {
                     return Err(RuntimeError::Engine(Error::internal(
                         "strict eval variable environment selected a non-function scope",
                     )));
                 }
             }
-            crate::heap::EvalVariableEnvironment::VariableObject { scope, source } => {
+            crate::function::metadata::EvalVariableEnvironment::VariableObject {
+                scope,
+                source,
+            } => {
                 if environment.caller_strict {
                     return Err(RuntimeError::Engine(Error::internal(
                         "strict eval environment selected a variable object",
@@ -921,10 +938,16 @@ fn verify_eval_environments(
                 let target_matches_function_segment = if synthetic_eval_root {
                     function.metadata().eval_kind == EvalKind::Direct
                         && usize::from(scope) >= imported_scope_start
-                        && matches!(source, crate::heap::EvalBindingSource::Closure(_))
+                        && matches!(
+                            source,
+                            crate::function::metadata::EvalBindingSource::Closure(_)
+                        )
                 } else {
                     scope == first_function_anchor
-                        && matches!(source, crate::heap::EvalBindingSource::Local(_))
+                        && matches!(
+                            source,
+                            crate::function::metadata::EvalBindingSource::Local(_)
+                        )
                 };
                 if !target_matches_function_segment {
                     return Err(RuntimeError::Engine(Error::internal(
@@ -937,10 +960,10 @@ fn verify_eval_environments(
                     ))
                 })?;
                 let expected_kind = match target_scope.kind {
-                    crate::heap::EvalScopeKind::FunctionRoot => {
+                    crate::function::metadata::EvalScopeKind::FunctionRoot => {
                         ClosureVariableKind::EvalVariableObject
                     }
-                    crate::heap::EvalScopeKind::Parameter => {
+                    crate::function::metadata::EvalScopeKind::Parameter => {
                         ClosureVariableKind::ArgEvalVariableObject
                     }
                     _ => {
@@ -949,29 +972,31 @@ fn verify_eval_environments(
                         )));
                     }
                 };
-                if matches!(source, crate::heap::EvalBindingSource::Argument(_))
-                    || target_scope
-                        .bindings
-                        .iter()
-                        .filter(|binding| {
-                            binding.source == source
-                                && binding.kind == expected_kind
-                                && !binding.is_lexical
-                                && !binding.is_const
-                                && !binding.is_catch_parameter
-                        })
-                        .count()
-                        != 1
+                if matches!(
+                    source,
+                    crate::function::metadata::EvalBindingSource::Argument(_)
+                ) || target_scope
+                    .bindings
+                    .iter()
+                    .filter(|binding| {
+                        binding.source == source
+                            && binding.kind == expected_kind
+                            && !binding.is_lexical
+                            && !binding.is_const
+                            && !binding.is_catch_parameter
+                    })
+                    .count()
+                    != 1
                 {
                     return Err(RuntimeError::Engine(Error::internal(
                         "eval variable-object target is not exact",
                     )));
                 }
                 match source {
-                    crate::heap::EvalBindingSource::Local(index)
+                    crate::function::metadata::EvalBindingSource::Local(index)
                         if eval_variable_object_local_kind(function, index)
                             == Some(expected_kind) => {}
-                    crate::heap::EvalBindingSource::Closure(index) => {
+                    crate::function::metadata::EvalBindingSource::Closure(index) => {
                         let descriptor = function
                             .closure_variables()
                             .get(usize::from(index))
@@ -989,8 +1014,8 @@ fn verify_eval_environments(
                             )));
                         }
                     }
-                    crate::heap::EvalBindingSource::Local(_)
-                    | crate::heap::EvalBindingSource::Argument(_) => {
+                    crate::function::metadata::EvalBindingSource::Local(_)
+                    | crate::function::metadata::EvalBindingSource::Argument(_) => {
                         return Err(RuntimeError::Engine(Error::internal(
                             "eval variable-object source is not authenticated",
                         )));
@@ -1006,7 +1031,7 @@ fn verify_eval_environments(
             let variable_target_matches = if function.metadata().strict {
                 matches!(
                     environment.variable_environment,
-                    crate::heap::EvalVariableEnvironment::StrictLocal(actual)
+                    crate::function::metadata::EvalVariableEnvironment::StrictLocal(actual)
                         if actual == first_function_anchor
                 )
             } else {
@@ -1016,12 +1041,12 @@ fn verify_eval_environments(
                 ) {
                     (
                         EvalCallerVariableTarget::Global,
-                        crate::heap::EvalVariableEnvironment::Global,
+                        crate::function::metadata::EvalVariableEnvironment::Global,
                     ) => true,
                     (
                         EvalCallerVariableTarget::ExternalBinding(expected),
-                        crate::heap::EvalVariableEnvironment::VariableObject {
-                            source: crate::heap::EvalBindingSource::Closure(actual),
+                        crate::function::metadata::EvalVariableEnvironment::VariableObject {
+                            source: crate::function::metadata::EvalBindingSource::Closure(actual),
                             ..
                         },
                     ) => {
@@ -1039,7 +1064,9 @@ fn verify_eval_environments(
         }
 
         for scope in &environment.scopes {
-            if scope.kind == crate::heap::EvalScopeKind::With && scope.bindings.len() != 1 {
+            if scope.kind == crate::function::metadata::EvalScopeKind::With
+                && scope.bindings.len() != 1
+            {
                 return Err(RuntimeError::Engine(Error::internal(
                     "eval with scope does not contain exactly one object binding",
                 )));
@@ -1050,8 +1077,8 @@ fn verify_eval_environments(
                         "eval binding has an empty name",
                     )));
                 }
-                let is_catch_scope = scope.kind == crate::heap::EvalScopeKind::Catch;
-                let is_with_scope = scope.kind == crate::heap::EvalScopeKind::With;
+                let is_catch_scope = scope.kind == crate::function::metadata::EvalScopeKind::Catch;
+                let is_with_scope = scope.kind == crate::function::metadata::EvalScopeKind::With;
                 if binding.is_catch_parameter
                     && (!is_catch_scope
                         || !binding.is_lexical
@@ -1070,7 +1097,7 @@ fn verify_eval_environments(
                             || binding.name.utf16_units().ne("<with>".encode_utf16())
                             || matches!(
                                 binding.source,
-                                crate::heap::EvalBindingSource::Argument(_)
+                                crate::function::metadata::EvalBindingSource::Argument(_)
                             )))
                 {
                     return Err(RuntimeError::Engine(Error::internal(
@@ -1079,8 +1106,8 @@ fn verify_eval_environments(
                 }
                 if binding.kind.is_eval_variable_object() {
                     let role_allowed = match scope.kind {
-                        crate::heap::EvalScopeKind::FunctionRoot => true,
-                        crate::heap::EvalScopeKind::Parameter => {
+                        crate::function::metadata::EvalScopeKind::FunctionRoot => true,
+                        crate::function::metadata::EvalScopeKind::Parameter => {
                             binding.kind == ClosureVariableKind::ArgEvalVariableObject
                         }
                         _ => false,
@@ -1089,7 +1116,10 @@ fn verify_eval_environments(
                         || binding.is_lexical
                         || binding.is_const
                         || binding.is_catch_parameter
-                        || matches!(binding.source, crate::heap::EvalBindingSource::Argument(_))
+                        || matches!(
+                            binding.source,
+                            crate::function::metadata::EvalBindingSource::Argument(_)
+                        )
                         || eval_variable_object_sentinel(binding.kind).is_none_or(|sentinel| {
                             binding.name.utf16_units().ne(sentinel.encode_utf16())
                         })
@@ -1100,7 +1130,7 @@ fn verify_eval_environments(
                     }
                 }
                 let expected = match binding.source {
-                    crate::heap::EvalBindingSource::Local(index) => {
+                    crate::function::metadata::EvalBindingSource::Local(index) => {
                         let definition = function
                             .local_definitions()
                             .get(usize::from(index))
@@ -1123,7 +1153,7 @@ fn verify_eval_environments(
                         *captured = true;
                         (definition.is_lexical, definition.is_const, definition.kind)
                     }
-                    crate::heap::EvalBindingSource::Argument(index) => {
+                    crate::function::metadata::EvalBindingSource::Argument(index) => {
                         let definition = function
                             .argument_definitions()
                             .get(usize::from(index))
@@ -1139,7 +1169,7 @@ fn verify_eval_environments(
                         }
                         (definition.is_lexical, definition.is_const, definition.kind)
                     }
-                    crate::heap::EvalBindingSource::Closure(index) => {
+                    crate::function::metadata::EvalBindingSource::Closure(index) => {
                         let descriptor = function
                             .closure_variables()
                             .get(usize::from(index))
@@ -1798,12 +1828,14 @@ pub(in crate::runtime) fn verify_unlinked_eval_tree(
         .map(|binding| usize::from(binding.scope) + 1)
         .max()
         .unwrap_or(0);
-    let mut scope_kinds = vec![crate::heap::EvalScopeKind::FunctionRoot; scope_count];
+    let mut scope_kinds = vec![crate::function::metadata::EvalScopeKind::FunctionRoot; scope_count];
     for binding in expected_bindings {
         if binding.kind == ClosureVariableKind::WithObject {
-            scope_kinds[usize::from(binding.scope)] = crate::heap::EvalScopeKind::With;
+            scope_kinds[usize::from(binding.scope)] =
+                crate::function::metadata::EvalScopeKind::With;
         } else if binding.is_catch_parameter {
-            scope_kinds[usize::from(binding.scope)] = crate::heap::EvalScopeKind::Catch;
+            scope_kinds[usize::from(binding.scope)] =
+                crate::function::metadata::EvalScopeKind::Catch;
         }
     }
     for (scope, scope_kind) in scope_kinds.iter_mut().enumerate() {
@@ -1816,7 +1848,7 @@ pub(in crate::runtime) fn verify_unlinked_eval_tree(
                 && binding.kind == ClosureVariableKind::EvalVariableObject
         });
         if has_parameter_object && !has_body_object {
-            *scope_kind = crate::heap::EvalScopeKind::Parameter;
+            *scope_kind = crate::function::metadata::EvalScopeKind::Parameter;
         }
     }
     let variable_target = if caller_strict {
@@ -1922,9 +1954,10 @@ pub(in crate::runtime) fn verify_unlinked_eval_tree_with_profile_and_arguments(
                 "eval root binding disagrees with its caller scope profile",
             )));
         };
-        if (binding.is_catch_parameter && scope_kind != crate::heap::EvalScopeKind::Catch)
+        if (binding.is_catch_parameter
+            && scope_kind != crate::function::metadata::EvalScopeKind::Catch)
             || (binding.kind == ClosureVariableKind::WithObject)
-                != (scope_kind == crate::heap::EvalScopeKind::With)
+                != (scope_kind == crate::function::metadata::EvalScopeKind::With)
         {
             return Err(RuntimeError::Engine(Error::internal(
                 "eval root binding disagrees with its caller scope profile",
@@ -1946,8 +1979,8 @@ pub(in crate::runtime) fn verify_unlinked_eval_tree_with_profile_and_arguments(
         }
         if binding.kind.is_eval_variable_object() {
             let role_allowed = match scope_kind {
-                crate::heap::EvalScopeKind::FunctionRoot => true,
-                crate::heap::EvalScopeKind::Parameter => {
+                crate::function::metadata::EvalScopeKind::FunctionRoot => true,
+                crate::function::metadata::EvalScopeKind::Parameter => {
                     binding.kind == ClosureVariableKind::ArgEvalVariableObject
                 }
                 _ => false,
@@ -1985,7 +2018,7 @@ pub(in crate::runtime) fn verify_unlinked_eval_tree_with_profile_and_arguments(
         .iter()
         .enumerate()
         .any(|(scope, kind)| {
-            *kind == crate::heap::EvalScopeKind::With
+            *kind == crate::function::metadata::EvalScopeKind::With
                 && expected_bindings
                     .iter()
                     .filter(|binding| usize::from(binding.scope) == scope)
@@ -2011,10 +2044,10 @@ pub(in crate::runtime) fn verify_unlinked_eval_tree_with_profile_and_arguments(
                         .scope_kinds
                         .get(usize::from(binding.scope))
                         .is_some_and(|scope_kind| match scope_kind {
-                            crate::heap::EvalScopeKind::FunctionRoot => {
+                            crate::function::metadata::EvalScopeKind::FunctionRoot => {
                                 binding.kind == ClosureVariableKind::EvalVariableObject
                             }
-                            crate::heap::EvalScopeKind::Parameter => {
+                            crate::function::metadata::EvalScopeKind::Parameter => {
                                 binding.kind == ClosureVariableKind::ArgEvalVariableObject
                             }
                             _ => false,
@@ -3737,7 +3770,8 @@ fn verify_unlinked_tree_with_root(
             .flat_map(|environment| environment.scopes.iter())
             .flat_map(|scope| scope.bindings.iter())
         {
-            let crate::heap::EvalBindingSource::Closure(index) = binding.source else {
+            let crate::function::metadata::EvalBindingSource::Closure(index) = binding.source
+            else {
                 continue;
             };
             if function_name_origins
@@ -4795,13 +4829,13 @@ mod tests {
     use crate::bytecode::Instruction;
     use crate::compiler::compile_unlinked_module_with_filename;
     use crate::debug::DebugInfoMode;
-    use crate::function::{
-        UnlinkedFunctionDebug, UnlinkedFunctionParts, UnlinkedVariableDefinition,
-    };
-    use crate::heap::{
+    use crate::function::metadata::{
         EvalBinding, EvalBindingSource, EvalEnvironment, EvalScope, EvalScopeKind,
         EvalVariableEnvironment, ParameterArgumentCell, ParameterBodyStorage,
         ParameterDefaultSource, ParameterPatternCopy,
+    };
+    use crate::function::{
+        UnlinkedFunctionDebug, UnlinkedFunctionParts, UnlinkedVariableDefinition,
     };
     use crate::module::{ModuleLinkInitializer, ModuleLinkInitializerValue, UnlinkedModuleTables};
 

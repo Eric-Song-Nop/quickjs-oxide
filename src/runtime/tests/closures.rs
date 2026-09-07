@@ -160,7 +160,7 @@ fn parent_local_writes_after_fclosure_update_the_shared_cell() {
         },
         vec![ClosureVariable {
             source: ClosureSource::ParentLocal(0),
-            name: crate::heap::ClosureVariableName::None,
+            name: crate::function::metadata::ClosureVariableName::None,
             is_lexical: false,
             is_const: false,
             kind: ClosureVariableKind::Normal,
@@ -257,7 +257,7 @@ fn parent_argument_and_transitive_parent_closure_capture_share_identity() {
         },
         vec![ClosureVariable {
             source: ClosureSource::ParentArgument(0),
-            name: crate::heap::ClosureVariableName::None,
+            name: crate::function::metadata::ClosureVariableName::None,
             is_lexical: false,
             is_const: false,
             kind: ClosureVariableKind::Normal,

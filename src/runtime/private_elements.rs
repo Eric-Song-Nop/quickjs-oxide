@@ -8,7 +8,7 @@
 //! absent fields use QuickJS's native TypeError spelling.
 
 use super::*;
-use crate::heap::EvalKind;
+use crate::function::metadata::EvalKind;
 use crate::object::PrivateNameRef;
 
 impl Runtime {

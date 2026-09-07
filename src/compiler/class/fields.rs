@@ -6,7 +6,7 @@
 
 use super::super::*;
 use super::ClassPropertyKey;
-use crate::heap::ClassInitializerKind;
+use crate::function::metadata::ClassInitializerKind;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ClassElementState {

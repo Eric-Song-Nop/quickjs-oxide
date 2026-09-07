@@ -6,6 +6,7 @@ remain exported through `runtime`, regardless of the file implementing them.
 | Location | Responsibility |
 | --- | --- |
 | `runtime.rs` | Shared state, rooted handles, and internal runtime operations |
+| `host.rs`, `host/system.rs` | Host service contract and default system implementation |
 | `lifecycle.rs` | Runtime creation, identity, and host configuration |
 | `error.rs` | Public runtime error types and conversions |
 | `bootstrap.rs`, `bootstrap/realm.rs` | Intrinsic installation and realm construction |

@@ -7,15 +7,18 @@ use crate::compiler::{
 };
 use crate::debug::{DebugInfoMode, LineColumn, Pc2LineEntry, Pc2LineTable};
 use crate::error::{Error, ErrorKind, NativeErrorKind, NativeErrorMessage};
+use crate::function::metadata::{
+    ClosureSource, ClosureVariable, ClosureVariableKind, ClosureVariableName, ConstructorKind,
+    EvalBinding, EvalBindingSource, EvalEnvironment, EvalKind, EvalScope, EvalScopeKind,
+    EvalVariableEnvironment, FunctionKind, FunctionMetadata,
+};
 use crate::function::{
     UnlinkedConstant, UnlinkedFunction, UnlinkedFunctionDebug, UnlinkedVariableDefinition,
 };
 use crate::heap::{
-    ArrayJoinKind, BytecodeConstant, ClosureSource, ClosureVariable, ClosureVariableKind,
-    ClosureVariableName, ConstructorKind, DynamicFunctionKind, EvalBinding, EvalBindingSource,
-    EvalEnvironment, EvalKind, EvalScope, EvalScopeKind, EvalVariableEnvironment,
-    FunctionDebugPosition, FunctionKind, FunctionMetadata, HeapError, NativeCProto,
-    NativeFunctionId, ObjectPayload, PrimitiveKind, PrimitiveObjectData, PropertySlot, RawValue,
+    ArrayJoinKind, BytecodeConstant, DynamicFunctionKind, FunctionDebugPosition, HeapError,
+    NativeCProto, NativeFunctionId, ObjectPayload, PrimitiveKind, PrimitiveObjectData,
+    PropertySlot, RawValue,
 };
 use crate::object::{
     AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, DescriptorField,
@@ -725,7 +728,7 @@ fn incrementing_closure(source: ClosureSource) -> UnlinkedFunction {
         },
         vec![ClosureVariable {
             source,
-            name: crate::heap::ClosureVariableName::None,
+            name: crate::function::metadata::ClosureVariableName::None,
             is_lexical: false,
             is_const: false,
             kind: ClosureVariableKind::Normal,

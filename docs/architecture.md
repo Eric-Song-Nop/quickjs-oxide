@@ -1,7 +1,7 @@
 # Engine module responsibilities
 
 The engine currently lives in one Rust crate. Internal modules separate
-implementation responsibilities while the existing public paths remain stable.
+implementation responsibilities. Callers import types from their owning module.
 
 ## Heap
 
@@ -27,7 +27,18 @@ implementation responsibilities while the existing public paths remain stable.
 
 Heap validation checks whether a stored representation is valid. It must not
 execute JavaScript or invoke host callbacks while borrowing heap storage.
-Public heap types retain their `quickjs_oxide::heap` paths through re-exports.
+Heap nodes and storage types belong to `quickjs_oxide::heap`. Shared function
+descriptors belong to `quickjs_oxide::function::metadata`; callers use that
+path directly.
+
+## Function model
+
+`src/function/metadata.rs` owns function, parameter, closure, and eval
+descriptors shared by compilation, publication, and execution. It depends on
+atom identities rather than heap nodes or runtime handles. Runtime-owned
+bytecode nodes and authenticated private-binding storage remain in the heap.
+`src/function.rs` still contains both unlinked functions and rooted published
+function handles; it is not yet an independent compiler crate.
 
 ## Compiler
 
@@ -50,6 +61,9 @@ Publishing functions into a realm remains a runtime responsibility.
   their initial property relationships.
 - `src/runtime/context.rs` provides the realm-facing embedding operations.
 - `src/runtime/intrinsics/` implements builtin behavior.
+- `src/runtime/host.rs` defines host services; `src/runtime/host/system.rs`
+  implements the default clock, timezone, and random-seed provider. These
+  runtime-wide services do not belong to the Date intrinsic.
 - Other existing child modules handle jobs, module execution, property
   semantics, callable state, and host integration.
 

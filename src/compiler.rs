@@ -37,17 +37,17 @@ use crate::bytecode::{
 };
 use crate::debug::{DebugInfoMode, Pc2LineEntry, Pc2LineTable, QuickJsSourceLocator, SourceOffset};
 use crate::error::{Error, ErrorKind, NativeErrorMessage, SourceLocation, SourceSpan};
-use crate::function::{
-    UnlinkedConstant, UnlinkedFunction, UnlinkedFunctionDebug, UnlinkedVariableDefinition,
-};
-use crate::heap::{
+use crate::function::metadata::{
     ClassInitializerKind, ClosureSource, ClosureVariable, ClosureVariableKind, ClosureVariableName,
     ConstructorKind, EvalBinding, EvalBindingSource, EvalCallerProfile, EvalCallerVariableTarget,
     EvalEnvironment, EvalKind, EvalRootBinding, EvalScope, EvalScopeKind, EvalVariableEnvironment,
     FunctionKind as BytecodeFunctionKind, FunctionMetadata, ParameterArgumentCell,
     ParameterBodyStorage, ParameterDefaultSource, ParameterEnvironmentLayout, ParameterPatternCopy,
-    quickjs_copies_defined_argument_count,
 };
+use crate::function::{
+    UnlinkedConstant, UnlinkedFunction, UnlinkedFunctionDebug, UnlinkedVariableDefinition,
+};
+use crate::heap::quickjs_copies_defined_argument_count;
 use crate::lexer::{
     Identifier, Keyword, LexContext, LexError, LexErrorKind, Lexer, LexerOptions, LexicalGoal,
     NumberKind, NumericRadix, Punctuator, Span, TemplatePartKind, Token, TokenKind,

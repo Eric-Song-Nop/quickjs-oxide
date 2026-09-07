@@ -6,6 +6,10 @@
 //! their own clock, local-time rules, and entropy without changing engine
 //! logic.
 
+mod system;
+
+pub(super) use system::SystemHostServices;
+
 /// Synchronous host services owned by one runtime.
 ///
 /// `quickjs-oxide` is currently single-threaded, so implementations do not

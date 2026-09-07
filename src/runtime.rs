@@ -44,8 +44,8 @@ mod vm_host;
 pub use self::context::{Context, EvalOptions};
 pub use self::error::RuntimeError;
 pub use self::host::HostServices;
+use self::host::SystemHostServices;
 use self::intrinsics::CanonicalNumericIndex;
-use self::intrinsics::date::SystemHostServices;
 use self::intrinsics::promise::HostPromiseRejectionTracker;
 pub use self::intrinsics::promise::{PromiseRejectionEvent, PromiseSnapshot};
 pub use self::jobs::{PendingJobError, PendingJobOutcome};
@@ -72,6 +72,11 @@ use crate::compiler::{
 };
 use crate::debug::{DebugInfoMode, LineColumn, QuickJsSourceLocator};
 use crate::error::{Error, ErrorKind, NativeErrorKind, NativeErrorMessage};
+use crate::function::metadata::{
+    ClassInitializerKind, ClosureSource, ClosureVariable, ClosureVariableKind, ClosureVariableName,
+    ConstructorKind, EvalEnvironment, EvalKind, FunctionKind, FunctionMetadata,
+    ParameterEnvironmentLayout, VariableDefinition,
+};
 use crate::function::{
     FunctionBytecodeRef, UnlinkedConstant, UnlinkedFunction, UnlinkedFunctionDebug,
     UnlinkedVariableDefinition,
@@ -81,27 +86,24 @@ use crate::heap::Test262AgentKind;
 use crate::heap::{
     ArrayFindKind, ArrayFlattenKind, ArrayIterationKind, ArrayIteratorKind, ArrayJoinKind,
     ArrayPopKind, ArrayPushKind, ArrayReduceKind, ArraySearchKind, ArraySliceKind,
-    AutoInitProperty, BigIntAsNKind, BytecodeConstant, ClassInitializerKind, ClosureSource,
-    ClosureVariable, ClosureVariableKind, ClosureVariableName, ConstructorKind, ContextData,
-    ContextId, DateGetFieldKind, DateNativeKind, DateSetFieldKind, DateStringMethod,
-    DynamicFunctionKind, DynamicImportHandlerKind, ErrorConstructorKind, EvalEnvironment, EvalKind,
-    ForInCandidate, ForInIteratorData, ForInProperty, FunctionBytecodeData, FunctionBytecodeId,
-    FunctionDebugInfo, FunctionDebugPosition, FunctionKind, FunctionMetadata, GcStats,
-    GeneratorRealmData, GeneratorResumeKind, GlobalNumberPredicateKind, GlobalUriCodecKind, Heap,
-    HeapCleanup, HeapCounts, HeapError, InternalCallableData, JsonNativeKind, MathBinaryKind,
-    MathMinMaxKind, MathUnaryKind, ModuleEvaluationKind, ModuleId, NativeCProto, NativeFunctionId,
-    NumberFormatKind, NumberParseKind, NumberPredicateKind, ObjectAccessorKind, ObjectData,
-    ObjectExtensibilityKind, ObjectId, ObjectIntegrityKind, ObjectKeysKind, ObjectKind,
-    ObjectOwnPropertyKeysKind, ObjectPayload, ParameterEnvironmentLayout, PrimitiveKind,
-    PrimitiveObjectData, PromiseResolvingKind, PropertySlot, PublishedPrivateBindings,
-    RawModuleEvaluationState, RawModuleInstance, RawModuleLinkRealm, RawModuleLinkStatus,
-    RawModuleNamespaceState, RawModuleRecord, RawModuleRecordBody, RawModuleRef,
-    RawModuleResolutionState, RawModuleTransition, RawPublishedModuleExport,
+    AutoInitProperty, BigIntAsNKind, BytecodeConstant, ContextData, ContextId, DateGetFieldKind,
+    DateNativeKind, DateSetFieldKind, DateStringMethod, DynamicFunctionKind,
+    DynamicImportHandlerKind, ErrorConstructorKind, ForInCandidate, ForInIteratorData,
+    ForInProperty, FunctionBytecodeData, FunctionBytecodeId, FunctionDebugInfo,
+    FunctionDebugPosition, GcStats, GeneratorRealmData, GeneratorResumeKind,
+    GlobalNumberPredicateKind, GlobalUriCodecKind, Heap, HeapCleanup, HeapCounts, HeapError,
+    InternalCallableData, JsonNativeKind, MathBinaryKind, MathMinMaxKind, MathUnaryKind,
+    ModuleEvaluationKind, ModuleId, NativeCProto, NativeFunctionId, NumberFormatKind,
+    NumberParseKind, NumberPredicateKind, ObjectAccessorKind, ObjectData, ObjectExtensibilityKind,
+    ObjectId, ObjectIntegrityKind, ObjectKeysKind, ObjectKind, ObjectOwnPropertyKeysKind,
+    ObjectPayload, PrimitiveKind, PrimitiveObjectData, PromiseResolvingKind, PropertySlot,
+    PublishedPrivateBindings, RawModuleEvaluationState, RawModuleInstance, RawModuleLinkRealm,
+    RawModuleLinkStatus, RawModuleNamespaceState, RawModuleRecord, RawModuleRecordBody,
+    RawModuleRef, RawModuleResolutionState, RawModuleTransition, RawPublishedModuleExport,
     RawPublishedModuleExportTarget, RawValue, ReflectKind, RegExpNativeKind, ShapeId,
     StringCaseKind, StringCharAtKind, StringCreateHtmlKind, StringIncludesKind, StringIndexOfKind,
     StringPadKind, StringReplaceKind, StringStaticKind, StringSubrangeKind, StringTrimKind,
-    StringWellFormedKind, SymbolRegistryKind, VarRefData, VarRefId, VariableDefinition,
-    WeakSymbolGcEvent,
+    StringWellFormedKind, SymbolRegistryKind, VarRefData, VarRefId, WeakSymbolGcEvent,
 };
 use crate::object::{
     AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, DescriptorField, ObjectRef,

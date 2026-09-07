@@ -7,9 +7,10 @@
 
 use super::{FrameBinding, RuntimeVmHost, read_frame_binding, runtime_error_to_vm_error};
 use crate::bytecode::{DynamicEnvironmentSource, WithObjectSource};
-use crate::heap::{
-    ClosureSource, ClosureVariable, ClosureVariableKind, ClosureVariableName, RawValue,
+use crate::function::metadata::{
+    ClosureSource, ClosureVariable, ClosureVariableKind, ClosureVariableName,
 };
+use crate::heap::RawValue;
 use crate::object::{ObjectRef, PropertyKey, WellKnownSymbol};
 use crate::value::Value;
 use crate::vm::Completion;
@@ -419,7 +420,8 @@ mod tests {
     use crate::Runtime;
     use crate::atom::Atom;
     use crate::bytecode::EvalVariableSource;
-    use crate::heap::{BytecodeConstant, RawValue, VariableDefinition};
+    use crate::function::metadata::VariableDefinition;
+    use crate::heap::{BytecodeConstant, RawValue};
     use crate::value::JsString;
     use std::rc::Rc;
 

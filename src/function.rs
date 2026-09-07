@@ -13,6 +13,8 @@
 //! objects or symbols, so it cannot accidentally join two runtime domains
 //! before publication.
 
+pub mod metadata;
+
 use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -20,10 +22,11 @@ use std::rc::Rc;
 
 use crate::bytecode::Instruction;
 use crate::debug::Pc2LineTable;
-use crate::heap::{
-    ClosureVariable, ClosureVariableKind, EvalEnvironment, FunctionBytecodeId, FunctionMetadata,
-    HeapError, ParameterEnvironmentLayout,
+use crate::function::metadata::{
+    ClosureVariable, ClosureVariableKind, EvalEnvironment, FunctionMetadata,
+    ParameterEnvironmentLayout,
 };
+use crate::heap::{FunctionBytecodeId, HeapError};
 use crate::regexp::CompiledRegExp;
 use crate::runtime::Runtime;
 use crate::value::{JsString, Value};
@@ -749,7 +752,7 @@ mod tests {
     };
     use crate::bigint::JsBigInt;
     use crate::bytecode::Instruction;
-    use crate::heap::{
+    use crate::function::metadata::{
         ClosureSource, ClosureVariable, ClosureVariableKind, EvalEnvironment, EvalScope,
         EvalScopeKind, EvalVariableEnvironment, FunctionMetadata,
     };
@@ -903,10 +906,10 @@ mod tests {
     fn closure_descriptors_stay_attached_to_the_child_draft() {
         let descriptor = ClosureVariable {
             source: ClosureSource::ParentArgument(0),
-            name: crate::heap::ClosureVariableName::None,
+            name: crate::function::metadata::ClosureVariableName::None,
             is_lexical: false,
             is_const: false,
-            kind: crate::heap::ClosureVariableKind::Normal,
+            kind: crate::function::metadata::ClosureVariableKind::Normal,
         };
         let function = UnlinkedFunction::new_with_closure_variables(
             vec![Instruction::GetVarRef(0), Instruction::Return],

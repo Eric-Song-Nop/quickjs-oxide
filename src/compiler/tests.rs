@@ -6,12 +6,13 @@ use crate::bytecode::{
 };
 use crate::debug::DebugInfoMode;
 use crate::error::{Error, ErrorKind};
-use crate::heap::{
+use crate::function::metadata::{
     ClassInitializerKind, ClosureSource, ClosureVariable, ClosureVariableKind, ClosureVariableName,
     ConstructorKind, EvalBindingSource, EvalCallerProfile, EvalCallerVariableTarget, EvalKind,
     EvalRootBinding, EvalScopeKind, EvalVariableEnvironment, FunctionKind as BytecodeFunctionKind,
-    ParameterDefaultSource, validate_parameter_bytecode_layout,
+    ParameterDefaultSource,
 };
+use crate::heap::validate_parameter_bytecode_layout;
 
 use crate::lexer::{LexError, LexErrorKind, Lexer, Position, Span};
 use crate::module::{

@@ -5,7 +5,7 @@ use super::{
 };
 use crate::bytecode::Instruction;
 use crate::error::{Error, ErrorKind};
-use crate::heap::EvalKind;
+use crate::function::metadata::EvalKind;
 use crate::lexer::Span;
 
 // QuickJS `JS_ATOM_this`, `JS_ATOM_new_target`, and `JS_ATOM_home_object`

@@ -1207,7 +1207,7 @@ fn compiler_links_and_deduplicates_direct_eval_scope_descriptors() {
     assert_eq!(block.scopes[7].kind, EvalScopeKind::ProgramBody);
     assert_eq!(block.scopes[8].kind, EvalScopeKind::FunctionRoot);
 
-    let names = |environment: &crate::heap::EvalEnvironment<JsString>| {
+    let names = |environment: &crate::function::metadata::EvalEnvironment<JsString>| {
         environment
             .scopes
             .iter()

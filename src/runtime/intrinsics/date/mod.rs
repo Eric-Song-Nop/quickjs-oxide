@@ -6,11 +6,8 @@
 mod calendar;
 mod constructor;
 mod format;
-mod host;
 mod parse;
 mod prototype;
-
-pub(in crate::runtime) use host::SystemHostServices;
 
 use super::*;
 

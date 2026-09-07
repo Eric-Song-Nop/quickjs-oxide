@@ -213,21 +213,22 @@ fn function_bind_and_to_string_use_quickjs_payload_and_source_paths() {
 
     for (function_kind, expected) in [
         (
-            crate::heap::FunctionKind::Generator,
+            crate::function::metadata::FunctionKind::Generator,
             "function *fallback() {\n    [native code]\n}",
         ),
         (
-            crate::heap::FunctionKind::Async,
+            crate::function::metadata::FunctionKind::Async,
             "async function fallback() {\n    [native code]\n}",
         ),
         (
-            crate::heap::FunctionKind::AsyncGenerator,
+            crate::function::metadata::FunctionKind::AsyncGenerator,
             "async function *fallback() {\n    [native code]\n}",
         ),
     ] {
         let (code, metadata) = if matches!(
             function_kind,
-            crate::heap::FunctionKind::Generator | crate::heap::FunctionKind::AsyncGenerator
+            crate::function::metadata::FunctionKind::Generator
+                | crate::function::metadata::FunctionKind::AsyncGenerator
         ) {
             (
                 vec![

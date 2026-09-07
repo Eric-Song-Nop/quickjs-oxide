@@ -6,7 +6,8 @@ use crate::bytecode::{
     Instruction, IteratorCallKind, PrivateNameSource,
 };
 use crate::error::{Error, ErrorKind, NativeErrorKind};
-use crate::heap::{ContextId, FunctionMetadata};
+use crate::function::metadata::FunctionMetadata;
+use crate::heap::ContextId;
 use crate::object::ObjectRef;
 use crate::value::{JsString, Value};
 use num_bigint::BigInt;

@@ -8,10 +8,8 @@ use crate::bytecode::{
     ApplyKind, ArgumentsKind, DefineMethodKind, DynamicEnvironmentSource, EvalVariableSource,
     PrivateNameSource,
 };
-use crate::heap::{
-    EvalBinding, EvalBindingSource, EvalVariableEnvironment, GeneratorActivationData,
-    GeneratorFrameBinding, GeneratorVmActivation,
-};
+use crate::function::metadata::{EvalBinding, EvalBindingSource, EvalVariableEnvironment};
+use crate::heap::{GeneratorActivationData, GeneratorFrameBinding, GeneratorVmActivation};
 use crate::object::PrivateNameRef;
 use crate::vm::{
     AppendStartOutcome, ArgumentListOutcome, BytecodePc, CallInput, DirectEvalInvocation, Vm,
@@ -1107,8 +1105,8 @@ impl RuntimeVmHost {
             .position(|scope| {
                 matches!(
                     scope.kind,
-                    crate::heap::EvalScopeKind::FunctionRoot
-                        | crate::heap::EvalScopeKind::Parameter
+                    crate::function::metadata::EvalScopeKind::FunctionRoot
+                        | crate::function::metadata::EvalScopeKind::Parameter
                 )
             })
             .and_then(|scope| u16::try_from(scope).ok())
@@ -1122,10 +1120,13 @@ impl RuntimeVmHost {
                 let current_body_is_program = first_function_anchor
                     .checked_sub(1)
                     .and_then(|scope| environment.scopes.get(usize::from(scope)))
-                    .is_some_and(|scope| scope.kind == crate::heap::EvalScopeKind::ProgramBody);
+                    .is_some_and(|scope| {
+                        scope.kind == crate::function::metadata::EvalScopeKind::ProgramBody
+                    });
                 if caller_metadata.is_module
                     || !current_body_is_program
-                    || (caller_strict && caller_metadata.eval_kind != crate::heap::EvalKind::None)
+                    || (caller_strict
+                        && caller_metadata.eval_kind != crate::function::metadata::EvalKind::None)
                 {
                     return Err(Error::internal(
                         "global eval variable environment escaped an authored Script root",
@@ -1146,9 +1147,11 @@ impl RuntimeVmHost {
                 let current_body_is_program = first_function_anchor
                     .checked_sub(1)
                     .and_then(|scope| environment.scopes.get(usize::from(scope)))
-                    .is_some_and(|scope| scope.kind == crate::heap::EvalScopeKind::ProgramBody);
+                    .is_some_and(|scope| {
+                        scope.kind == crate::function::metadata::EvalScopeKind::ProgramBody
+                    });
                 if current_body_is_program
-                    && caller_metadata.eval_kind == crate::heap::EvalKind::None
+                    && caller_metadata.eval_kind == crate::function::metadata::EvalKind::None
                     && !caller_metadata.is_module
                 {
                     return Err(Error::internal(
@@ -1162,8 +1165,8 @@ impl RuntimeVmHost {
                 };
                 if !matches!(
                     scope.kind,
-                    crate::heap::EvalScopeKind::FunctionRoot
-                        | crate::heap::EvalScopeKind::Parameter
+                    crate::function::metadata::EvalScopeKind::FunctionRoot
+                        | crate::function::metadata::EvalScopeKind::Parameter
                 ) {
                     return Err(Error::internal(
                         "strict eval variable environment did not select a function anchor",
@@ -1177,11 +1180,11 @@ impl RuntimeVmHost {
                     ));
                 }
                 let target_matches_function_segment = if caller_metadata.eval_kind
-                    == crate::heap::EvalKind::None
+                    == crate::function::metadata::EvalKind::None
                 {
                     scope == first_function_anchor && matches!(source, EvalBindingSource::Local(_))
                 } else {
-                    caller_metadata.eval_kind == crate::heap::EvalKind::Direct
+                    caller_metadata.eval_kind == crate::function::metadata::EvalKind::Direct
                         && scope > first_function_anchor
                         && matches!(source, EvalBindingSource::Closure(_))
                 };
@@ -1194,10 +1197,10 @@ impl RuntimeVmHost {
                     Error::internal("eval variable-object scope is out of bounds")
                 })?;
                 let expected_kind = match target_scope.kind {
-                    crate::heap::EvalScopeKind::FunctionRoot => {
+                    crate::function::metadata::EvalScopeKind::FunctionRoot => {
                         ClosureVariableKind::EvalVariableObject
                     }
-                    crate::heap::EvalScopeKind::Parameter => {
+                    crate::function::metadata::EvalScopeKind::Parameter => {
                         ClosureVariableKind::ArgEvalVariableObject
                     }
                     _ => {
@@ -1273,8 +1276,8 @@ impl RuntimeVmHost {
             for binding in &scope.bindings {
                 if binding.kind.is_eval_variable_object()
                     && match scope.kind {
-                        crate::heap::EvalScopeKind::FunctionRoot => false,
-                        crate::heap::EvalScopeKind::Parameter => {
+                        crate::function::metadata::EvalScopeKind::FunctionRoot => false,
+                        crate::function::metadata::EvalScopeKind::Parameter => {
                             binding.kind != ClosureVariableKind::ArgEvalVariableObject
                         }
                         _ => true,
@@ -5528,12 +5531,12 @@ mod tests {
         let host = RuntimeVmHost::empty_for_test(runtime, context.realm);
         let strict_script = EvalEnvironment::<Atom> {
             scopes: vec![
-                crate::heap::EvalScope {
-                    kind: crate::heap::EvalScopeKind::ProgramBody,
+                crate::function::metadata::EvalScope {
+                    kind: crate::function::metadata::EvalScopeKind::ProgramBody,
                     bindings: Box::new([]),
                 },
-                crate::heap::EvalScope {
-                    kind: crate::heap::EvalScopeKind::FunctionRoot,
+                crate::function::metadata::EvalScope {
+                    kind: crate::function::metadata::EvalScopeKind::FunctionRoot,
                     bindings: Box::new([]),
                 },
             ]
@@ -5573,7 +5576,7 @@ mod tests {
             true,
             FunctionMetadata {
                 strict: true,
-                eval_kind: crate::heap::EvalKind::Direct,
+                eval_kind: crate::function::metadata::EvalKind::Direct,
                 ..FunctionMetadata::default()
             },
         )
@@ -5581,20 +5584,20 @@ mod tests {
 
         let mut strict_function = strict_script.clone();
         strict_function.scopes = vec![
-            crate::heap::EvalScope {
-                kind: crate::heap::EvalScopeKind::FunctionBody,
+            crate::function::metadata::EvalScope {
+                kind: crate::function::metadata::EvalScopeKind::FunctionBody,
                 bindings: Box::new([]),
             },
-            crate::heap::EvalScope {
-                kind: crate::heap::EvalScopeKind::FunctionRoot,
+            crate::function::metadata::EvalScope {
+                kind: crate::function::metadata::EvalScopeKind::FunctionRoot,
                 bindings: Box::new([]),
             },
-            crate::heap::EvalScope {
-                kind: crate::heap::EvalScopeKind::ProgramBody,
+            crate::function::metadata::EvalScope {
+                kind: crate::function::metadata::EvalScopeKind::ProgramBody,
                 bindings: Box::new([]),
             },
-            crate::heap::EvalScope {
-                kind: crate::heap::EvalScopeKind::FunctionRoot,
+            crate::function::metadata::EvalScope {
+                kind: crate::function::metadata::EvalScopeKind::FunctionRoot,
                 bindings: Box::new([]),
             },
         ]
@@ -5619,7 +5622,7 @@ mod tests {
                 true,
                 FunctionMetadata {
                     strict: true,
-                    eval_kind: crate::heap::EvalKind::Direct,
+                    eval_kind: crate::function::metadata::EvalKind::Direct,
                     ..FunctionMetadata::default()
                 },
             )

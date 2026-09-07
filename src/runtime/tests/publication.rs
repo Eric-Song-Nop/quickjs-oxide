@@ -1129,7 +1129,7 @@ fn publication_preflights_closure_descriptors_before_heap_changes() {
         },
         vec![ClosureVariable {
             source: ClosureSource::ParentLocal(0),
-            name: crate::heap::ClosureVariableName::None,
+            name: crate::function::metadata::ClosureVariableName::None,
             is_lexical: false,
             is_const: false,
             kind: ClosureVariableKind::Normal,
@@ -1166,7 +1166,7 @@ fn publication_rejects_inconsistent_closure_metadata() {
             },
             vec![ClosureVariable {
                 source: ClosureSource::ParentLocal(0),
-                name: crate::heap::ClosureVariableName::None,
+                name: crate::function::metadata::ClosureVariableName::None,
                 is_lexical,
                 is_const: false,
                 kind: ClosureVariableKind::Normal,
@@ -1200,7 +1200,7 @@ fn publication_rejects_inconsistent_closure_metadata() {
         },
         vec![ClosureVariable {
             source: ClosureSource::ParentClosure(0),
-            name: crate::heap::ClosureVariableName::None,
+            name: crate::function::metadata::ClosureVariableName::None,
             is_lexical: false,
             is_const: true,
             kind: ClosureVariableKind::Normal,

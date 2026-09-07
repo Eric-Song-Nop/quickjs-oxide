@@ -7,7 +7,7 @@
 
 use super::super::*;
 use super::ClassElementState;
-use crate::heap::ClassInitializerKind;
+use crate::function::metadata::ClassInitializerKind;
 
 impl<'source> Parser<'source> {
     pub(super) fn parse_class_static_block(

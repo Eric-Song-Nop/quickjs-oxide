@@ -15,8 +15,9 @@ use super::{Runtime, RuntimeError};
 use crate::bigint::JsBigInt;
 use crate::bytecode::{ApplyKind, Instruction};
 use crate::error::{Error, ErrorKind};
+use crate::function::metadata::{ConstructorKind, FunctionKind, FunctionMetadata};
 use crate::function::{FunctionBytecodeRef, UnlinkedConstant, UnlinkedFunction};
-use crate::heap::{ConstructorKind, ContextId, FunctionKind, FunctionMetadata};
+use crate::heap::ContextId;
 use crate::object::CallableRef;
 use crate::value::{JsString, Value};
 

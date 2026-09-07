@@ -1,6 +1,6 @@
 use super::*;
 use crate::compiler::{EvalCompileContext, compile_unlinked_eval_source_with_filename};
-use crate::heap::{
+use crate::function::metadata::{
     EvalCallerProfile, EvalCallerVariableTarget, EvalKind, EvalRootBinding, EvalVariableEnvironment,
 };
 use crate::source_text::SourceText;
@@ -236,7 +236,7 @@ impl Runtime {
         let mut variable_target = None;
         let state = self.0.state.borrow();
         for (scope_index, descriptor_scope) in environment.descriptor.scopes.iter().enumerate() {
-            if descriptor_scope.kind == crate::heap::EvalScopeKind::With
+            if descriptor_scope.kind == crate::function::metadata::EvalScopeKind::With
                 && descriptor_scope.bindings.len() != 1
             {
                 return Err(RuntimeError::Invariant(
@@ -247,7 +247,8 @@ impl Runtime {
                 RuntimeError::Invariant("direct eval scope index exceeds bytecode range")
             })?;
             for binding in &descriptor_scope.bindings {
-                let is_catch_scope = descriptor_scope.kind == crate::heap::EvalScopeKind::Catch;
+                let is_catch_scope =
+                    descriptor_scope.kind == crate::function::metadata::EvalScopeKind::Catch;
                 if binding.is_catch_parameter
                     && (!is_catch_scope
                         || !binding.is_lexical
@@ -258,7 +259,8 @@ impl Runtime {
                         "direct eval catch binding metadata is not authentic",
                     ));
                 }
-                let is_with_scope = descriptor_scope.kind == crate::heap::EvalScopeKind::With;
+                let is_with_scope =
+                    descriptor_scope.kind == crate::function::metadata::EvalScopeKind::With;
                 let name = state.atoms.to_js_string(binding.name)?;
                 if (binding.kind == ClosureVariableKind::WithObject) != is_with_scope
                     || (binding.kind == ClosureVariableKind::WithObject
@@ -268,7 +270,7 @@ impl Runtime {
                             || name.utf16_units().ne("<with>".encode_utf16())
                             || matches!(
                                 binding.source,
-                                crate::heap::EvalBindingSource::Argument(_)
+                                crate::function::metadata::EvalBindingSource::Argument(_)
                             )))
                 {
                     return Err(RuntimeError::Invariant(
@@ -277,8 +279,8 @@ impl Runtime {
                 }
                 if binding.kind.is_eval_variable_object() {
                     let role_allowed = match descriptor_scope.kind {
-                        crate::heap::EvalScopeKind::FunctionRoot => true,
-                        crate::heap::EvalScopeKind::Parameter => {
+                        crate::function::metadata::EvalScopeKind::FunctionRoot => true,
+                        crate::function::metadata::EvalScopeKind::Parameter => {
                             binding.kind == ClosureVariableKind::ArgEvalVariableObject
                         }
                         _ => false,
@@ -292,7 +294,10 @@ impl Runtime {
                         || binding.is_lexical
                         || binding.is_const
                         || binding.is_catch_parameter
-                        || matches!(binding.source, crate::heap::EvalBindingSource::Argument(_))
+                        || matches!(
+                            binding.source,
+                            crate::function::metadata::EvalBindingSource::Argument(_)
+                        )
                         || name.utf16_units().ne(sentinel.encode_utf16())
                     {
                         return Err(RuntimeError::Invariant(
@@ -312,10 +317,10 @@ impl Runtime {
                             source,
                         } => {
                             let target_kind = match descriptor_scope.kind {
-                                crate::heap::EvalScopeKind::FunctionRoot => {
+                                crate::function::metadata::EvalScopeKind::FunctionRoot => {
                                     ClosureVariableKind::EvalVariableObject
                                 }
-                                crate::heap::EvalScopeKind::Parameter => {
+                                crate::function::metadata::EvalScopeKind::Parameter => {
                                     ClosureVariableKind::ArgEvalVariableObject
                                 }
                                 _ => ClosureVariableKind::Normal,

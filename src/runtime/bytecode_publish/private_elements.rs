@@ -7,7 +7,8 @@
 
 use super::*;
 use crate::bytecode::{Instruction, PrivateNameSource};
-use crate::heap::{PublishedPrivateBinding, PublishedPrivateBindings, VariableDefinition};
+use crate::function::metadata::VariableDefinition;
+use crate::heap::{PublishedPrivateBinding, PublishedPrivateBindings};
 use std::collections::HashMap;
 
 fn is_private_source_name(name: &JsString) -> bool {
