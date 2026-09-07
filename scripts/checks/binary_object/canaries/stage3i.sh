@@ -329,7 +329,7 @@ expect_full_rewrite_rejected stage3d-call-value-throw-return \
     $'            DirectCallTarget::Callable(callable) => {\n                self.call_internal(caller_realm, &callable, this_value, arguments)\n            }' \
     $'            DirectCallTarget::Callable(callable) => self\n                .call_internal(caller_realm, &callable, this_value, arguments)\n                .map(|completion| match completion {\n                    Completion::Throw(value) => Completion::Return(value),\n                    completion => completion,\n                }),'
 expect_full_rewrite_rejected stage3d-context-call-throw-return \
-    stage3d-throw-critical-route src/runtime/context.rs \
+    stage3d-throw-critical-route src/runtime/context/calls.rs \
     $'        let completion = self\n            .runtime\n            .call_internal(self.realm, callable, this_value, arguments)?;\n        self.finish_completion(completion)' \
     $'        let completion = self\n            .runtime\n            .call_internal(self.realm, callable, this_value, arguments)?;\n        let completion = match completion {\n            Completion::Throw(value) => Completion::Return(value),\n            completion => completion,\n        };\n        self.finish_completion(completion)'
 expect_full_rewrite_rejected stage3d-backtrace-hook-noop \

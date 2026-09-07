@@ -86,7 +86,7 @@ def check(ctx):
             ctx.fail(diagnostic, f"{ctx.relative}::{ctx.function_name} must preserve constructor-only capability")
 
     context_construct = ctx.stage3b_function(
-        "src/runtime/context.rs", "construct_with_new_target", "stage3b-public-construction"
+        "src/runtime/context/calls.rs", "construct_with_new_target", "stage3b-public-construction"
     )
 
     if "raw_new_target" in " ".join(context_construct.split()):

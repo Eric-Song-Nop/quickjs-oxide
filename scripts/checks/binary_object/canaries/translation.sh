@@ -94,7 +94,7 @@ expect_full_rewrite_rejected stage3b-proxy-construct-callable-narrowing \
     '                match self.constructor_from_value(realm, Value::Object(rooted.target.clone()))? {' \
     '                match self.callable_from_value(Value::Object(rooted.target.clone())) {'
 expect_full_rewrite_rejected stage3b-public-raw-construction-leak \
-    stage3b-public-construction src/runtime/context.rs \
+    stage3b-public-construction src/runtime/context/calls.rs \
     '            .construct_internal(self.realm, constructor, new_target, arguments)' \
     '            .construct_value_with_raw_new_target_internal(self.realm, Value::Object(constructor.as_object().clone()), Value::Object(new_target.as_object().clone()), arguments)'
 expect_full_rewrite_rejected stage3b-species-callable-narrowing \

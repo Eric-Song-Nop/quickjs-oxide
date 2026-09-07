@@ -815,7 +815,7 @@ def check(ctx):
             "ordinary-leaf verification may admit only the exact empty atom String beside plain primitives",
         )
 
-    context_relative = "src/runtime/context.rs"
+    context_relative = "src/runtime/context/bytecode.rs"
 
     context_source = ctx.read_source(context_relative)
 

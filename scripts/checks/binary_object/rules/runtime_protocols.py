@@ -15,7 +15,7 @@ def check(ctx):
         "src/runtime.rs": ctx.runtime_code,
         "src/vm.rs": ctx.vm_code,
         "src/bytecode.rs": ctx.bytecode_code,
-        "src/runtime/context.rs": ctx.context_code,
+        "src/runtime/context/bytecode.rs": ctx.context_code,
     }
 
     stage3b_items: dict[tuple[str, str], str] = {}
@@ -829,7 +829,7 @@ def check(ctx):
             "d7564209dc646e4a18641690161eefba207110f7a244377489a96510bb9d66b5",
         ),
         (
-            "src/runtime/context.rs",
+            "src/runtime/context/calls.rs",
             "call",
             "Context::call must pass call_internal's completion directly to finish_completion",
             "bf80579858f0ce24fdb44408eb43a1b3a7263bba07ef972026a22a2b1ff0fa89",

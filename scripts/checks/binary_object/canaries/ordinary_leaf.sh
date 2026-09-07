@@ -85,11 +85,11 @@ expect_rewrite_rejected ordinary-verifier-empty-atom-broadening ordinary-leaf-pl
     'UnlinkedConstantKind::AtomString(Value::String(value)) if value.is_empty()' \
     'UnlinkedConstantKind::AtomString(Value::String(_))'
 expect_rewrite_rejected ordinary-public-api-selector-collapse ordinary-leaf-public-api \
-    src/runtime/context.rs \
+    src/runtime/context/bytecode.rs \
     $'            bytes,\n            root_constant_index,\n        );' \
     $'            bytes,\n            0,\n        );'
 expect_rewrite_rejected ordinary-public-api-pending-broadening ordinary-leaf-public-api \
-    src/runtime/context.rs \
+    src/runtime/context/bytecode.rs \
     $'            Ok(function) => Ok(function),\n            Err(RuntimeError::Engine(error))\n                if NativeErrorKind::from_javascript_error(error.kind()).is_some() =>' \
     $'            Ok(function) => Ok(function),\n            Err(RuntimeError::Engine(error))\n                if true || NativeErrorKind::from_javascript_error(error.kind()).is_some() =>'
 expect_rewrite_rejected scalar-draft-copy-regression scalar-script-draft-shape \
