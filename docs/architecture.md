@@ -7,6 +7,9 @@ implementation responsibilities while the existing public paths remain stable.
 
 - `src/heap.rs` owns heap identities, stored payloads, allocation, reference
   counts, graph edges, and cycle collection.
+- `src/heap/buffers.rs` owns ArrayBuffer backing-store access, resizing,
+  copying, transfer, and detach, plus SharedArrayBuffer handle cloning and
+  growth. Observable coercions and view validation remain in the runtime.
 - `src/heap/bytecode_validation.rs` validates frame pseudo bindings, parameter
   layouts, and eval environments before bytecode publication.
 - `src/heap/private_validation.rs` authenticates private binding metadata and
