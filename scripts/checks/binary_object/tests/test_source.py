@@ -54,6 +54,35 @@ class SourceTests(unittest.TestCase):
         )
         self.assertEqual(context.errors, ["shape: a has no balanced closing brace"])
 
+    def test_context_expansion_preserves_module_scope_and_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src/runtime/context").mkdir(parents=True)
+            (root / "src/runtime/context.rs").write_text(
+                '#[cfg(feature = "test262-host")]\nmod test262;\n', encoding="utf-8"
+            )
+            (root / "src/runtime/context/test262.rs").write_text(
+                "impl Context { fn evidence() {} }", encoding="utf-8"
+            )
+            context = self.context(root)
+            self.assertEqual(
+                context.read_source("src/runtime/context.rs"),
+                '#[cfg(feature = "test262-host")]\nmod test262 {\n'
+                'impl Context { fn evidence() {} }\n}\n',
+            )
+            self.assertEqual(context.errors, [])
+
+    def test_context_expansion_reports_missing_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src/runtime").mkdir(parents=True)
+            (root / "src/runtime/context.rs").write_text("mod calls;\n", encoding="utf-8")
+            context = self.context(root)
+            context.read_source("src/runtime/context.rs")
+            self.assertEqual(context.errors, [
+                "missing-source: src/runtime/context/calls.rs must be a regular file"
+            ])
+
     def test_runtime_test_expansion_preserves_gated_declarations(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

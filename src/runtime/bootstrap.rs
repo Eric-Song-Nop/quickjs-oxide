@@ -1,5 +1,7 @@
 //! Install primitive and function intrinsics and their initial property relationships.
 
+mod realm;
+
 use super::{
     AccessorValue, BigIntAsNKind, CallableRef, Completion, ContextId, DescriptorField,
     DynamicFunctionKind, FunctionDebugPosition, GlobalNumberPredicateKind, GlobalUriCodecKind,

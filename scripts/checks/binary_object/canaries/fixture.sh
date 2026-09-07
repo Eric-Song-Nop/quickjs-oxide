@@ -15,6 +15,7 @@ cp -- "$repository_root/src/value.rs" "$fixture/src/value.rs"
 cp -- "$repository_root/src/atom.rs" "$fixture/src/atom.rs"
 cp -- "$repository_root/src/function.rs" "$fixture/src/function.rs"
 cp -- "$repository_root/src/runtime/context.rs" "$fixture/src/runtime/context.rs"
+cp -R -- "$repository_root/src/runtime/context" "$fixture/src/runtime/context"
 cp -- "$repository_root/src/runtime/bytecode_publish.rs" \
     "$fixture/src/runtime/bytecode_publish.rs"
 printf '%s\n' \

@@ -123,7 +123,7 @@ require_gated(
     ),
 )
 require_gated(
-    "src/runtime/context.rs",
+    "src/runtime/context/test262.rs",
     (
         "    pub fn new_code_point_range_function(&mut self) -> Result<CallableRef, RuntimeError> {",
         "    pub fn new_test262_gc_function(&mut self) -> Result<CallableRef, RuntimeError> {",

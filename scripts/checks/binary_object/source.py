@@ -20,7 +20,16 @@ class SourceTools:
             ctx.fail("missing-source", f"{relative} must be a regular file")
             return ""
         source = path.read_text(encoding="utf-8")
-        if relative == "src/runtime/tests.rs":
+        if relative == "src/runtime/context.rs":
+            # Keep each declaration's surrounding attributes and module scope.
+            # Evidence still authenticates the original method bodies, now read
+            # from their declared responsibility modules rather than one file.
+            def expand_context_module(match):
+                name = match[1]
+                child = ctx.read_source(f"src/runtime/context/{name}.rs")
+                return f"mod {name} {{\n{child}\n}}"
+            source = re.sub(r"(?m)^mod (\w+);$", expand_context_module, source)
+        elif relative == "src/runtime/tests.rs":
             # Expand only plain, ungated child declarations. Every evidence function
             # is still checked below, including its attributes and normalized body.
             def expand_test_module(match):
