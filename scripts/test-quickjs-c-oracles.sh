@@ -68,22 +68,22 @@ while IFS=$'\t' read -r id family source source_hash expected expected_hash desc
     [[ "$family" =~ ^[a-z0-9-]+$ ]] || die "invalid oracle family: $family"
     case $family in
         module)
-            [[ "$source" =~ ^tests/fixtures/module_[a-z0-9_]+\.c$ ]] \
+            [[ "$source" =~ ^tests/fixtures/inputs/module_[a-z0-9_]+\.c$ ]] \
                 || die "invalid module oracle source path: $source"
             ;;
         function-bytecode)
-            [[ "$source" =~ ^tests/fixtures/function_bytecode_[a-z0-9_]+\.c$ ]] \
+            [[ "$source" =~ ^tests/fixtures/inputs/function_bytecode_[a-z0-9_]+\.c$ ]] \
                 || die "invalid function-bytecode oracle source path: $source"
             ;;
         shared-array-buffer)
-            [[ "$source" =~ ^tests/fixtures/shared_array_buffer_[a-z0-9_]+\.c$ ]] \
+            [[ "$source" =~ ^tests/fixtures/inputs/shared_array_buffer_[a-z0-9_]+\.c$ ]] \
                 || die "invalid SharedArrayBuffer oracle source path: $source"
             ;;
         *)
             die "unsupported oracle family: $family"
             ;;
     esac
-    [[ "$expected" == "${source%.c}.quickjs-2026-06-04.txt" ]] \
+    [[ "$expected" == "tests/fixtures/expected/$(basename "${source%.c}").quickjs-2026-06-04.txt" ]] \
         || die "oracle transcript does not match its source: $id"
     [[ "$source_hash" =~ ^[0-9a-f]{64}$ ]] || die "invalid source hash: $id"
     [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || die "invalid transcript hash: $id"
@@ -141,7 +141,7 @@ done
     || die 'QuickJS C oracle manifest must be sorted by id'
 
 manifest_sources=$(printf '%s\n' "${source_paths[@]}" | LC_ALL=C sort)
-fixture_sources=$(CDPATH='' cd -- "$root" && find tests/fixtures -maxdepth 1 \
+fixture_sources=$(CDPATH='' cd -- "$root" && find tests/fixtures/inputs -maxdepth 1 \
     \( -type f -o -type l \) \
     \( -name 'module_*.c' -o -name 'function_bytecode_*.c' \
        -o -name 'shared_array_buffer_*.c' \) \
@@ -149,7 +149,7 @@ fixture_sources=$(CDPATH='' cd -- "$root" && find tests/fixtures -maxdepth 1 \
 [[ "$manifest_sources" == "$fixture_sources" ]] \
     || die 'QuickJS C oracle manifest does not cover the complete source inventory'
 manifest_transcripts=$(printf '%s\n' "${expected_paths[@]}" | LC_ALL=C sort)
-fixture_transcripts=$(CDPATH='' cd -- "$root" && find tests/fixtures -maxdepth 1 \
+fixture_transcripts=$(CDPATH='' cd -- "$root" && find tests/fixtures/expected -maxdepth 1 \
     \( -type f -o -type l \) \
     \( -name 'module_*.quickjs-2026-06-04.txt' \
        -o -name 'function_bytecode_*.quickjs-2026-06-04.txt' \

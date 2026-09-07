@@ -3,9 +3,9 @@ use std::rc::Rc;
 
 use quickjs_oxide::{JsString, ModuleLoader, ModuleLoaderError, PromiseState, Runtime, Value};
 
-mod support;
+mod common;
 
-use support::compile_syntax_error;
+use common::compile_syntax_error;
 
 const IMPORT_SOURCE: &str = "import('dependency')";
 

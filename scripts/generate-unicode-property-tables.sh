@@ -15,7 +15,7 @@ source_dir=$1
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 output_file=${2:-"$root/src/unicode_property_tables.rs"}
-helper=$root/tests/fixtures/dump_unicode_properties.c
+helper=$root/tests/fixtures/inputs/dump_unicode_properties.c
 
 sha256_file() {
     if command -v sha256sum >/dev/null 2>&1; then

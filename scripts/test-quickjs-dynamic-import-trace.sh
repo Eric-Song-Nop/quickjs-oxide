@@ -8,7 +8,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 builder=$script_dir/build-quickjs-dynamic-import-trace.sh
 parser_test=$script_dir/test-parse-quickjs-dynamic-import-trace.mjs
-fixtures=$root/tests/fixtures/dynamic-import-trace
+fixtures=$root/tests/fixtures/inputs/dynamic-import-trace
 mode=${1:---check}
 
 if [[ $# -gt 1 || "$mode" != --check && "$mode" != --validate ]]; then

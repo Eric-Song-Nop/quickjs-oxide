@@ -121,14 +121,15 @@ tail -n +2 "$registry" | while IFS= read -r line; do
     [[ "$field_count" == 10 ]] || die "fixture registry row must have 10 columns"
     IFS=$'\t' read -r id fixture expected fixture_sha expected_sha mode transcript completion prepared_sha label <<<"$line"
     [[ "$id" =~ ^r3[a-z0-9]+$ ]] || die "invalid fixture case id: $id"
-    [[ "$fixture" =~ ^tests/fixtures/[a-z0-9_]+\.js$ ]] \
+    [[ "$fixture" =~ ^tests/fixtures/inputs/[a-z0-9_]+\.js$ ]] \
         || die "invalid fixture path for $id: $fixture"
-    [[ "$expected" =~ ^tests/fixtures/[a-z0-9_]+\.quickjs-2026-06-04\.txt$ ]] \
+    [[ "$expected" =~ ^tests/fixtures/expected/[a-z0-9_]+\.quickjs-2026-06-04\.txt$ ]] \
         || die "invalid expected path for $id: $expected"
-    fixture_stem=${fixture%.js}
+    fixture_stem=${fixture##*/}
+    fixture_stem=${fixture_stem%.js}
     [[ "${fixture##*/}" == "$id"_*.js ]] \
         || die "fixture basename does not match case id: $id"
-    [[ "$expected" == "$fixture_stem.quickjs-2026-06-04.txt" ]] \
+    [[ "$expected" == "tests/fixtures/expected/$fixture_stem.quickjs-2026-06-04.txt" ]] \
         || die "expected transcript does not match fixture: $id"
     [[ "$fixture_sha" =~ ^[0-9a-f]{64}$ ]] || die "invalid fixture hash for $id"
     [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || die "invalid expected hash for $id"

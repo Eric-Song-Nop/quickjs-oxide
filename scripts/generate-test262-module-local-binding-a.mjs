@@ -18,7 +18,7 @@ const checkedSuite = join(checkedSource, "test262");
 const checkedRunner = join(checkedSource, "run-test262");
 const checkedConfig = join(checkedSource, "test262.conf");
 const checkedAdmissions = join(root, "dev-support/test262/admissions.tsv");
-const checkedFocused = join(root, "tests/test262-class-private-callables-b.txt");
+const checkedFocused = join(root, "dev-support/test262/generated/test262-class-private-callables-b.txt");
 const args = process.argv.slice(2);
 
 function option(name, fallback) {

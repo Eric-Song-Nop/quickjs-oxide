@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptDirectory, "..");
-const supportDirectory = resolve(root, "tests/support");
+const supportDirectory = resolve(root, "tests/oracle/support");
 const providerFiles = [
   resolve(supportDirectory, "object_graph_observation.rs"),
   resolve(supportDirectory, "runtime_completion_oracle.rs"),
@@ -216,7 +216,7 @@ const helperAllowlist = new Set([
   "tests/oracle/string/oracle_string_intrinsic.rs\u0000c09ce90549ab8e65e6a88c4f7261c5ec6e7aa8a11bee43106b827b8823bc1377",
   "tests/oracle/string/oracle_string_intrinsic.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
   "tests/oracle/string/oracle_string_split.rs\u0000174e66d9def3034c785ba13ce8818d1a4b6132fa1aa62f3956f8a870a18c6690",
-  "tests/oracle/oracle_math_intrinsic.rs\u00002ecb9b416736102f1170cfa102c85182007491633a58badf2c1677354d8fa244",
+  "tests/oracle/math_intrinsic.rs\u00002ecb9b416736102f1170cfa102c85182007491633a58badf2c1677354d8fa244",
 ]);
 
 runCanaries();
@@ -276,7 +276,9 @@ function collectConsumerFiles() {
     }
     paths.push(path);
   }
-  return [...new Set(paths)].sort();
+  return [...new Set(paths)]
+    .filter((path) => !path.startsWith(supportDirectory + sep))
+    .sort();
 }
 
 function walkRustFiles(directory, output) {
@@ -346,7 +348,7 @@ function checkFunctions(functions, providers, tombstones) {
           .join(", ");
         failures.push(
           `${displayPath}:${helper.line} duplicates shared provider ${providerNames}; ` +
-            `import it from tests/support instead ` +
+            `import it from tests/oracle/support instead ` +
             `(fingerprint ${helper.fingerprint})`,
         );
       }

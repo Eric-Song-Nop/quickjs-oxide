@@ -6,8 +6,9 @@ use super::*;
 
 const WIRE_LIMITS: WireLimits = WireLimits::new(4096, 16, 1024, 2048);
 const CODE_LIMITS: CodeLimits = CodeLimits::new(256, 128, 32);
-const QUICKJS_FUNCTION_BYTECODE_ORACLE: &str =
-    include_str!("../../../../tests/fixtures/function_bytecode_wire.quickjs-2026-06-04.txt");
+const QUICKJS_FUNCTION_BYTECODE_ORACLE: &str = include_str!(
+    "../../../../tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt"
+);
 
 fn oracle_field(name: &str) -> &str {
     QUICKJS_FUNCTION_BYTECODE_ORACLE

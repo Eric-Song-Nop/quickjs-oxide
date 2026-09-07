@@ -102,7 +102,7 @@ fn external_qjs_is_only_an_oracle() {
 "#,
     );
     fixture.write(
-        "tests/fixtures/quickjs.c",
+        "tests/fixtures/inputs/quickjs.c",
         "/* A native fixture is test-only and is not a product engine. */\n",
     );
 

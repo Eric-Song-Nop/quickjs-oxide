@@ -15,7 +15,7 @@ const protectedFiles = [
   "dev-support/test262/negative-diagnostics.tsv",
   "dev-support/test262/negative-diagnostic-rules.tsv",
   "compat/test262-oxide.conf",
-  "tests/test262-class-private-callables-b.txt",
+  "dev-support/test262/generated/test262-class-private-callables-b.txt",
 ].map((relativePath) => join(root, relativePath));
 
 function run(arguments_, expectedStatus = 0) {

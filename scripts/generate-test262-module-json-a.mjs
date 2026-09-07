@@ -20,7 +20,7 @@ const checkedRunner = join(checkedSource, "run-test262");
 const checkedConfig = join(checkedSource, "test262.conf");
 const checkedAdmissions = join(root, "dev-support/test262/admissions.tsv");
 const checkedProfile = join(root, "compat/test262-oxide.conf");
-const checkedManifest = join(root, "tests/test262-class-private-callables-b.txt");
+const checkedManifest = join(root, "dev-support/test262/generated/test262-class-private-callables-b.txt");
 const checkedDiagnostics = join(root, "dev-support/test262/negative-diagnostics.tsv");
 const checkedDiagnosticRules = join(
   root,

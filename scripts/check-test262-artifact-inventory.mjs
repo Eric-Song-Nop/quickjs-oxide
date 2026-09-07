@@ -12,7 +12,7 @@ function trackedFiles(pattern) {
     .filter(Boolean);
 }
 
-const artifacts = trackedFiles("tests/test262-*").filter((relative) =>
+const artifacts = trackedFiles("dev-support/test262/generated/test262-*").filter((relative) =>
   existsSync(relative),
 );
 if (artifacts.length === 0) {

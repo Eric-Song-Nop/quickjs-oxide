@@ -1429,55 +1429,55 @@ mod tests {
 
     const DEFAULT_MODULE_MANIFEST: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-default-a.txt"
+        "/dev-support/test262/generated/test262-module-default-a.txt"
     ));
     const DEFAULT_MODULE_SOURCES: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-default-a-sources.txt"
+        "/dev-support/test262/generated/test262-module-default-a-sources.txt"
     ));
     const DEFAULT_MODULE_EDGES: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-default-a-edges.tsv"
+        "/dev-support/test262/generated/test262-module-default-a-edges.tsv"
     ));
     const DEFAULT_MODULE_CLOSURES: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-default-a-closures.tsv"
+        "/dev-support/test262/generated/test262-module-default-a-closures.tsv"
     ));
     const DEFAULT_MODULE_LEDGER: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-default-a-ledger.tsv"
+        "/dev-support/test262/generated/test262-module-default-a-ledger.tsv"
     ));
     const DEFAULT_MODULE_NEGATIVES: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-default-a-negatives.txt"
+        "/dev-support/test262/generated/test262-module-default-a-negatives.txt"
     ));
     const DECL_POSITION_MODULE_MANIFEST: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-decl-position-a.txt"
+        "/dev-support/test262/generated/test262-module-decl-position-a.txt"
     ));
     const DECL_POSITION_MODULE_LEDGER: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-decl-position-a-ledger.tsv"
+        "/dev-support/test262/generated/test262-module-decl-position-a-ledger.tsv"
     ));
     const STATIC_NEGATIVE_MODULE_MANIFEST: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-static-negative-a.txt"
+        "/dev-support/test262/generated/test262-module-static-negative-a.txt"
     ));
     const STATIC_NEGATIVE_MODULE_LEDGER: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-static-negative-a-ledger.tsv"
+        "/dev-support/test262/generated/test262-module-static-negative-a-ledger.tsv"
     ));
     const STATIC_NEGATIVE_MODULE_REQUESTS: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-static-negative-a-requests.tsv"
+        "/dev-support/test262/generated/test262-module-static-negative-a-requests.tsv"
     ));
     const STATIC_NEGATIVE_MODULE_EXCLUSIONS: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-static-negative-a-exclusions.tsv"
+        "/dev-support/test262/generated/test262-module-static-negative-a-exclusions.tsv"
     ));
     const STATIC_NEGATIVE_MODULE_PROVENANCE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/test262-module-static-negative-a-provenance.tsv"
+        "/dev-support/test262/generated/test262-module-static-negative-a-provenance.tsv"
     ));
     const IMPORT_META_SCRIPT_ROOTS: [&str; 5] = [
         "test/language/expressions/import.meta/syntax/goal-async-function-params-or-body.js",

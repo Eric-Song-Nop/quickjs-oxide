@@ -216,13 +216,13 @@ for (const [, relative] of exclusionCanaries) {
 }
 
 const evidence = new Map([
-  ["tests/test262-module-default-a.txt", manifest],
-  ["tests/test262-module-default-a-sources.txt", sourceManifest],
-  ["tests/test262-module-default-a-edges.tsv", edges],
-  ["tests/test262-module-default-a-closures.tsv", closures],
-  ["tests/test262-module-default-a-ledger.tsv", ledger],
-  ["tests/test262-module-default-a-negatives.txt", negatives],
-  ["tests/test262-module-default-a-exclusions.tsv", exclusions],
+  ["dev-support/test262/generated/test262-module-default-a.txt", manifest],
+  ["dev-support/test262/generated/test262-module-default-a-sources.txt", sourceManifest],
+  ["dev-support/test262/generated/test262-module-default-a-edges.tsv", edges],
+  ["dev-support/test262/generated/test262-module-default-a-closures.tsv", closures],
+  ["dev-support/test262/generated/test262-module-default-a-ledger.tsv", ledger],
+  ["dev-support/test262/generated/test262-module-default-a-negatives.txt", negatives],
+  ["dev-support/test262/generated/test262-module-default-a-exclusions.tsv", exclusions],
 ]);
 
 const admissionGroup = "module-default-a";
@@ -278,9 +278,9 @@ if (mode === "admissions") {
   for (const [relative, contents] of evidence) {
     if (
       ![
-        "tests/test262-module-default-a-edges.tsv",
-        "tests/test262-module-default-a-closures.tsv",
-        "tests/test262-module-default-a-ledger.tsv",
+        "dev-support/test262/generated/test262-module-default-a-edges.tsv",
+        "dev-support/test262/generated/test262-module-default-a-closures.tsv",
+        "dev-support/test262/generated/test262-module-default-a-ledger.tsv",
       ].includes(relative)
     ) {
       continue;

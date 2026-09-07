@@ -38,6 +38,7 @@ scan_globs=(
     --glob '*.rs'
     --glob '*.toml'
     --glob '!**/*tests.rs'
+    --glob '!**/tests/**'
     --glob '!src/bin/run_test262.rs'
     --glob '!src/bin/run_test262/**'
 )

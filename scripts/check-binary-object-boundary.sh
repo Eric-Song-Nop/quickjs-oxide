@@ -47,7 +47,25 @@ def read_source(relative: str) -> str:
     if path.is_symlink() or not path.is_file():
         fail("missing-source", f"{relative} must be a regular file")
         return ""
-    return path.read_text(encoding="utf-8")
+    source = path.read_text(encoding="utf-8")
+    if relative == "src/runtime/tests.rs":
+        # Expand only plain, ungated child declarations. Every evidence function
+        # is still checked below, including its attributes and normalized body.
+        def expand_test_module(match):
+            child = f"src/runtime/tests/{match[1]}.rs"
+            content = read_source(child)
+            return re.sub(r"(?m)^use super::\*;\n", "", content)
+        source = re.sub(r"(?m)^mod (\w+);$", expand_test_module, source)
+    elif relative == "src/runtime/binary_object/ordinary_leaf.rs":
+        declaration = "#[cfg(test)]\nmod tests;"
+        if declaration in source:
+            child = read_source("src/runtime/binary_object/ordinary_leaf/tests.rs")
+            source = source.replace(declaration, "#[cfg(test)]\nmod tests {\n" + child + "\n}")
+    return source
+
+
+def is_test_source(path: Path) -> bool:
+    return path.name == "tests.rs" or "tests" in path.relative_to(root).parts
 
 
 def blank(text: str) -> str:
@@ -589,7 +607,7 @@ binary_visible_counts = {
         re.findall(r"\bpub(?:[ \t\n]*\([^)]*\))?", code)
     )
     for path, code in binary_code_cache.items()
-    if path.name != "tests.rs"
+    if not is_test_source(path)
     and re.search(r"\bpub(?:[ \t\n]*\([^)]*\))?", code)
 }
 is_full_binary_inventory = binary_visible_counts == expected_binary_visible_counts
@@ -611,7 +629,7 @@ bytecode_image_impl_headers = {
         for match in bytecode_image_impl_header_pattern.finditer(code)
     ]
     for path, code in binary_code_cache.items()
-    if path.name != "tests.rs"
+    if not is_test_source(path)
     and path.relative_to(root).as_posix().startswith(
         "src/runtime/binary_object/bytecode_image/"
     )
@@ -1488,7 +1506,7 @@ allowed_native_plan_symbol_files = {
 }
 for path, code in binary_code_cache.items():
     relative = path.relative_to(root).as_posix()
-    if path.name == "tests.rs" or relative in allowed_native_plan_symbol_files:
+    if is_test_source(path) or relative in allowed_native_plan_symbol_files:
         continue
     for symbol in native_plan_facade_symbols:
         mention = re.search(rf"\b{symbol}\b", code)
@@ -6910,7 +6928,7 @@ if not self_test_marker_authorized:
         ("src/runtime/binary_object/function_translate/capability.rs", "ordinary_throw_rows_are_the_exact_reviewed_completion_set"): "46280b952611f2513c2764859dacaa8b0b2be02d86a0ffbf92a0d5791e7deb6a",
         ("src/runtime/binary_object/ordinary_leaf.rs", "lowers_property_free_read_only_with_owned_input_atom_spelling"): "bc88a01461e1c7a8fc3d05e716510a81eb95b464dc48165b863b86928f970172",
         ("src/runtime/binary_object/ordinary_leaf.rs", "read_only_rejects_other_subtypes_non_string_atoms_and_atom_table_drift"): "e03485e5228e1e346c83d40e2285f09283f71c94f53542af394c04a1e6b4b7aa",
-        ("src/runtime/binary_object/ordinary_leaf.rs", "read_only_accepts_only_string_names_under_zero_or_one_slot_provenance"): "2c730d38b8a09aa20b2ba20add47bde755090f23a8599e8516e964352f32eff2",
+        ("src/runtime/binary_object/ordinary_leaf.rs", "read_only_accepts_only_string_names_under_zero_or_one_slot_provenance"): "9a4fb8296751a4218e8d4c7ac672efd95c650e51c4078207af4ba625771dd609",
         ("src/runtime/binary_object/ordinary_leaf.rs", "natural_read_only_wire_remains_outside_the_nonlexical_leaf_cohort"): "b50006a970fd18ce24274af96ee39394e04ae06bf27fa988682dcc3b1480741d",
         ("src/bytecode.rs", "verifier_rejects_bad_constants_and_stack_joins"): "dae9279e19da751453eaec47b74b470d0ee627b0e2a03a1c8fae7c5405907aef",
         ("src/runtime/tests.rs", "trusted_quickjs_ordinary_read_only_uses_exact_zero_stack_wire_and_type_error"): "29f9c54b5ccffea7e9bf100206ccaf0a99b2f4afe8d2ff887ad99b5b11989493",
@@ -7104,9 +7122,54 @@ if not self_test_marker_authorized:
         "src/runtime/binary_object/function_translate/capability.rs": "32dade7c55d5a151c53047eb58b0371bd1a9ea74b9aa10877816ccd906e7122d",
         "src/runtime/binary_object/function_translate/dto.rs": "c1a61dbf9eb3354d90f1f63c29ac58b6704c767218743193135e09c3a9e1118c",
         "src/runtime/binary_object/function_translate/mod.rs": "ebebcae0b13ffbf5eed7f748611fdb6a5af7148c3dd0e0b13f972e270a577c55",
-        "src/runtime/binary_object/ordinary_leaf.rs": "9769c38040576adb92af2b3c92d812c1d3f6961b4b386ca5da19c814ce4ca420",
+        "src/runtime/binary_object/ordinary_leaf.rs": "07afa165df3dc6c719d520267f9290af4ae9de2102cb918b2360e0799ab8d6b3",
         "src/runtime/binary_object_publish.rs": "269399252cc30ed9574df9c693b7172efd06b60dbdcbd7c1c3da5a8a573501e2",
-        "src/runtime/tests.rs": "471ab9471007b657ed6e1e321341e5eac0df46a3b1096a623f5c0e9f2f1cad36",
+        "src/runtime/tests.rs": "3c99c91c1706ae3549b666d31c4bd39e856cfcaacc7f2d0f3d1ed9ccccb8c8fb",
+        "src/runtime/binary_object/ordinary_leaf/tests.rs": "8a659586b5dfd17d5b3f1863913ddc952fd46fbb080bbf422133939fedb86630",
+        "src/runtime/tests/accessors.rs": "7e7aadee6f2248192a6c1438029e26e1153f9412e148cf8c672f7e7d97ddc1d4",
+        "src/runtime/tests/active_frames.rs": "0f23ac2c069808f1800dd38003db6eb92286c6b7261d0d97ea6c36b39a91eed9",
+        "src/runtime/tests/arrays.rs": "b38bd0d4d5d86be7bdb2260ec0093c5c2b32ec46063e2c8a1fa20d728639db3b",
+        "src/runtime/tests/atoms.rs": "7cdddf2a2a1c5a5b222c89c3fb7472b35aa62ee4411789b7b3b7ac429266ace5",
+        "src/runtime/tests/backtraces.rs": "ca7f4b89816a3a984de643f9ad549cffead65826b267eb94922537f914b26dda",
+        "src/runtime/tests/binary_apply.rs": "11d082ac7d750ebb92c1a52e24befbdad7cedac81e62e22a9e130914b0c9a5bb",
+        "src/runtime/tests/binary_calls.rs": "4e4e6c850244e879030032fb4e5bca92ace90a30f56d918594960d538749da1a",
+        "src/runtime/tests/binary_objects.rs": "0633a863aedbe21de26839dab56f90c47e8ceff47b3d75df83a7ff9fdbb8e2f6",
+        "src/runtime/tests/binary_property_keys.rs": "677a0828b4eac884df6bf42c85cc43a47c17d38033dcb1148c513442063a0119",
+        "src/runtime/tests/binary_publication.rs": "dccbaf6984b3b7c4b35ba6b2725e40758b95ae6b13f31fef84ae249221db5e6f",
+        "src/runtime/tests/binary_read_only.rs": "a129a8ba7c4cd0c53862c94f72338f6d59dd69c580a578eaa99dbae66220d279",
+        "src/runtime/tests/binary_scalar.rs": "82423d9f161e8b592e52e1a2128fe82651b0d9d8376eac41299c6ceb6b5b4eff",
+        "src/runtime/tests/binary_this.rs": "e0807c78e5abe46f2ebac827f05db6ee72fac2e2dc2ba63498976127af21ba90",
+        "src/runtime/tests/binary_throw.rs": "42ccdd16dee54a0d23bbaf212312e8fa456bc2f10e188023353d3bfc47a3c540",
+        "src/runtime/tests/boolean_objects.rs": "29171fe0aa9bebc3e2211d3469ea73e302dfb891a16f899b56495e4a448b2b0b",
+        "src/runtime/tests/bound_functions.rs": "9b45a9361e5de043016cf2e05e66c83189c1b02d21dd4d2596c909b6c7a03cac",
+        "src/runtime/tests/calls.rs": "fe184b3739a1c9f3fc5f8a3454bfd1c0d17e045f36b95363f1946d82eebf8c66",
+        "src/runtime/tests/closures.rs": "902740214ce17875cd69c112406e24696f69d085caddf2b93196fe0a931e784a",
+        "src/runtime/tests/coercion.rs": "b82f7f1e88fdc584fcdf35103f761e61a38d0285b34634fb75ddfe3d83f2a10c",
+        "src/runtime/tests/constructors.rs": "84e04b95b503497252054f311585a662bf5744650ac281d2c0a3ca346bd0a370",
+        "src/runtime/tests/debug.rs": "c79fb7067b4b09d4f136ccf2ee6ce68c6c167f84eba6525d13590e884cb776e0",
+        "src/runtime/tests/dynamic_functions.rs": "ce8a2a25f2d6bfa21e9cf5399f120b6f05976367901c1b881d9f3fe53a17ed46",
+        "src/runtime/tests/dynamic_import.rs": "0857135df9de3432917f4db88546a0a3c25996d6a2f3f104fd282b75db074c33",
+        "src/runtime/tests/errors.rs": "7ef14b9a9679b3b2cbebbfa06d2147ae6e528f6d5911509beb3bfbb910320958",
+        "src/runtime/tests/eval.rs": "16d691cc42529c6aed8db151994510159c934b7a878b73ceb610d3455ea4a9fa",
+        "src/runtime/tests/exceptions.rs": "172687dc6f55db9c5ecdb9c8719e6ea90a24e64f0ca37b209230b54e773953ee",
+        "src/runtime/tests/function_objects.rs": "7370c2c4b6ee87e62d506c21e64e56f730a7b31a06187de4861dd171e1a06068",
+        "src/runtime/tests/gc.rs": "a643da6dde459d421bbcaa31eb13b25bb5deee7c6b4588d84ef7e0df74a59570",
+        "src/runtime/tests/globals.rs": "046b4663514b72006c5eb1c4346a80a56756552f3467923f7640ada3c10ae60d",
+        "src/runtime/tests/host_gc.rs": "44f2ed56651e7ad58895c52ed45032d579889c026e0ed3e8a784b1aa8acfd3b7",
+        "src/runtime/tests/host_policy.rs": "db9b878f58c5dbe8285de77ea57229f63a456693ff441d8418b8b60a184d56db",
+        "src/runtime/tests/iterators.rs": "b7850b9c54ec749bd31a6f74acc6973e7b832d14a3de7771841cf9f85004191f",
+        "src/runtime/tests/lexical_cells.rs": "2ef6e971766672d3cd66893710963bf83ffda39634c309865cfa0dcae3ce1da0",
+        "src/runtime/tests/native_calls.rs": "9d64aff7347eb3c3dd08e46b91f475409487318c3326a861fdb1faee5e2983a1",
+        "src/runtime/tests/ownership.rs": "f0efc2c360617930894f9b0179f6e6b77b795b6a0303db7d4fc023171ff97916",
+        "src/runtime/tests/primitive_intrinsics.rs": "c45e66689e7da139c09e6d2e66c536bec2e26d918938b5959c792aeb0edf0eda",
+        "src/runtime/tests/properties.rs": "0df858d59da3c04fbfecde70e7c8601afb9c1b474ff11d40e6334de23098d8d2",
+        "src/runtime/tests/publication.rs": "67a23cfa15a3a2b8202b1cd975852c78c3600be6f86b42fdb774a01100fa4f43",
+        "src/runtime/tests/realms.rs": "1f1036c4ee74bb39a773df8d5a2e44f6a8f211cb2c91465651000e04e1a19419",
+        "src/runtime/tests/shapes.rs": "39dd728a2911af42fb36754ec8df26b2c959ec78d7f472184d951eb5c9c6f19b",
+        "src/runtime/tests/source.rs": "82c12bc0b891746698a20d22ca7f076816df12be682731bb4b7a25d23181af2f",
+        "src/runtime/tests/strings.rs": "bd6e8b1bba2565a458f43f3cbe9632f7327469708811be1e2121f4ccc6c34465",
+        "src/runtime/tests/symbols.rs": "f712b93cf9fb3807e224a3f89998d5f7f841bcddb1eaec076c5d9596b2cdd35e",
+        "src/runtime/tests/weak_references.rs": "0185ce25513444eae94bb39b8ccfae8826bd2d3c9b44773e9f741b49fe990192",
     }
     for relative, expected_hash in stage3j_rust_file_hashes.items():
         path = root / relative
@@ -7117,7 +7180,7 @@ if not self_test_marker_authorized:
         if found_hash != expected_hash:
             fail(
                 "stage3j-rust-freeze",
-                f"{relative} drifted from frozen Rust6 diff {stage3j_rust_diff_sha256}; found {found_hash}",
+                f"{relative} drifted from the reviewed test-layout snapshot (original Rust6 diff {stage3j_rust_diff_sha256}); found {found_hash}",
             )
 
     require_normalized_code_sha256(
@@ -8325,9 +8388,9 @@ if not self_test_marker_authorized:
         "707554c4d52518c67226d827e6ce0f2b2b01023b055b8dcc78db4fd9e3e76e72"
     )
     stage3j_c_evidence_hashes = {
-        "tests/fixtures/function_bytecode_wire.c": "815baf3fbf14de146b53d103401279cd9d5eacd006e60b468f8d141b34e2bd92",
-        "tests/fixtures/function_bytecode_wire.quickjs-2026-06-04.txt": "58d8327f176950aeb8ab682dcf8fc11577421c46c5eb146f078adb073fbf03ec",
-        "dev-support/quickjs-c-oracles.tsv": "e9f74aaa094cc4fb30b4a159d239d7e311622e55cd4c78f75723057a03569ee7",
+        "tests/fixtures/inputs/function_bytecode_wire.c": "815baf3fbf14de146b53d103401279cd9d5eacd006e60b468f8d141b34e2bd92",
+        "tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt": "58d8327f176950aeb8ab682dcf8fc11577421c46c5eb146f078adb073fbf03ec",
+        "dev-support/quickjs-c-oracles.tsv": "d89a56d7de7b16d2a8430318d62d8d736eedff3494946ddaba29c297d259d2e7",
     }
     stage3d_c_sources: dict[str, str] = {}
     for relative, expected_hash in stage3j_c_evidence_hashes.items():
@@ -8340,12 +8403,12 @@ if not self_test_marker_authorized:
         if found_hash != expected_hash:
             fail(
                 "stage3j-c-oracle",
-                f"{relative} drifted from frozen C3 diff {stage3j_c_diff_sha256}; found {found_hash}",
+                f"{relative} drifted from the reviewed fixture-layout snapshot (original C3 diff {stage3j_c_diff_sha256}); found {found_hash}",
             )
         stage3d_c_sources[relative] = payload.decode("utf-8")
 
     stage3d_c_source = stage3d_c_sources.get(
-        "tests/fixtures/function_bytecode_wire.c", ""
+        "tests/fixtures/inputs/function_bytecode_wire.c", ""
     )
     if (
         stage3d_c_source.count(
@@ -8503,7 +8566,7 @@ if not self_test_marker_authorized:
             "the exact 9,981-line C oracle must define and call one Stage3J raw112 matrix with all eight natural/manual/duplicate/finite-loop/underflow wires, defining-realm semantics, repeated execution, and clean pending state",
         )
     stage3d_c_transcript = stage3d_c_sources.get(
-        "tests/fixtures/function_bytecode_wire.quickjs-2026-06-04.txt", ""
+        "tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt", ""
     )
     stage3d_c_transcript_contract = (
         "ordinary-throw-wire-size=45",
@@ -8798,9 +8861,9 @@ if not self_test_marker_authorized:
         or sum(
             line.startswith(
                 "function-bytecode-wire\tfunction-bytecode\t"
-                "tests/fixtures/function_bytecode_wire.c\t"
+                "tests/fixtures/inputs/function_bytecode_wire.c\t"
                 "815baf3fbf14de146b53d103401279cd9d5eacd006e60b468f8d141b34e2bd92\t"
-                "tests/fixtures/function_bytecode_wire.quickjs-2026-06-04.txt\t"
+                "tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt\t"
                 "58d8327f176950aeb8ab682dcf8fc11577421c46c5eb146f078adb073fbf03ec\t"
             )
             for line in stage3i_manifest_lines
@@ -10062,12 +10125,12 @@ if not self_test_marker_authorized:
 
     stage3e_focused_receipt_paths = {
         "focused_tsv": (
-            "tests/test262-class-private-callables-b-global-candidate.tsv",
+            "dev-support/test262/generated/test262-class-private-callables-b-global-candidate.tsv",
             "focused_tsv_sha256",
             1543969,
         ),
         "focused_jsonl": (
-            "tests/test262-class-private-callables-b-global-candidate.jsonl",
+            "dev-support/test262/generated/test262-class-private-callables-b-global-candidate.jsonl",
             "focused_jsonl_sha256",
             3501190,
         ),
@@ -10707,7 +10770,7 @@ for path in binary_sources:
             "scalar admission may consume boolean atom predicates, not raw atom identities; found "
             + location(relative, source, match.start()),
         )
-    if not relative.startswith("src/runtime/binary_object/bytecode_image/") or path.name == "tests.rs":
+    if not relative.startswith("src/runtime/binary_object/bytecode_image/") or is_test_source(path):
         continue
     for match in visible_function_pattern.finditer(code):
         visibility = " ".join(match.group("visibility").split())
@@ -11771,23 +11834,23 @@ run_stage3i_receipt_escape_canaries() {
     local suite_root=$1
     local base_root=$suite_root/base
 
-    mkdir -p "$base_root/tests/fixtures" "$base_root/dev-support/test262" \
+    mkdir -p "$base_root/tests/fixtures/inputs" "$base_root/tests/fixtures/expected" "$base_root/dev-support/test262/generated" \
         "$base_root/docs"
     cp -R "$repository_root/src" "$base_root/src"
     cp -- "$repository_root/Cargo.toml" "$base_root/Cargo.toml"
-    cp -- "$repository_root/tests/fixtures/function_bytecode_wire.c" \
-        "$base_root/tests/fixtures/function_bytecode_wire.c"
-    cp -- "$repository_root/tests/fixtures/function_bytecode_wire.quickjs-2026-06-04.txt" \
-        "$base_root/tests/fixtures/function_bytecode_wire.quickjs-2026-06-04.txt"
+    cp -- "$repository_root/tests/fixtures/inputs/function_bytecode_wire.c" \
+        "$base_root/tests/fixtures/inputs/function_bytecode_wire.c"
+    cp -- "$repository_root/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt" \
+        "$base_root/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt"
     cp -- "$repository_root/dev-support/quickjs-c-oracles.tsv" \
         "$base_root/dev-support/quickjs-c-oracles.tsv"
     cp -- "$repository_root/dev-support/test262/current.conf" \
         "$base_root/dev-support/test262/current.conf"
     cp -- "$repository_root/docs/status.md" "$base_root/docs/status.md"
-    cp -- "$repository_root/tests/test262-class-private-callables-b-global-candidate.tsv" \
-        "$base_root/tests/test262-class-private-callables-b-global-candidate.tsv"
-    cp -- "$repository_root/tests/test262-class-private-callables-b-global-candidate.jsonl" \
-        "$base_root/tests/test262-class-private-callables-b-global-candidate.jsonl"
+    cp -- "$repository_root/dev-support/test262/generated/test262-class-private-callables-b-global-candidate.tsv" \
+        "$base_root/dev-support/test262/generated/test262-class-private-callables-b-global-candidate.tsv"
+    cp -- "$repository_root/dev-support/test262/generated/test262-class-private-callables-b-global-candidate.jsonl" \
+        "$base_root/dev-support/test262/generated/test262-class-private-callables-b-global-candidate.jsonl"
 
     expect_stage3i_receipt_multi_rewrite_rejected() {
         local label=$1
@@ -11810,8 +11873,8 @@ plan = sys.argv[2]
 field = sys.argv[3]
 config_path = root / "dev-support/test262/current.conf"
 status_path = root / "docs/status.md"
-tsv_path = root / "tests/test262-class-private-callables-b-global-candidate.tsv"
-jsonl_path = root / "tests/test262-class-private-callables-b-global-candidate.jsonl"
+tsv_path = root / "dev-support/test262/generated/test262-class-private-callables-b-global-candidate.tsv"
+jsonl_path = root / "dev-support/test262/generated/test262-class-private-callables-b-global-candidate.jsonl"
 
 
 def replace_once(path: Path, before: str, after: str) -> None:
@@ -12028,7 +12091,7 @@ import sys
 source_path = Path(sys.argv[1])
 target_path = Path(sys.argv[2])
 source = source_path.read_text(encoding="utf-8")
-test_module = "\n#[cfg(test)]\nmod tests {"
+test_module = "\n#[cfg(test)]\nmod tests;"
 if source.count(test_module) != 1:
     raise SystemExit(
         "error: ordinary_leaf.rs must contain exactly one cfg(test) module boundary"
@@ -12372,6 +12435,12 @@ path = Path(sys.argv[1])
 before = sys.argv[2]
 after = sys.argv[3]
 source = path.read_text(encoding="utf-8")
+if before not in source and path.with_suffix("").is_dir():
+    matches = [candidate for candidate in path.with_suffix("").rglob("*.rs")
+               if before in candidate.read_text(encoding="utf-8")]
+    if len(matches) == 1:
+        path = matches[0]
+        source = path.read_text(encoding="utf-8")
 if source.count(before) != 1:
     raise SystemExit(f"rewrite canary expected one occurrence of {before!r}")
 path.write_text(source.replace(before, after), encoding="utf-8")
@@ -12403,40 +12472,49 @@ expect_full_rewrite_rejected() {
 
     mkdir -p "$case_root"
     cp -R "$repository_root/src" "$case_root/src"
-    mkdir -p "$case_root/tests/fixtures" "$case_root/dev-support/test262" "$case_root/docs"
+    mkdir -p "$case_root/tests/fixtures/inputs" "$case_root/tests/fixtures/expected" "$case_root/dev-support/test262/generated" "$case_root/docs"
     cp -- "$repository_root/Cargo.toml" "$case_root/Cargo.toml"
-    cp -- "$repository_root/tests/fixtures/function_bytecode_wire.c" \
-        "$case_root/tests/fixtures/function_bytecode_wire.c"
-    cp -- "$repository_root/tests/fixtures/function_bytecode_wire.quickjs-2026-06-04.txt" \
-        "$case_root/tests/fixtures/function_bytecode_wire.quickjs-2026-06-04.txt"
+    cp -- "$repository_root/tests/fixtures/inputs/function_bytecode_wire.c" \
+        "$case_root/tests/fixtures/inputs/function_bytecode_wire.c"
+    cp -- "$repository_root/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt" \
+        "$case_root/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt"
     cp -- "$repository_root/dev-support/quickjs-c-oracles.tsv" \
         "$case_root/dev-support/quickjs-c-oracles.tsv"
     cp -- "$repository_root/dev-support/test262/current.conf" \
         "$case_root/dev-support/test262/current.conf"
     cp -- "$repository_root/docs/status.md" "$case_root/docs/status.md"
-    cp -- "$repository_root/tests/test262-class-private-callables-b-global-candidate.tsv" \
-        "$case_root/tests/test262-class-private-callables-b-global-candidate.tsv"
-    cp -- "$repository_root/tests/test262-class-private-callables-b-global-candidate.jsonl" \
-        "$case_root/tests/test262-class-private-callables-b-global-candidate.jsonl"
+    cp -- "$repository_root/dev-support/test262/generated/test262-class-private-callables-b-global-candidate.tsv" \
+        "$case_root/dev-support/test262/generated/test262-class-private-callables-b-global-candidate.tsv"
+    cp -- "$repository_root/dev-support/test262/generated/test262-class-private-callables-b-global-candidate.jsonl" \
+        "$case_root/dev-support/test262/generated/test262-class-private-callables-b-global-candidate.jsonl"
     python3 - "$case_root/$relative" "$before" "$after" "$before2" "$after2" \
         "$case_root" "$added_relative" "$added_source" <<'PY'
 from pathlib import Path
 import sys
 
-path = Path(sys.argv[1])
-before = sys.argv[2]
-after = sys.argv[3]
-source = path.read_text(encoding="utf-8")
-if source.count(before) != 1:
-    raise SystemExit(f"full rewrite canary expected one occurrence of {before!r}")
-source = source.replace(before, after)
-before2 = sys.argv[4]
-after2 = sys.argv[5]
-if before2:
-    if source.count(before2) != 1:
-        raise SystemExit(f"full rewrite canary expected one occurrence of {before2!r}")
-    source = source.replace(before2, after2)
-path.write_text(source, encoding="utf-8")
+import re
+
+base_path = Path(sys.argv[1])
+for before, after in [(sys.argv[2], sys.argv[3]), (sys.argv[4], sys.argv[5])]:
+    if not before:
+        continue
+    candidates = [base_path, *base_path.with_suffix("").rglob("*.rs")]
+    matches = []
+    for path in candidates:
+        if not path.is_file():
+            continue
+        source = path.read_text(encoding="utf-8")
+        needle, replacement = before, after
+        if path != base_path and base_path.stem == "ordinary_leaf":
+            # The old inline test module contributed four spaces of indentation.
+            needle = re.sub(r"(?m)^ {4}", "", needle)
+            replacement = re.sub(r"(?m)^ {4}", "", replacement)
+        if needle in source:
+            matches.append((path, source, needle, replacement))
+    if len(matches) != 1 or matches[0][1].count(matches[0][2]) != 1:
+        raise SystemExit(f"full rewrite canary expected one occurrence of {before!r}")
+    path, source, needle, replacement = matches[0]
+    path.write_text(source.replace(needle, replacement), encoding="utf-8")
 case_root = Path(sys.argv[6])
 added_relative = sys.argv[7]
 if added_relative:
@@ -13065,7 +13143,7 @@ stage3d-publisher-throw-to-return|ordinary-leaf-consumer-lowering|src/runtime/bi
 stage3d-runtime-evidence-ignored|stage3d-runtime-evidence|src/runtime/tests.rs|#[test]\nfn trusted_quickjs_ordinary_throw_uses_the_exact_wire_metadata_and_value_identity() {|#[test]\n#[ignore = "gate mutation"]\nfn trusted_quickjs_ordinary_throw_uses_the_exact_wire_metadata_and_value_identity() {
 stage3d-runtime-evidence-cfg-excluded|stage3d-runtime-evidence|src/runtime/tests.rs|#[test]\nfn trusted_quickjs_ordinary_throw_reenters_caller_catch_backtrace_and_iterator_close() {|#[cfg(any())]\n#[test]\nfn trusted_quickjs_ordinary_throw_reenters_caller_catch_backtrace_and_iterator_close() {
 stage3d-runtime-evidence-early-return|stage3d-runtime-evidence|src/runtime/tests.rs|fn trusted_quickjs_ordinary_throw_is_terminal_and_branch_targetable() {\n    let runtime = Runtime::new();|fn trusted_quickjs_ordinary_throw_is_terminal_and_branch_targetable() {\n    return;\n    let runtime = Runtime::new();
-stage3d-c-oracle-disabled|stage3d-c-oracle|tests/fixtures/function_bytecode_wire.c|    if (expect_ordinary_throw_completion(compile_context))|    if (0 && expect_ordinary_throw_completion(compile_context))
+stage3d-c-oracle-disabled|stage3d-c-oracle|tests/fixtures/inputs/function_bytecode_wire.c|    if (expect_ordinary_throw_completion(compile_context))|    if (0 && expect_ordinary_throw_completion(compile_context))
 STAGE3D_CANARIES
 expect_full_rewrite_table <<'STAGE3E_CANARIES'
 stage3e-raw49-shared|function-translate-registry-audience|src/runtime/binary_object/function_translate/capability.rs|    row!(49, AtomU8, OrdinaryOnly, Recipe::ThrowReadOnly),|    row!(49, AtomU8, Shared, Recipe::ThrowReadOnly),
@@ -13081,7 +13159,7 @@ stage3e-runtime-wire-subtype-alias|stage3e-runtime-evidence|src/runtime/tests.rs
 stage3e-runtime-type-error-test-ignored|stage3e-runtime-evidence|src/runtime/tests.rs|#[test]\nfn trusted_quickjs_ordinary_read_only_uses_exact_zero_stack_wire_and_type_error() {|#[test]\n#[ignore = "gate mutation"]\nfn trusted_quickjs_ordinary_read_only_uses_exact_zero_stack_wire_and_type_error() {
 stage3e-runtime-catch-test-cfg-excluded|stage3e-runtime-evidence|src/runtime/tests.rs|#[test]\nfn trusted_quickjs_ordinary_read_only_reenters_catch_and_resets_pending_state() {|#[cfg(any())]\n#[test]\nfn trusted_quickjs_ordinary_read_only_reenters_catch_and_resets_pending_state() {
 stage3e-runtime-realm-test-early-return|stage3e-runtime-evidence|src/runtime/tests.rs|fn trusted_quickjs_ordinary_read_only_uses_bytecode_realm_and_attaches_backtrace() {\n    let runtime = Runtime::new();|fn trusted_quickjs_ordinary_read_only_uses_bytecode_realm_and_attaches_backtrace() {\n    return;\n    let runtime = Runtime::new();
-stage3e-c-oracle-disabled|stage3d-c-oracle|tests/fixtures/function_bytecode_wire.c|    if (expect_ordinary_throw_error_completion(compile_context))|    if (0 && expect_ordinary_throw_error_completion(compile_context))
+stage3e-c-oracle-disabled|stage3d-c-oracle|tests/fixtures/inputs/function_bytecode_wire.c|    if (expect_ordinary_throw_error_completion(compile_context))|    if (0 && expect_ordinary_throw_error_completion(compile_context))
 stage3f-status-inherited-coverage-erased|stage3f-status|docs/status.md|retains the Stage-3H raw-111 `ToObject`, Stage-3G\nraw-11 Object, and Stage-3F raw-177 coverage|retains the Stage-3H raw-111 `ToObject` and Stage-3G\nraw-11 Object but drops the Stage-3F raw-177 coverage
 STAGE3E_CANARIES
 expect_full_rewrite_table <<'STAGE3F_CANARIES'
@@ -13101,7 +13179,7 @@ stage3f-wire-stack-one|stage3f-runtime-evidence|src/runtime/tests.rs|    0x00, 0
 stage3f-runtime-wire-test-ignored|stage3f-runtime-evidence|src/runtime/tests.rs|#[test]\nfn trusted_quickjs_ordinary_nop_preserves_exact_metadata_realm_and_zero_effect() {|#[test]\n#[ignore = "gate mutation"]\nfn trusted_quickjs_ordinary_nop_preserves_exact_metadata_realm_and_zero_effect() {
 stage3f-runtime-fallthrough-test-cfg-excluded|stage3f-runtime-evidence|src/runtime/tests.rs|#[test]\nfn trusted_quickjs_ordinary_nop_only_fallthrough_rolls_back_and_retries() {|#[cfg(any())]\n#[test]\nfn trusted_quickjs_ordinary_nop_only_fallthrough_rolls_back_and_retries() {
 stage3f-runtime-branch-test-early-return|stage3f-runtime-evidence|src/runtime/tests.rs|fn trusted_quickjs_ordinary_branch_targets_raw177_typed_index() {\n    let mut image = QUICKJS_ORDINARY_NOP_BC5.to_vec();|fn trusted_quickjs_ordinary_branch_targets_raw177_typed_index() {\n    return;\n    let mut image = QUICKJS_ORDINARY_NOP_BC5.to_vec();
-stage3f-c-oracle-disabled|stage3d-c-oracle|tests/fixtures/function_bytecode_wire.c|    if (expect_ordinary_nop_completion(compile_context))|    if (0 && expect_ordinary_nop_completion(compile_context))
+stage3f-c-oracle-disabled|stage3d-c-oracle|tests/fixtures/inputs/function_bytecode_wire.c|    if (expect_ordinary_nop_completion(compile_context))|    if (0 && expect_ordinary_nop_completion(compile_context))
 stage3f-status-typed-chain-erased|stage3f-status|docs/status.md|`Recipe::Nop` to `FunctionOp::Nop` to `OrdinaryLeafOp::Nop` and finally the|`Recipe::Nop` directly to `Instruction::Nop`, bypassing the typed DTO chain, and finally the
 stage3f-status-premature-source-current-hidden|stage3f-status|docs/status.md|The same oracle pins compatible 32-bit `scope_next` wrapping|<!-- Stage 3F is source-current and authenticated. -->\n\nThe same oracle pins compatible 32-bit `scope_next` wrapping
 stage3f-status-no-longer-source-ahead|stage3f-status|docs/status.md|The same oracle pins compatible 32-bit `scope_next` wrapping|Stage 3F is no longer source-ahead.\n\nThe same oracle pins compatible 32-bit `scope_next` wrapping
@@ -13173,8 +13251,8 @@ stage3g-runtime-fallthrough-negative-erased|stage3g-runtime-evidence|src/runtime
 stage3g-runtime-branch-index-collapse|stage3g-runtime-evidence|src/runtime/tests.rs|            Instruction::Goto(1),\n            Instruction::Object,|            Instruction::Goto(0),\n            Instruction::Object,
 stage3g-runtime-freshness-erased|stage3g-runtime-evidence|src/runtime/tests.rs|            assert_ne!(object, other, "raw11 reused an Object allocation");|            assert_eq!(object, other, "raw11 reused an Object allocation");
 stage3g-runtime-wire-test-cfg-excluded|stage3g-runtime-evidence|src/runtime/tests.rs|#[test]\nfn trusted_quickjs_ordinary_object_is_natural_fresh_and_defining_realm_owned() {|#[cfg(any())]\n#[test]\nfn trusted_quickjs_ordinary_object_is_natural_fresh_and_defining_realm_owned() {
-stage3g-c-oracle-disabled|stage3d-c-oracle|tests/fixtures/function_bytecode_wire.c|    if (expect_ordinary_object_completion(compile_context))|    if (0 && expect_ordinary_object_completion(compile_context))
-stage3g-c-transcript-max-stack-erased|stage3g-c-oracle|tests/fixtures/function_bytecode_wire.quickjs-2026-06-04.txt|ordinary-object-child-metadata=flags:0243,js_mode:1,args:0,vars:0,defined_args:0,stack:1,var_refs:0,closures:0,cpool:0,code:2,locals:0,code_offset:39,atoms:0|ordinary-object-child-metadata=flags:0243,js_mode:1,args:0,vars:0,defined_args:0,stack:0,var_refs:0,closures:0,cpool:0,code:2,locals:0,code_offset:39,atoms:0
+stage3g-c-oracle-disabled|stage3d-c-oracle|tests/fixtures/inputs/function_bytecode_wire.c|    if (expect_ordinary_object_completion(compile_context))|    if (0 && expect_ordinary_object_completion(compile_context))
+stage3g-c-transcript-max-stack-erased|stage3g-c-oracle|tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt|ordinary-object-child-metadata=flags:0243,js_mode:1,args:0,vars:0,defined_args:0,stack:1,var_refs:0,closures:0,cpool:0,code:2,locals:0,code_offset:39,atoms:0|ordinary-object-child-metadata=flags:0243,js_mode:1,args:0,vars:0,defined_args:0,stack:0,var_refs:0,closures:0,cpool:0,code:2,locals:0,code_offset:39,atoms:0
 stage3g-status-inherited-coverage-erased|stage3g-status|docs/status.md|retains the Stage-3H raw-111 `ToObject`, Stage-3G\nraw-11 Object, and Stage-3F raw-177 coverage|retains the Stage-3H raw-111 `ToObject` and Stage-3F\nraw-177 coverage
 STAGE3G_CANARIES
 expect_full_rewrite_rejected stage3g-translate-object-erased \
@@ -13229,9 +13307,9 @@ stage3h-runtime-max-stack-negative-erased|stage3h-runtime-evidence|src/runtime/t
 stage3h-runtime-branch-index-collapse|stage3h-runtime-evidence|src/runtime/tests.rs|            Instruction::Goto(2),\n            Instruction::ToObject,|            Instruction::Goto(1),\n            Instruction::ToObject,
 stage3h-runtime-natural-test-cfg-excluded|stage3h-runtime-evidence|src/runtime/tests.rs|#[test]\nfn trusted_quickjs_ordinary_to_object_is_natural_exact_and_realm_correct() {|#[cfg(any())]\n#[test]\nfn trusted_quickjs_ordinary_to_object_is_natural_exact_and_realm_correct() {
 stage3h-runtime-nullish-test-cfg-excluded|stage3h-runtime-evidence|src/runtime/tests.rs|#[test]\nfn trusted_quickjs_ordinary_to_object_nullish_is_pending_and_catchable() {|#[cfg(any())]\n#[test]\nfn trusted_quickjs_ordinary_to_object_nullish_is_pending_and_catchable() {
-stage3h-c-oracle-disabled|stage3d-c-oracle|tests/fixtures/function_bytecode_wire.c|    if (expect_ordinary_to_object_completion(compile_context))|    if (0 && expect_ordinary_to_object_completion(compile_context))
-stage3h-c-mechanical-wire-remap|stage3d-c-oracle|tests/fixtures/function_bytecode_wire.c|    manual_wire[44] = 111;|    manual_wire[44] = 112;
-stage3h-c-transcript-provenance-concealed|stage3h-c-oracle|tests/fixtures/function_bytecode_wire.quickjs-2026-06-04.txt|ordinary-to-object-evidence=compiler-natural-provenance-plus-mechanically-derived-property-free-wire|ordinary-to-object-evidence=two-compiler-natural-wires
+stage3h-c-oracle-disabled|stage3d-c-oracle|tests/fixtures/inputs/function_bytecode_wire.c|    if (expect_ordinary_to_object_completion(compile_context))|    if (0 && expect_ordinary_to_object_completion(compile_context))
+stage3h-c-mechanical-wire-remap|stage3d-c-oracle|tests/fixtures/inputs/function_bytecode_wire.c|    manual_wire[44] = 111;|    manual_wire[44] = 112;
+stage3h-c-transcript-provenance-concealed|stage3h-c-oracle|tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt|ordinary-to-object-evidence=compiler-natural-provenance-plus-mechanically-derived-property-free-wire|ordinary-to-object-evidence=two-compiler-natural-wires
 stage3h-c-manifest-source-hash-drift|stage3j-c-oracle|dev-support/quickjs-c-oracles.tsv|815baf3fbf14de146b53d103401279cd9d5eacd006e60b468f8d141b34e2bd92|815baf3fbf14de146b53d103401279cd9d5eacd006e60b468f8d141b34e2bd93
 stage3h-status-c-provenance-erased|stage3h-status|docs/status.md|The oracle honestly labels this as compiler\nprovenance, then mechanically changes|The oracle labels both wires as compiler\nprovenance, then changes
 stage3h-status-inherited-coverage-erased|stage3h-status|docs/status.md|retains the Stage-3H raw-111 `ToObject`, Stage-3G\nraw-11 Object, and Stage-3F raw-177 coverage|retains the Stage-3G\nraw-11 Object and Stage-3F raw-177 coverage
@@ -13275,8 +13353,8 @@ stage3i-validator-index-drift|stage3i-push-this-protocol|src/runtime/binary_obje
 stage3i-publisher-push-this-pre-match-drop|stage3i-push-this-publication|src/runtime/binary_object_publish.rs|    let instruction = match operation {|    if matches!(operation, OrdinaryLeafOp::PushThis) { return Ok(Instruction::Nop); }\n    let instruction = match operation {
 stage3i-wire-fnv-drift|stage3i-runtime-evidence|src/runtime/tests.rs|            0x4ec7_e018_7375_d810,|            0x4ec7_e018_7375_d811,
 stage3i-runtime-test-ignored|stage3i-runtime-evidence|src/runtime/tests.rs|#[test]\nfn trusted_quickjs_ordinary_push_this_is_exact_typed_and_realm_correct() {|#[test]\n#[ignore]\nfn trusted_quickjs_ordinary_push_this_is_exact_typed_and_realm_correct() {
-stage3i-c-oracle-disabled|stage3i-c-oracle|tests/fixtures/function_bytecode_wire.c|    if (expect_ordinary_push_this_completion(compile_context))|    if (0 && expect_ordinary_push_this_completion(compile_context))
-stage3i-c-transcript-verdict-drift|stage3i-c-oracle|tests/fixtures/function_bytecode_wire.quickjs-2026-06-04.txt|ordinary-push-this-oracle=passed|ordinary-push-this-oracle=failed
+stage3i-c-oracle-disabled|stage3i-c-oracle|tests/fixtures/inputs/function_bytecode_wire.c|    if (expect_ordinary_push_this_completion(compile_context))|    if (0 && expect_ordinary_push_this_completion(compile_context))
+stage3i-c-transcript-verdict-drift|stage3i-c-oracle|tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt|ordinary-push-this-oracle=passed|ordinary-push-this-oracle=failed
 stage3i-c-manifest-source-hash-drift|stage3j-c-oracle|dev-support/quickjs-c-oracles.tsv|815baf3fbf14de146b53d103401279cd9d5eacd006e60b468f8d141b34e2bd92|815baf3fbf14de146b53d103401279cd9d5eacd006e60b468f8d141b34e2bd93
 stage3j-status-registry-counts-stale|stage3j-status|docs/status.md|The scalar policy remains 30 opcodes; the stage-3J ordinary policy is 133,\nand their union is 134 (110 blocked, one scalar-only, 104 ordinary-only, and 29\nshared registry rows).|The scalar policy remains 30 opcodes; the stage-3I ordinary policy is 132,\nand their union is 133 (111 blocked, one scalar-only, 103 ordinary-only, and 29\nshared registry rows).
 stage3j-status-raw112-reblocked|stage3j-status|docs/status.md|audience; stage 3J adds exactly raw 112 `to_propkey` with its `None` operand,\n1-to-1 stack effect, and ordinary-only audience. Raw 47 `return_async` remains\nblocked.|audience. Raw 47 `return_async` and raw 112 `to_propkey` remain blocked.
@@ -13301,8 +13379,8 @@ stage3j-publisher-to-propkey-synthetic|stage3j-to-propkey-publication|src/runtim
 stage3j-natural-wire-fnv-drift|stage3j-runtime-evidence|src/runtime/tests.rs|            0x83c3_3a69_f73e_737c,|            0x83c3_3a69_f73e_737d,
 stage3j-duplicate-loop-test-ignored|stage3j-runtime-evidence|src/runtime/binary_object/ordinary_leaf.rs|    #[test]\n    fn to_propkey_duplicate_and_finite_loop_reentry_are_ordinary_verified() {|    #[test]\n    #[ignore = "gate mutation"]\n    fn to_propkey_duplicate_and_finite_loop_reentry_are_ordinary_verified() {
 stage3j-runtime-observability-test-ignored|stage3j-runtime-evidence|src/runtime/tests.rs|#[test]\nfn trusted_quickjs_ordinary_to_propkey_observability_and_reentry_match_quickjs() {|#[test]\n#[ignore = "gate mutation"]\nfn trusted_quickjs_ordinary_to_propkey_observability_and_reentry_match_quickjs() {
-stage3j-c-oracle-disabled|stage3j-c-oracle|tests/fixtures/function_bytecode_wire.c|    if (expect_ordinary_to_propkey_completion(compile_context))|    if (0 && expect_ordinary_to_propkey_completion(compile_context))
-stage3j-c-transcript-verdict-drift|stage3j-c-oracle|tests/fixtures/function_bytecode_wire.quickjs-2026-06-04.txt|ordinary-to-propkey-oracle=passed|ordinary-to-propkey-oracle=failed
+stage3j-c-oracle-disabled|stage3j-c-oracle|tests/fixtures/inputs/function_bytecode_wire.c|    if (expect_ordinary_to_propkey_completion(compile_context))|    if (0 && expect_ordinary_to_propkey_completion(compile_context))
+stage3j-c-transcript-verdict-drift|stage3j-c-oracle|tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt|ordinary-to-propkey-oracle=passed|ordinary-to-propkey-oracle=failed
 stage3j-c-manifest-transcript-hash-drift|stage3j-c-oracle|dev-support/quickjs-c-oracles.tsv|58d8327f176950aeb8ab682dcf8fc11577421c46c5eb146f078adb073fbf03ec|58d8327f176950aeb8ab682dcf8fc11577421c46c5eb146f078adb073fbf03ed
 stage3j-status-typed-chain-erased|stage3j-status|docs/status.md|Stage 3J admits raw 112 only as the exact one-to-one typed chain|Stage 3J describes raw 112 as a typed chain
 stage3j-status-duplicate-rejected|stage3j-status|docs/status.md|duplicate raw112 and a finite backedge to\nraw112 are legal and retain their ordinary stack/CFG checks.|duplicate raw112 and a finite backedge to\nraw112 are rejected by a special entrance protocol.

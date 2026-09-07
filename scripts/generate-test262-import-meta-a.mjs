@@ -39,25 +39,25 @@ const expected = {
   variants: 27,
   negatives: 12,
   evidenceSha256: {
-    "tests/test262-import-meta-a.txt":
+    "dev-support/test262/generated/test262-import-meta-a.txt":
       "e74868cc1620f70e5e1cb4528bd2af6915cf1ada5895406869004de7d857def6",
-    "tests/test262-import-meta-a-sources.txt":
+    "dev-support/test262/generated/test262-import-meta-a-sources.txt":
       "6adb4674b5fd39fa55c3727e937539362426b5e94598bc17b6e49deca0f1e0b5",
-    "tests/test262-import-meta-a-module-roots.txt":
+    "dev-support/test262/generated/test262-import-meta-a-module-roots.txt":
       "13e6fe16e2861bedab398511180006c1b3660e1265b5c350809579c83267e8d3",
-    "tests/test262-import-meta-a-script-roots.txt":
+    "dev-support/test262/generated/test262-import-meta-a-script-roots.txt":
       "7a7f50e4def2ed2bbc83b944a4f28287b8cad1f5aa1eb960bc0a7ab6428047b3",
-    "tests/test262-import-meta-a-edges.tsv":
+    "dev-support/test262/generated/test262-import-meta-a-edges.tsv":
       "24adcf9f82ac269972dde05bc445534bcbb658fc6fab364e7caf1ad42f971a37",
-    "tests/test262-import-meta-a-closures.tsv":
+    "dev-support/test262/generated/test262-import-meta-a-closures.tsv":
       "7ed199bbfd603004f11cc0130651cc11c48b0697bccd688bf3a1db2378e21310",
-    "tests/test262-import-meta-a-ledger.tsv":
+    "dev-support/test262/generated/test262-import-meta-a-ledger.tsv":
       "ad2282a942e54a6da43dfc092f99a2bf89cc42519d9d1f89f4a78e632e9edfba",
-    "tests/test262-import-meta-a-variants.tsv":
+    "dev-support/test262/generated/test262-import-meta-a-variants.tsv":
       "403284c9137dde8db3f7d0ea149e383fc169735f41123182f57636834cf8a336",
-    "tests/test262-import-meta-a-negatives.txt":
+    "dev-support/test262/generated/test262-import-meta-a-negatives.txt":
       "eebc250f1fac5b3ff153bf76ff32c5a31d88c74bb3ea8249597513c61fd771fc",
-    "tests/test262-import-meta-a-exclusions.tsv":
+    "dev-support/test262/generated/test262-import-meta-a-exclusions.tsv":
       "c4b24a9d180fa8cf4ebc5f10b43bf6e47adb07b89bcd979954cc545a033241bf",
   },
 };
@@ -293,16 +293,16 @@ for (const [surface, relativePath] of exclusionCanaries) {
 }
 
 const evidence = new Map([
-  ["tests/test262-import-meta-a.txt", manifest],
-  ["tests/test262-import-meta-a-sources.txt", sourceManifest],
-  ["tests/test262-import-meta-a-module-roots.txt", moduleRootManifest],
-  ["tests/test262-import-meta-a-script-roots.txt", scriptRootManifest],
-  ["tests/test262-import-meta-a-edges.tsv", edges],
-  ["tests/test262-import-meta-a-closures.tsv", closures],
-  ["tests/test262-import-meta-a-ledger.tsv", ledger],
-  ["tests/test262-import-meta-a-variants.tsv", variantsLedger],
-  ["tests/test262-import-meta-a-negatives.txt", negatives],
-  ["tests/test262-import-meta-a-exclusions.tsv", exclusions],
+  ["dev-support/test262/generated/test262-import-meta-a.txt", manifest],
+  ["dev-support/test262/generated/test262-import-meta-a-sources.txt", sourceManifest],
+  ["dev-support/test262/generated/test262-import-meta-a-module-roots.txt", moduleRootManifest],
+  ["dev-support/test262/generated/test262-import-meta-a-script-roots.txt", scriptRootManifest],
+  ["dev-support/test262/generated/test262-import-meta-a-edges.tsv", edges],
+  ["dev-support/test262/generated/test262-import-meta-a-closures.tsv", closures],
+  ["dev-support/test262/generated/test262-import-meta-a-ledger.tsv", ledger],
+  ["dev-support/test262/generated/test262-import-meta-a-variants.tsv", variantsLedger],
+  ["dev-support/test262/generated/test262-import-meta-a-negatives.txt", negatives],
+  ["dev-support/test262/generated/test262-import-meta-a-exclusions.tsv", exclusions],
 ]);
 for (const [relativePath, contents] of evidence) {
   assert.equal(sha256(contents), expected.evidenceSha256[relativePath], `${relativePath} changed`);

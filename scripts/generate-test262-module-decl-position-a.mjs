@@ -34,15 +34,15 @@ const expected = {
   importRoots: 43,
   generatorRoots: 12,
   evidenceSha256: {
-    "tests/test262-module-decl-position-a.txt":
+    "dev-support/test262/generated/test262-module-decl-position-a.txt":
       "5e70969f0a3f4ed428f69e868fdd69fe2b6821d42733e97cc13c1e24837ef182",
-    "tests/test262-module-decl-position-a-ledger.tsv":
+    "dev-support/test262/generated/test262-module-decl-position-a-ledger.tsv":
       "640f63f2a82ec0055315fc40062f5801fde707a4076e56dcf18aaf10a1fec908",
-    "tests/test262-module-decl-position-a-variants.tsv":
+    "dev-support/test262/generated/test262-module-decl-position-a-variants.tsv":
       "b3c079495d0161773a15cd5f039d840e7959fe6c039b416a74203c084f7186db",
-    "tests/test262-module-decl-position-a-negatives.txt":
+    "dev-support/test262/generated/test262-module-decl-position-a-negatives.txt":
       "5e70969f0a3f4ed428f69e868fdd69fe2b6821d42733e97cc13c1e24837ef182",
-    "tests/test262-module-decl-position-a-exclusions.tsv":
+    "dev-support/test262/generated/test262-module-decl-position-a-exclusions.tsv":
       "593c026b26d72c7ee5511fdd7ab526c25f8a08719e43ecdac9e7ce6bcb6c7b36",
   },
 };
@@ -145,11 +145,11 @@ const exclusions = lines(
 );
 
 const evidence = new Map([
-  ["tests/test262-module-decl-position-a.txt", manifest],
-  ["tests/test262-module-decl-position-a-ledger.tsv", ledger],
-  ["tests/test262-module-decl-position-a-variants.tsv", variants],
-  ["tests/test262-module-decl-position-a-negatives.txt", manifest],
-  ["tests/test262-module-decl-position-a-exclusions.tsv", exclusions],
+  ["dev-support/test262/generated/test262-module-decl-position-a.txt", manifest],
+  ["dev-support/test262/generated/test262-module-decl-position-a-ledger.tsv", ledger],
+  ["dev-support/test262/generated/test262-module-decl-position-a-variants.tsv", variants],
+  ["dev-support/test262/generated/test262-module-decl-position-a-negatives.txt", manifest],
+  ["dev-support/test262/generated/test262-module-decl-position-a-exclusions.tsv", exclusions],
 ]);
 
 assert.equal(roots.length, expected.roots);
@@ -204,7 +204,7 @@ if (mode === "admissions") {
 } else {
   assertAdmissionGroup(checkedAdmissions, admissionGroup, admissionRecords);
   for (const [relativePath, contents] of evidence) {
-    if (relativePath === "tests/test262-module-decl-position-a-ledger.tsv") {
+    if (relativePath === "dev-support/test262/generated/test262-module-decl-position-a-ledger.tsv") {
       assert.equal(
         readFileSync(join(root, relativePath), "utf8"),
         contents,

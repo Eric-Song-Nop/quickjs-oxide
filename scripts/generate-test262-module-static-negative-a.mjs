@@ -42,19 +42,19 @@ const expected = {
   canaries: 25,
   manifestSha256: "dd8e65fab5447123ad48aa383a835893b72a5e899d34d2dce3a81660bdacc145",
   evidenceSha256: {
-    "tests/test262-module-static-negative-a.txt":
+    "dev-support/test262/generated/test262-module-static-negative-a.txt":
       "dd8e65fab5447123ad48aa383a835893b72a5e899d34d2dce3a81660bdacc145",
-    "tests/test262-module-static-negative-a-ledger.tsv":
+    "dev-support/test262/generated/test262-module-static-negative-a-ledger.tsv":
       "e58797b86f3fa3d22f439e2d0c5e575030db0fbc9fc948bcfd9d8e2ff589765c",
-    "tests/test262-module-static-negative-a-requests.tsv":
+    "dev-support/test262/generated/test262-module-static-negative-a-requests.tsv":
       "fcfc7d66f73137a7959b2c249b8c0ed877fdca5069366c782b29cef1e1180ba5",
-    "tests/test262-module-static-negative-a-variants.tsv":
+    "dev-support/test262/generated/test262-module-static-negative-a-variants.tsv":
       "96241ec0e0a5fd07a2e0fbbf8d3b624960367678ec2bb1ce47a094d45c58b271",
-    "tests/test262-module-static-negative-a-negatives.txt":
+    "dev-support/test262/generated/test262-module-static-negative-a-negatives.txt":
       "dd8e65fab5447123ad48aa383a835893b72a5e899d34d2dce3a81660bdacc145",
-    "tests/test262-module-static-negative-a-exclusions.tsv":
+    "dev-support/test262/generated/test262-module-static-negative-a-exclusions.tsv":
       "b9ff3c813883844d745ce959ee79a0b61316cb94244157657a4c5daf0d76af82",
-    "tests/test262-module-static-negative-a-provenance.tsv":
+    "dev-support/test262/generated/test262-module-static-negative-a-provenance.tsv":
       "9b422029fcc07575e66f43f8f0b6c913622b1bd5c9c9c7c274793af9b10a28b8",
   },
 };
@@ -202,7 +202,7 @@ const allowedFeatures = new Set([
   "let,const",
   "new.target",
 ]);
-const manifestPath = join(root, "tests/test262-module-static-negative-a.txt");
+const manifestPath = join(root, "dev-support/test262/generated/test262-module-static-negative-a.txt");
 const owned = new Set(
   existsSync(manifestPath)
     ? readFileSync(manifestPath, "utf8").split("\n").filter(Boolean)
@@ -331,13 +331,13 @@ const provenance = lines(
 );
 
 const evidence = new Map([
-  ["tests/test262-module-static-negative-a.txt", manifest],
-  ["tests/test262-module-static-negative-a-ledger.tsv", ledger],
-  ["tests/test262-module-static-negative-a-requests.tsv", requests],
-  ["tests/test262-module-static-negative-a-variants.tsv", variants],
-  ["tests/test262-module-static-negative-a-negatives.txt", manifest],
-  ["tests/test262-module-static-negative-a-exclusions.tsv", exclusions],
-  ["tests/test262-module-static-negative-a-provenance.tsv", provenance],
+  ["dev-support/test262/generated/test262-module-static-negative-a.txt", manifest],
+  ["dev-support/test262/generated/test262-module-static-negative-a-ledger.tsv", ledger],
+  ["dev-support/test262/generated/test262-module-static-negative-a-requests.tsv", requests],
+  ["dev-support/test262/generated/test262-module-static-negative-a-variants.tsv", variants],
+  ["dev-support/test262/generated/test262-module-static-negative-a-negatives.txt", manifest],
+  ["dev-support/test262/generated/test262-module-static-negative-a-exclusions.tsv", exclusions],
+  ["dev-support/test262/generated/test262-module-static-negative-a-provenance.tsv", provenance],
 ]);
 
 const featureCount = (features) =>
@@ -394,7 +394,7 @@ if (mode === "admissions") {
   assertAdmissionGroup(checkedAdmissions, admissionGroup, admissionRecords);
   assert(roots.every((relativePath) => audited.has(relativePath)), "profile is missing an admission");
   for (const [relativePath, contents] of evidence) {
-    if (relativePath === "tests/test262-module-static-negative-a-provenance.tsv") {
+    if (relativePath === "dev-support/test262/generated/test262-module-static-negative-a-provenance.tsv") {
       // This receipt records the profile as it stood when the cohort was
       // promoted. Later milestones legitimately extend that live profile, so
       // authenticate the historical receipt instead of regenerating it from
@@ -415,11 +415,11 @@ if (mode === "admissions") {
     }
     if (
       [
-        "tests/test262-module-static-negative-a.txt",
-        "tests/test262-module-static-negative-a-ledger.tsv",
-        "tests/test262-module-static-negative-a-requests.tsv",
-        "tests/test262-module-static-negative-a-exclusions.tsv",
-        "tests/test262-module-static-negative-a-provenance.tsv",
+        "dev-support/test262/generated/test262-module-static-negative-a.txt",
+        "dev-support/test262/generated/test262-module-static-negative-a-ledger.tsv",
+        "dev-support/test262/generated/test262-module-static-negative-a-requests.tsv",
+        "dev-support/test262/generated/test262-module-static-negative-a-exclusions.tsv",
+        "dev-support/test262/generated/test262-module-static-negative-a-provenance.tsv",
       ].includes(relativePath)
     ) {
       assert.equal(

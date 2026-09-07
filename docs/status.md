@@ -979,7 +979,7 @@ assignment-target cohorts discovered during admission are exact-contracted too.
 R3el adds the QuickJS-matched single-statement function, lexical, and class
 declaration diagnostics, plus strict-code `with` statement diagnostics.
 
-The active tree now retains only 23 referenced `tests/test262-*` artifacts; 313
+The active tree now retains only 23 referenced `dev-support/test262/generated/test262-*` artifacts; 313
 superseded manifests and ledgers are authenticated in the R3eh history release.
 Fast CI rejects any new unreferenced Test262 bookkeeping file.
 

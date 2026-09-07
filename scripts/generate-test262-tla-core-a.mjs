@@ -15,7 +15,7 @@ const root = resolve(import.meta.dirname, "..");
 const checkedSuite = join(root, "target/oracle/quickjs-2026-06-04/test262");
 const checkedAdmissions = join(root, "dev-support/test262/admissions.tsv");
 const checkedProfile = join(root, "compat/test262-oxide.conf");
-const checkedManifest = join(root, "tests/test262-class-private-callables-b.txt");
+const checkedManifest = join(root, "dev-support/test262/generated/test262-class-private-callables-b.txt");
 const args = process.argv.slice(2);
 
 function option(name, fallback) {
