@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-ORACLE = ROOT / 'tests/oracle'
+ORACLE = ROOT / 'apps/cli/tests/oracle'
 HOST_MODULES = {'test262_create_realm', 'test262_host_gc', 'test262_is_html_dda'}
 MODULE = re.compile(r'^(?:pub(?:\([^)]*\))?\s+)?mod (\w+);$', re.MULTILINE)
 TEST = re.compile(r'^\s*#\[test\]', re.MULTILINE)
@@ -27,7 +27,7 @@ def inventory():
         path = path.resolve()
         if path in visited:
             fail(f'duplicate module registration: {path.relative_to(ROOT)}')
-        if not path.is_relative_to(ROOT / 'tests'):
+        if not path.is_relative_to(ROOT / 'apps/cli/tests') and path != ROOT / 'crates/quickjs-oxide/tests/common/mod.rs':
             fail(f'oracle module escapes tests/: {path}')
         visited.add(path)
         source = path.read_text()
@@ -50,9 +50,14 @@ def inventory():
                 fail(f'unexpected host-only module: {name}')
             paths = [a for a in attributes if a.startswith('#[path')]
             if paths:
-                if len(paths) != 1 or paths[0] != '#[path = "../common/mod.rs"]' or path != ORACLE / 'main.rs':
+                allowed = {
+                    (ORACLE / 'main.rs', '#[path = "../common/mod.rs"]'): '../common/mod.rs',
+                    (ROOT / 'apps/cli/tests/common/mod.rs', '#[path = "../../../../crates/quickjs-oxide/tests/common/mod.rs"]'): '../../../../crates/quickjs-oxide/tests/common/mod.rs',
+                }
+                relative = allowed.get((path, paths[0])) if len(paths) == 1 else None
+                if relative is None:
                     fail(f'use ordinary module declarations for {name}')
-                child = path.parent / '../common/mod.rs'
+                child = path.parent / relative
             else:
                 directory = path.parent if path.name in ('main.rs', 'mod.rs') else path.with_suffix('')
                 candidates = [directory / (name + '.rs'), directory / name / 'mod.rs']
@@ -68,14 +73,14 @@ def inventory():
     orphans = set(ORACLE.rglob('*.rs')) - visited
     if orphans:
         fail('unregistered oracle sources: ' + ', '.join(str(p.relative_to(ROOT)) for p in sorted(orphans)))
-    if list((ROOT / 'tests').glob('oracle_*.rs')):
-        fail('oracle sources must live under tests/oracle/')
+    if list((ROOT / 'apps/cli/tests').glob('oracle_*.rs')):
+        fail('oracle sources must live under apps/cli/tests/oracle/')
     print(f'Oracle module tree covers {counts[False]} default + {counts[True]} host tests across {len(visited)} sources.')
     return counts
 
 
 def compiled_inventory(features=False, test_filter=None):
-    command = ['cargo', 'test', '--locked', '--test', 'oracle']
+    command = ['cargo', 'test', '--locked', '-p', 'quickjs-oxide-cli', '--test', 'oracle']
     if features:
         command += ['--features', 'test262-host']
     if test_filter:

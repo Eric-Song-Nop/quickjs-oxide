@@ -43,7 +43,7 @@ const wrapperPath = path.resolve(
 );
 const { engine_metadata: engineMetadata, evaluate } = require(wrapperPath);
 
-const examplesPath = path.resolve(process.cwd(), "web/site/examples.js");
+const examplesPath = path.resolve(process.cwd(), "apps/web/site/examples.js");
 const examplesSource = await readFile(examplesPath, "utf8");
 const examplesModule = await import(
   `data:text/javascript;base64,${Buffer.from(examplesSource).toString("base64")}`

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptDirectory, "../..");
-const supportDirectory = resolve(root, "tests/oracle/support");
+const supportDirectory = resolve(root, "apps/cli/tests/oracle/support");
 const providerFiles = [
   resolve(supportDirectory, "object_graph_observation.rs"),
   resolve(supportDirectory, "runtime_completion_oracle.rs"),
@@ -22,7 +22,7 @@ const options = parseArguments(process.argv.slice(2));
 const tombstoneSources = [
   {
     label: "legacy Error-context completion observer",
-    origin: "tests/oracle/arguments/oracle_arguments.rs",
+    origin: "apps/cli/tests/oracle/arguments/oracle_arguments.rs",
     replacement:
       "the matching runtime_completion_oracle::observe_*_eval_completion helper",
     source: String.raw`fn observe_rust_eval(
@@ -61,7 +61,7 @@ const tombstoneSources = [
   },
   {
     label: "compact completion observer",
-    origin: "tests/oracle/object/oracle_object_descriptors.rs",
+    origin: "apps/cli/tests/oracle/object/oracle_object_descriptors.rs",
     replacement: "runtime_completion_oracle::observe_eval_completion",
     source: String.raw`fn observe_rust_eval(
     runtime: &Runtime,
@@ -99,7 +99,7 @@ const tombstoneSources = [
   },
   {
     label: "prelude fail-fast completion comparison",
-    origin: "tests/oracle/string/oracle_string_case.rs",
+    origin: "apps/cli/tests/oracle/string/oracle_string_case.rs",
     replacement:
       "runtime_completion_oracle::compare_eval_completion_cases_with_prelude",
     source: String.raw`fn compare_cases(group: &str, cases: &[(&str, &str)]) {
@@ -121,7 +121,7 @@ const tombstoneSources = [
   },
   {
     label: "description-only compact completion observer",
-    origin: "tests/oracle/string/oracle_string_case.rs",
+    origin: "apps/cli/tests/oracle/string/oracle_string_case.rs",
     replacement:
       "runtime_completion_oracle::compare_eval_completion_cases_with_prelude",
     source: String.raw`fn observe_rust_eval(
@@ -160,7 +160,7 @@ const tombstoneSources = [
   },
   {
     label: "Object graph descriptor-bit formatter without a trailing argument comma",
-    origin: "tests/oracle/object/oracle_object_descriptors.rs",
+    origin: "apps/cli/tests/oracle/object/oracle_object_descriptors.rs",
     replacement: "object_graph_observation::data_bits",
     source: String.raw`fn data_bits(writable: bool, enumerable: bool, configurable: bool) -> String {
     format!(
@@ -173,7 +173,7 @@ const tombstoneSources = [
   },
   {
     label: "Object graph integer-property reader",
-    origin: "tests/oracle/object/oracle_object_assign.rs",
+    origin: "apps/cli/tests/oracle/object/oracle_object_assign.rs",
     replacement: "object_graph_observation::int_property",
     source: String.raw`fn int_property(runtime: &Runtime, context: &mut Context, object: &ObjectRef, name: &str) -> i32 {
     let Value::Int(value) = context
@@ -191,32 +191,32 @@ const tombstoneSources = [
 // Adjacent pre-existing copies stay explicit as path-and-fingerprint
 // exceptions, so the gate still rejects any new copy and detects stale entries.
 const helperAllowlist = new Set([
-  "tests/oracle/collections/oracle_map.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
-  "tests/oracle/collections/oracle_set.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
-  "tests/oracle/collections/oracle_weak_collections.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
-  "tests/oracle/errors/oracle_errors.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
-  "tests/oracle/function_semantics/oracle_function_prototype_prefix.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
-  "tests/oracle/global/oracle_global_numeric_predicates.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
-  "tests/oracle/global/oracle_global_uri_codecs.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
-  "tests/oracle/number/oracle_number_constructor_conversion.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
-  "tests/oracle/object/oracle_object_group_by.rs\u00002ecb9b416736102f1170cfa102c85182007491633a58badf2c1677354d8fa244",
-  "tests/oracle/object/oracle_object_group_by.rs\u00003da3ed15c59afc7ed8c28f61354fa7f1ad406d948f45faa8d6989b5805fbeec7",
-  "tests/oracle/object/oracle_object_group_by.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
-  "tests/oracle/object/oracle_object_group_by.rs\u0000174e66d9def3034c785ba13ce8818d1a4b6132fa1aa62f3956f8a870a18c6690",
-  "tests/oracle/object/oracle_object_group_by.rs\u0000ae3af224efe82f1d4d7b2adf0ac80991c51681123f90bc2ed647e15b29c3832d",
-  "tests/oracle/object/oracle_object_group_by.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
-  "tests/oracle/object/oracle_object_intrinsic.rs\u00002ecb9b416736102f1170cfa102c85182007491633a58badf2c1677354d8fa244",
-  "tests/oracle/object/oracle_object_intrinsic.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
-  "tests/oracle/object/oracle_object_intrinsic.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
-  "tests/oracle/string/oracle_string_index_search.rs\u0000ae3af224efe82f1d4d7b2adf0ac80991c51681123f90bc2ed647e15b29c3832d",
-  "tests/oracle/string/oracle_string_index_search.rs\u0000174e66d9def3034c785ba13ce8818d1a4b6132fa1aa62f3956f8a870a18c6690",
-  "tests/oracle/string/oracle_string_index_search.rs\u0000c09ce90549ab8e65e6a88c4f7261c5ec6e7aa8a11bee43106b827b8823bc1377",
-  "tests/oracle/string/oracle_string_index_search.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
-  "tests/oracle/string/oracle_string_intrinsic.rs\u00003da3ed15c59afc7ed8c28f61354fa7f1ad406d948f45faa8d6989b5805fbeec7",
-  "tests/oracle/string/oracle_string_intrinsic.rs\u0000c09ce90549ab8e65e6a88c4f7261c5ec6e7aa8a11bee43106b827b8823bc1377",
-  "tests/oracle/string/oracle_string_intrinsic.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
-  "tests/oracle/string/oracle_string_split.rs\u0000174e66d9def3034c785ba13ce8818d1a4b6132fa1aa62f3956f8a870a18c6690",
-  "tests/oracle/math_intrinsic.rs\u00002ecb9b416736102f1170cfa102c85182007491633a58badf2c1677354d8fa244",
+  "apps/cli/tests/oracle/collections/oracle_map.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
+  "apps/cli/tests/oracle/collections/oracle_set.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
+  "apps/cli/tests/oracle/collections/oracle_weak_collections.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
+  "apps/cli/tests/oracle/errors/oracle_errors.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
+  "apps/cli/tests/oracle/function_semantics/oracle_function_prototype_prefix.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
+  "apps/cli/tests/oracle/global/oracle_global_numeric_predicates.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
+  "apps/cli/tests/oracle/global/oracle_global_uri_codecs.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
+  "apps/cli/tests/oracle/number/oracle_number_constructor_conversion.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
+  "apps/cli/tests/oracle/object/oracle_object_group_by.rs\u00002ecb9b416736102f1170cfa102c85182007491633a58badf2c1677354d8fa244",
+  "apps/cli/tests/oracle/object/oracle_object_group_by.rs\u00003da3ed15c59afc7ed8c28f61354fa7f1ad406d948f45faa8d6989b5805fbeec7",
+  "apps/cli/tests/oracle/object/oracle_object_group_by.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
+  "apps/cli/tests/oracle/object/oracle_object_group_by.rs\u0000174e66d9def3034c785ba13ce8818d1a4b6132fa1aa62f3956f8a870a18c6690",
+  "apps/cli/tests/oracle/object/oracle_object_group_by.rs\u0000ae3af224efe82f1d4d7b2adf0ac80991c51681123f90bc2ed647e15b29c3832d",
+  "apps/cli/tests/oracle/object/oracle_object_group_by.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
+  "apps/cli/tests/oracle/object/oracle_object_intrinsic.rs\u00002ecb9b416736102f1170cfa102c85182007491633a58badf2c1677354d8fa244",
+  "apps/cli/tests/oracle/object/oracle_object_intrinsic.rs\u00005d9661cb5d6d4945fe9108896091b79c50bcf99ec24a535d745088a4bd150a86",
+  "apps/cli/tests/oracle/object/oracle_object_intrinsic.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
+  "apps/cli/tests/oracle/string/oracle_string_index_search.rs\u0000ae3af224efe82f1d4d7b2adf0ac80991c51681123f90bc2ed647e15b29c3832d",
+  "apps/cli/tests/oracle/string/oracle_string_index_search.rs\u0000174e66d9def3034c785ba13ce8818d1a4b6132fa1aa62f3956f8a870a18c6690",
+  "apps/cli/tests/oracle/string/oracle_string_index_search.rs\u0000c09ce90549ab8e65e6a88c4f7261c5ec6e7aa8a11bee43106b827b8823bc1377",
+  "apps/cli/tests/oracle/string/oracle_string_index_search.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
+  "apps/cli/tests/oracle/string/oracle_string_intrinsic.rs\u00003da3ed15c59afc7ed8c28f61354fa7f1ad406d948f45faa8d6989b5805fbeec7",
+  "apps/cli/tests/oracle/string/oracle_string_intrinsic.rs\u0000c09ce90549ab8e65e6a88c4f7261c5ec6e7aa8a11bee43106b827b8823bc1377",
+  "apps/cli/tests/oracle/string/oracle_string_intrinsic.rs\u0000decb1b0e66595c263bc68421bb9797396e381256f18cfb9bf9892c576822ad4a",
+  "apps/cli/tests/oracle/string/oracle_string_split.rs\u0000174e66d9def3034c785ba13ce8818d1a4b6132fa1aa62f3956f8a870a18c6690",
+  "apps/cli/tests/oracle/math_intrinsic.rs\u00002ecb9b416736102f1170cfa102c85182007491633a58badf2c1677354d8fa244",
 ]);
 
 runCanaries();
@@ -267,7 +267,7 @@ function parseArguments(arguments_) {
 }
 
 function collectConsumerFiles() {
-  const tests = resolve(root, "tests");
+  const tests = resolve(root, "apps/cli/tests");
   const paths = [];
   walkRustFiles(resolve(tests, "oracle"), paths);
   for (const path of options.scans) {
@@ -348,7 +348,7 @@ function checkFunctions(functions, providers, tombstones) {
           .join(", ");
         failures.push(
           `${displayPath}:${helper.line} duplicates shared provider ${providerNames}; ` +
-            `import it from tests/oracle/support instead ` +
+            `import it from apps/cli/tests/oracle/support instead ` +
             `(fingerprint ${helper.fingerprint})`,
         );
       }

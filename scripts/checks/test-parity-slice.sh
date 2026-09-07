@@ -40,22 +40,22 @@ generated_property=$(mktemp "${TMPDIR:-/tmp}/quickjs-oxide-unicode-property.XXXX
 generated_normalize=$(mktemp "${TMPDIR:-/tmp}/quickjs-oxide-unicode-normalize.XXXXXX")
 trap 'rm -f -- "$generated_ident" "$generated_case" "$generated_property" "$generated_normalize"' EXIT HUP INT TERM
 ./scripts/unicode/generate-unicode-ident-tables.sh "$unicode_source" "$generated_ident"
-if ! cmp -s "$generated_ident" src/generated/unicode/unicode_ident_tables.rs; then
+if ! cmp -s "$generated_ident" crates/core/src/generated/unicode/unicode_ident_tables.rs; then
     echo "error: checked-in Unicode identifier tables do not match the pinned source" >&2
     exit 1
 fi
 ./scripts/unicode/generate-unicode-case-tables.sh "$unicode_source" "$generated_case"
-if ! cmp -s "$generated_case" src/generated/unicode/unicode_case_tables.rs; then
+if ! cmp -s "$generated_case" crates/core/src/generated/unicode/unicode_case_tables.rs; then
     echo "error: checked-in Unicode case tables do not match the pinned source" >&2
     exit 1
 fi
 ./scripts/unicode/generate-unicode-property-tables.sh "$unicode_root" "$generated_property"
-if ! cmp -s "$generated_property" src/generated/unicode/unicode_property_tables.rs; then
+if ! cmp -s "$generated_property" crates/core/src/generated/unicode/unicode_property_tables.rs; then
     echo "error: checked-in Unicode property tables do not match the pinned source" >&2
     exit 1
 fi
 ./scripts/unicode/generate-unicode-normalize-tables.py "$unicode_source" "$generated_normalize"
-if ! cmp -s "$generated_normalize" src/generated/unicode/unicode_normalize_tables.rs; then
+if ! cmp -s "$generated_normalize" crates/core/src/generated/unicode/unicode_normalize_tables.rs; then
     echo "error: checked-in Unicode normalization tables do not match the pinned source" >&2
     exit 1
 fi
@@ -65,9 +65,9 @@ trap - EXIT HUP INT TERM
 
 cargo fmt --all -- --check
 QJS_ORACLE="$oracle" cargo test --locked --workspace --all-targets
-QJS_ORACLE="$oracle" cargo test --locked -p quickjs-oxide \
+QJS_ORACLE="$oracle" cargo test --locked --workspace \
     --features test262-host --lib --bins --test unsupported_diagnostics
-QJS_ORACLE="$oracle" cargo test --locked -p quickjs-oxide \
+QJS_ORACLE="$oracle" cargo test --locked --workspace \
     --features test262-host --test oracle test262_
 ./scripts/checks/check-oracle-registry.sh --compiled
 ./scripts/quickjs/test-quickjs-fixtures.sh --all --oxide ./target/debug/qjs
@@ -75,7 +75,7 @@ QJS_ORACLE="$oracle" cargo test --locked -p quickjs-oxide \
 ./scripts/test262/test-test262.sh --focused
 ./scripts/test262/test-test262.sh --full
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo clippy --locked -p quickjs-oxide --features test262-host \
+cargo clippy --locked --workspace --features test262-host \
     --lib --bins --test unsupported_diagnostics --test oracle \
     -- -D warnings
 ./scripts/checks/check-rust-only.sh

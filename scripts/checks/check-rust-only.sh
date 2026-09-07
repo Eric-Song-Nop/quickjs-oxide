@@ -140,11 +140,11 @@ fi
 
 # A workspace embedder may depend on the repository's own product crate. Cargo
 # prints that path dependency at positive depth, so remove only entries that
-# resolve back to this exact repository root before looking for external
+# resolve to the root or an explicitly owned workspace package before looking for external
 # QuickJS packages. All workspace source remains covered by the product-input
 # scans above.
 filter_status=0
-rg -v -F "($root)" "$tmp_dir/cargo-tree" \
+rg -v -F -e "($root)" -e "($root/crates/core)" -e "($root/crates/compiler)" -e "($root/crates/engine)" -e "($root/crates/host)" -e "($root/crates/quickjs-oxide)" -e "($root/apps/cli)" -e "($root/apps/web)" -e "($root/tools/test262)" "$tmp_dir/cargo-tree" \
     >"$tmp_dir/external-cargo-tree" || filter_status=$?
 if (( filter_status > 1 )); then
     echo "error: could not filter the repository's workspace crate" >&2

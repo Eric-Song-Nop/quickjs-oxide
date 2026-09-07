@@ -161,7 +161,7 @@ def check(ctx):
             f"found {ctx.enum_variant_names(dto_apply_kind_code)}",
         )
 
-    ctx.pinned_opcode_relative = "src/runtime/binary_object/pinned_opcodes.rs"
+    ctx.pinned_opcode_relative = "crates/engine/src/runtime/binary_object/pinned_opcodes.rs"
 
     pinned_opcode_source = ctx.read_source(ctx.pinned_opcode_relative)
 

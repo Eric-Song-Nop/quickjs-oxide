@@ -291,7 +291,7 @@ def check(ctx):
             "invalid translated labels must remain an ordinary scalar-cohort rejection",
         )
 
-    ctx.consumer_relative = "src/runtime/binary_object_publish.rs"
+    ctx.consumer_relative = "crates/engine/src/runtime/binary_object_publish.rs"
 
     consumer_path = ctx.root / ctx.consumer_relative
 

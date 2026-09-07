@@ -3,21 +3,22 @@ trap 'rm -rf -- "$tmp_dir"' EXIT HUP INT TERM
 
 fixture=$tmp_dir/fixture
 boundary_self_test_token="generated-boundary-self-test-$PPID-$RANDOM-$RANDOM"
-mkdir -p "$fixture/src/runtime/binary_object/bytecode_image/decode" \
-    "$fixture/src/runtime/binary_object/function_translate" \
-    "$fixture/src/runtime/binary_object/graph"
+mkdir -p "$fixture/crates/core/src" "$fixture/crates/engine/src/runtime/binary_object/bytecode_image/decode" \
+    "$fixture/crates/engine/src/runtime/binary_object/function_translate" \
+    "$fixture/crates/engine/src/runtime/binary_object/graph"
 printf '%s\n' "$boundary_self_test_token" > "$fixture/.boundary-self-test"
-printf '%s\n' 'pub mod runtime;' > "$fixture/src/lib.rs"
-printf '%s\n' 'mod binary_object;' > "$fixture/src/runtime.rs"
-cp -- "$repository_root/src/bytecode.rs" "$fixture/src/bytecode.rs"
-cp -- "$repository_root/src/vm.rs" "$fixture/src/vm.rs"
-cp -- "$repository_root/src/value.rs" "$fixture/src/value.rs"
-cp -- "$repository_root/src/atom.rs" "$fixture/src/atom.rs"
-cp -- "$repository_root/src/function.rs" "$fixture/src/function.rs"
-cp -- "$repository_root/src/runtime/context.rs" "$fixture/src/runtime/context.rs"
-cp -R -- "$repository_root/src/runtime/context" "$fixture/src/runtime/context"
-cp -- "$repository_root/src/runtime/bytecode_publish.rs" \
-    "$fixture/src/runtime/bytecode_publish.rs"
+printf '%s\n' 'pub mod runtime;' > "$fixture/crates/engine/src/lib.rs"
+printf '%s\n' 'mod binary_object;' > "$fixture/crates/engine/src/runtime.rs"
+cp -- "$repository_root/crates/core/src/bytecode.rs" "$fixture/crates/core/src/bytecode.rs"
+cp -- "$repository_root/crates/engine/src/vm.rs" "$fixture/crates/engine/src/vm.rs"
+cp -- "$repository_root/crates/engine/src/value.rs" "$fixture/crates/engine/src/value.rs"
+cp -- "$repository_root/crates/core/src/atom.rs" "$fixture/crates/core/src/atom.rs"
+cp -- "$repository_root/crates/core/src/function.rs" "$fixture/crates/core/src/function.rs"
+cp -- "$repository_root/crates/core/src/value.rs" "$fixture/crates/core/src/value.rs"
+cp -- "$repository_root/crates/engine/src/runtime/context.rs" "$fixture/crates/engine/src/runtime/context.rs"
+cp -R -- "$repository_root/crates/engine/src/runtime/context" "$fixture/crates/engine/src/runtime/context"
+cp -- "$repository_root/crates/engine/src/runtime/bytecode_publish.rs" \
+    "$fixture/crates/engine/src/runtime/bytecode_publish.rs"
 printf '%s\n' \
     'mod atoms;' \
     'mod code;' \
@@ -33,26 +34,26 @@ printf '%s\n' \
     'mod wire;' \
     'pub(super) use scalar_script::{ScalarScriptReadError, ScalarStringDraft, ScalarUnaryOp, ScalarValueDraft, decode_trusted_scalar_script};' \
     'pub(super) use ordinary_leaf::{DetachedAtomName, DetachedPrimitive, OrdinaryLeafApplyKind, OrdinaryLeafBinaryOp, OrdinaryLeafDraft, OrdinaryLeafMetadataDraft, OrdinaryLeafOp, OrdinaryLeafPredicateOp, OrdinaryLeafReadError, OrdinaryLeafStackOp, OrdinaryLeafUnaryOp, RootFunctionConstantSelector, decode_trusted_ordinary_leaf};' \
-    > "$fixture/src/runtime/binary_object/mod.rs"
-cp -- "$repository_root/src/runtime/binary_object/function_translate/mod.rs" \
-    "$fixture/src/runtime/binary_object/function_translate/mod.rs"
-cp -- "$repository_root/src/runtime/binary_object/function_translate/capability.rs" \
-    "$fixture/src/runtime/binary_object/function_translate/capability.rs"
-cp -- "$repository_root/src/runtime/binary_object/function_translate/dto.rs" \
-    "$fixture/src/runtime/binary_object/function_translate/dto.rs"
+    > "$fixture/crates/engine/src/runtime/binary_object/mod.rs"
+cp -- "$repository_root/crates/engine/src/runtime/binary_object/function_translate/mod.rs" \
+    "$fixture/crates/engine/src/runtime/binary_object/function_translate/mod.rs"
+cp -- "$repository_root/crates/engine/src/runtime/binary_object/function_translate/capability.rs" \
+    "$fixture/crates/engine/src/runtime/binary_object/function_translate/capability.rs"
+cp -- "$repository_root/crates/engine/src/runtime/binary_object/function_translate/dto.rs" \
+    "$fixture/crates/engine/src/runtime/binary_object/function_translate/dto.rs"
 python3 "$boundary_dir/canaries/scalar_fixture.py" \
-    "$repository_root/src/runtime/binary_object/scalar_script.rs" \
-    "$fixture/src/runtime/binary_object/scalar_script.rs"
+    "$repository_root/crates/engine/src/runtime/binary_object/scalar_script.rs" \
+    "$fixture/crates/engine/src/runtime/binary_object/scalar_script.rs"
 python3 "$boundary_dir/canaries/ordinary_fixture.py" \
-    "$repository_root/src/runtime/binary_object/ordinary_leaf.rs" \
-    "$fixture/src/runtime/binary_object/ordinary_leaf.rs"
+    "$repository_root/crates/engine/src/runtime/binary_object/ordinary_leaf.rs" \
+    "$fixture/crates/engine/src/runtime/binary_object/ordinary_leaf.rs"
 printf '%s\n' '// no alternate binary-object consumers' \
-    > "$fixture/src/runtime/other.rs"
+    > "$fixture/crates/engine/src/runtime/other.rs"
 printf '%s\n' \
     'fn retained_from_raw(raw: u32) {' \
     '    let _ = PinnedAtomId::from_raw(raw);' \
     '}' \
-    > "$fixture/src/runtime/binary_object/atoms.rs"
+    > "$fixture/crates/engine/src/runtime/binary_object/atoms.rs"
 printf '%s\n' \
     'mod sealed {' \
     '    pub trait Sealed {}' \
@@ -62,7 +63,7 @@ printf '%s\n' \
     "pub(in crate::runtime::binary_object) trait CheckedReadCursor<'input>: sealed::Sealed {}" \
     "impl<'input> CheckedReadCursor<'input> for WireCursor<'input> {}" \
     "impl<'input> CheckedReadCursor<'input> for SabTransportCursor<'input> {}" \
-    > "$fixture/src/runtime/binary_object/read_cursor.rs"
+    > "$fixture/crates/engine/src/runtime/binary_object/read_cursor.rs"
 printf '%s\n' \
     'mod atoms;' \
     'mod budget;' \
@@ -73,14 +74,14 @@ printf '%s\n' \
     '#[cfg(test)]' \
     'mod tests;' \
     'pub(in crate::runtime::binary_object) use native_plan::{NativeAtomClass, NativeAtomRef, NativeCodePlan, NativeOperands, decode_native_code_plan};' \
-    > "$fixture/src/runtime/binary_object/bytecode_image/mod.rs"
-cp -- "$repository_root/src/runtime/binary_object/bytecode_image/native_plan.rs" \
-    "$fixture/src/runtime/binary_object/bytecode_image/native_plan.rs"
-cp -- "$repository_root/src/runtime/binary_object/pinned_opcodes.rs" \
-    "$fixture/src/runtime/binary_object/pinned_opcodes.rs"
+    > "$fixture/crates/engine/src/runtime/binary_object/bytecode_image/mod.rs"
+cp -- "$repository_root/crates/engine/src/runtime/binary_object/bytecode_image/native_plan.rs" \
+    "$fixture/crates/engine/src/runtime/binary_object/bytecode_image/native_plan.rs"
+cp -- "$repository_root/crates/engine/src/runtime/binary_object/pinned_opcodes.rs" \
+    "$fixture/crates/engine/src/runtime/binary_object/pinned_opcodes.rs"
 printf '%s\n' \
     'pub(in crate::runtime::binary_object) fn decode_bytecode_image_body() {}' \
-    > "$fixture/src/runtime/binary_object/bytecode_image/decode/mod.rs"
+    > "$fixture/crates/engine/src/runtime/binary_object/bytecode_image/decode/mod.rs"
 printf '%s\n' \
     'pub(super) enum ImageAtom {' \
     '    Null,' \
@@ -88,7 +89,7 @@ printf '%s\n' \
     '    Predefined(PinnedAtomId),' \
     '    Dynamic(AtomId),' \
     '}' \
-    > "$fixture/src/runtime/binary_object/bytecode_image/atoms.rs"
+    > "$fixture/crates/engine/src/runtime/binary_object/bytecode_image/atoms.rs"
 printf '%s\n' \
     'const PINNED_EVAL_ATOM_RAW: u32 = 84;' \
     'struct ImageLocalVariable { name: ImageAtom }' \
@@ -109,10 +110,10 @@ printf '%s\n' \
     'impl BytecodeImage {' \
     '    fn sab_archive_occurrences(&self) {}' \
     '}' \
-    > "$fixture/src/runtime/binary_object/bytecode_image/model.rs"
+    > "$fixture/crates/engine/src/runtime/binary_object/bytecode_image/model.rs"
 printf '%s\n' \
     'pub(super) fn decode_graph_body() {}' \
-    > "$fixture/src/runtime/binary_object/graph/decode.rs"
+    > "$fixture/crates/engine/src/runtime/binary_object/graph/decode.rs"
 printf '%s\n' \
     'pub(in crate::runtime) struct NativeSabToken {' \
     '    native_token_bits: u64,' \
@@ -329,14 +330,14 @@ printf '%s\n' \
     '            .copied()' \
     '    }' \
     '}' \
-    > "$fixture/src/runtime/binary_object/graph/sab_transport.rs"
+    > "$fixture/crates/engine/src/runtime/binary_object/graph/sab_transport.rs"
 
 scan_root "$fixture" "$boundary_self_test_token" \
     || die "binary-object boundary rejected its clean no-consumer self-test fixture"
 
-printf '%s\n' 'mod binary_object_publish;' >> "$fixture/src/runtime.rs"
-cp -- "$repository_root/src/runtime/binary_object_publish.rs" \
-    "$fixture/src/runtime/binary_object_publish.rs"
+printf '%s\n' 'mod binary_object_publish;' >> "$fixture/crates/engine/src/runtime.rs"
+cp -- "$repository_root/crates/engine/src/runtime/binary_object_publish.rs" \
+    "$fixture/crates/engine/src/runtime/binary_object_publish.rs"
 
 scan_root "$fixture" "$boundary_self_test_token" \
     || die "binary-object boundary rejected its clean sole-consumer self-test fixture"

@@ -12,9 +12,9 @@ EXPECTED_MODEL_BYTECODE_IMAGE_METHODS = [('pub(super)', 'new'),
  ('pub(in crate::runtime)', 'module'),
  ('pub(in crate::runtime)', 'root')]
 
-EXPECTED_ATOM_SENSITIVE_VISIBLE_SITES = [('src/runtime/binary_object/bytecode_image/model.rs',
+EXPECTED_ATOM_SENSITIVE_VISIBLE_SITES = [('crates/engine/src/runtime/binary_object/bytecode_image/model.rs',
   'pub(in crate::runtime::binary_object)',
   'name_is_null'),
- ('src/runtime/binary_object/bytecode_image/model.rs',
+ ('crates/engine/src/runtime/binary_object/bytecode_image/model.rs',
   'pub(in crate::runtime::binary_object)',
   'name_is_pinned_eval')]

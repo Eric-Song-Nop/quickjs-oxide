@@ -700,7 +700,7 @@ def check(ctx):
                     + ctx.location(ctx.consumer_relative, ctx.consumer_source, ctx.match.start()),
                 )
 
-    ctx.bytecode_publish_relative = "src/runtime/bytecode_publish.rs"
+    ctx.bytecode_publish_relative = "crates/engine/src/runtime/bytecode_publish.rs"
 
     bytecode_publish_source = ctx.read_source(ctx.bytecode_publish_relative)
 
@@ -773,7 +773,7 @@ def check(ctx):
             f"found {len(ordinary_verifier_arms)} role arms",
         )
 
-    function_relative = "src/function.rs"
+    function_relative = "crates/core/src/function.rs"
 
     function_source = ctx.read_source(function_relative)
 
@@ -782,14 +782,14 @@ def check(ctx):
     plain_primitive_code, ctx._, ctx._ = ctx.unique_braced_item(
         function_code,
         re.compile(
-            r"(?m)^[ \t]*pub[ \t\n]*\([ \t\n]*crate[ \t\n]*\)[ \t\n]+const"
+            r"(?m)^[ \t]*pub[ \t\n]+const"
             r"[ \t\n]+fn[ \t\n]+is_plain_primitive\b[^{};]*\{"
         ),
         "ordinary-leaf-plain-primitive",
         "UnlinkedConstant plain-primitive discriminator",
     )
 
-    expected_plain_primitive = "pub(crate) const fn is_plain_primitive(&self) -> bool { matches!(self.0, UnlinkedConstantKind::Primitive(_)) }"
+    expected_plain_primitive = "pub const fn is_plain_primitive(&self) -> bool { matches!(self.0, UnlinkedConstantKind::Primitive(_)) }"
 
     if " ".join(plain_primitive_code.split()) != " ".join(expected_plain_primitive.split()):
         ctx.fail(
@@ -800,14 +800,14 @@ def check(ctx):
     empty_atom_code, ctx._, ctx._ = ctx.unique_braced_item(
         function_code,
         re.compile(
-            r"(?m)^[ \t]*pub[ \t\n]*\([ \t\n]*crate[ \t\n]*\)[ \t\n]+fn"
+            r"(?m)^[ \t]*pub[ \t\n]+fn"
             r"[ \t\n]+is_empty_atom_string\b[^{};]*\{"
         ),
         "ordinary-leaf-plain-primitive",
         "exact empty atom-String discriminator",
     )
 
-    expected_empty_atom = "pub(crate) fn is_empty_atom_string(&self) -> bool { matches!( &self.0, UnlinkedConstantKind::AtomString(Value::String(value)) if value.is_empty() ) }"
+    expected_empty_atom = "pub fn is_empty_atom_string(&self) -> bool { matches!( &self.0, UnlinkedConstantKind::AtomString(PrimitiveValue::String(value)) if value.is_empty() ) }"
 
     if " ".join(empty_atom_code.split()) != expected_empty_atom:
         ctx.fail(
@@ -815,7 +815,7 @@ def check(ctx):
             "ordinary-leaf verification may admit only the exact empty atom String beside plain primitives",
         )
 
-    context_relative = "src/runtime/context/bytecode.rs"
+    context_relative = "crates/engine/src/runtime/context/bytecode.rs"
 
     context_source = ctx.read_source(context_relative)
 
@@ -858,17 +858,17 @@ def check(ctx):
             "trusted bytecode reads must convert only JavaScript-visible errors into pending exceptions and preserve Unsupported/Internal directly",
         )
 
-    bytecode_source = ctx.read_source("src/bytecode.rs")
+    bytecode_source = ctx.read_source("crates/core/src/bytecode.rs")
 
     ctx.bytecode_code = ctx.rust_code_only(bytecode_source)
 
     bytecode_production_code = ctx.bytecode_code.split('#[cfg(test)]\nmod tests', 1)[0]
 
-    ctx.vm_code = ctx.rust_code_only(ctx.read_source("src/vm.rs"))
+    ctx.vm_code = ctx.rust_code_only(ctx.read_source("crates/engine/src/vm.rs"))
 
-    value_code = ctx.rust_code_only(ctx.read_source("src/value.rs"))
+    value_code = ctx.rust_code_only(ctx.read_source("crates/core/src/value.rs"))
 
-    atom_code = ctx.rust_code_only(ctx.read_source("src/atom.rs"))
+    atom_code = ctx.rust_code_only(ctx.read_source("crates/core/src/atom.rs"))
 
     engine_string_fragments = (
         (ctx.bytecode_code, "PushAtomValueIndex(u32),"),
@@ -876,7 +876,7 @@ def check(ctx):
         (ctx.bytecode_code, "Instruction::PushAtomValueIndex(index) if *index > crate::atom::ATOM_MAX_INT"),
         (ctx.vm_code, "Instruction::PushAtomValueIndex(value) => self.stack.push(Value::String( crate::value::JsString::from_fresh_decimal_u32(*value), ))"),
         (atom_code, "AtomSpelling::Integer(value) => Ok(JsString::from_fresh_decimal_u32(value))"),
-        (value_code, "pub(crate) fn from_fresh_decimal_u32(mut value: u32) -> Self"),
+        (value_code, "pub fn from_fresh_decimal_u32(mut value: u32) -> Self"),
         (value_code, "digits[start] = b'0' + (value % 10) as u8;"),
         (value_code, "Self(Rc::new(StringRepr::Latin1( digits[start..].to_vec().into_boxed_slice(), )))"),
     )

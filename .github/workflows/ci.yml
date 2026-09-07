@@ -99,7 +99,7 @@ jobs:
         run: |
           cargo test --locked --workspace --all-targets
           cargo test --locked --workspace --doc
-          cargo test --locked -p quickjs-oxide --features test262-host --lib --bins
+          cargo test --locked --workspace --features test262-host --lib --bins
           cargo test --locked --features test262-host \
             --test unsupported_diagnostics
           cargo test --locked --features test262-host \
@@ -110,9 +110,9 @@ jobs:
         run: |
           cargo clippy --locked --workspace --lib --bins -- -D warnings
           cargo clippy --locked --test oracle -- -D warnings
-          cargo clippy --locked -p quickjs-oxide --features test262-host \
+          cargo clippy --locked --workspace --features test262-host \
             --lib --bins -- -D warnings
-          cargo clippy --locked -p quickjs-oxide --features test262-host \
+          cargo clippy --locked --workspace --features test262-host \
             --test unsupported_diagnostics --test oracle \
             -- -D warnings
 
@@ -433,7 +433,7 @@ jobs:
             "--root", root,
             "--worktree",
             "--files", required(spec, "engine_semantics_files"),
-            "--trees", required(spec, "engine_semantics_trees"),
+            "--trees", "apps,crates,tools/test262",
           ], {
             encoding: "utf8",
             stdio: ["ignore", "pipe", "inherit"],

@@ -15,8 +15,8 @@ source_dir=$1
 tool_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 script_dir=$(CDPATH= cd -- "$tool_dir/.." && pwd)
 root=$(CDPATH= cd -- "$script_dir/.." && pwd)
-output_file=${2:-"$root/src/generated/unicode/unicode_property_tables.rs"}
-helper=$root/tests/fixtures/inputs/dump_unicode_properties.c
+output_file=${2:-"$root/crates/core/src/generated/unicode/unicode_property_tables.rs"}
+helper=$root/apps/cli/tests/fixtures/inputs/dump_unicode_properties.c
 
 sha256_file() {
     if command -v sha256sum >/dev/null 2>&1; then

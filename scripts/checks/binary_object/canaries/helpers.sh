@@ -62,13 +62,17 @@ run_expect_full_rewrite_rejected() {
     trap "$(printf 'rm -rf -- %q; rm -f -- %q' "$case_root" "$output")" EXIT
 
     mkdir -p "$case_root"
-    cp -R "$repository_root/src" "$case_root/src"
-    mkdir -p "$case_root/tests/fixtures/inputs" "$case_root/tests/fixtures/expected" "$case_root/dev-support/test262/generated" "$case_root/docs"
+    local tree
+    for tree in crates apps tools; do
+        mkdir -p "$case_root/$tree"
+        cp -R "$repository_root/$tree/." "$case_root/$tree"
+    done
+    mkdir -p "$case_root/apps/cli/tests/fixtures/inputs" "$case_root/apps/cli/tests/fixtures/expected" "$case_root/dev-support/test262/generated" "$case_root/docs"
     cp -- "$repository_root/Cargo.toml" "$case_root/Cargo.toml"
-    cp -- "$repository_root/tests/fixtures/inputs/function_bytecode_wire.c" \
-        "$case_root/tests/fixtures/inputs/function_bytecode_wire.c"
-    cp -- "$repository_root/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt" \
-        "$case_root/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt"
+    cp -- "$repository_root/apps/cli/tests/fixtures/inputs/function_bytecode_wire.c" \
+        "$case_root/apps/cli/tests/fixtures/inputs/function_bytecode_wire.c"
+    cp -- "$repository_root/apps/cli/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt" \
+        "$case_root/apps/cli/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt"
     cp -- "$repository_root/dev-support/quickjs-c-oracles.tsv" \
         "$case_root/dev-support/quickjs-c-oracles.tsv"
     cp -- "$repository_root/dev-support/test262/current.conf" \

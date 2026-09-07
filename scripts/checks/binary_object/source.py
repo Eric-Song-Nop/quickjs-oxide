@@ -20,18 +20,18 @@ class SourceTools:
             ctx.fail("missing-source", f"{relative} must be a regular file")
             return ""
         source = path.read_text(encoding="utf-8")
-        if relative == "src/runtime/tests.rs":
+        if relative == "crates/engine/src/runtime/tests.rs":
             # Expand only plain, ungated child declarations. Every evidence function
             # is still checked below, including its attributes and normalized body.
             def expand_test_module(match):
-                child = f"src/runtime/tests/{match[1]}.rs"
+                child = f"crates/engine/src/runtime/tests/{match[1]}.rs"
                 content = ctx.read_source(child)
                 return re.sub(r"(?m)^use super::\*;\n", "", content)
             source = re.sub(r"(?m)^mod (\w+);$", expand_test_module, source)
-        elif relative == "src/runtime/binary_object/ordinary_leaf.rs":
+        elif relative == "crates/engine/src/runtime/binary_object/ordinary_leaf.rs":
             declaration = '#[cfg(test)]\nmod tests;'
             if declaration in source:
-                child = ctx.read_source("src/runtime/binary_object/ordinary_leaf/tests.rs")
+                child = ctx.read_source("crates/engine/src/runtime/binary_object/ordinary_leaf/tests.rs")
                 source = source.replace(declaration, '#[cfg(test)]\nmod tests {\n' + child + '\n}')
         return source
 

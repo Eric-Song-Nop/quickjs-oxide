@@ -80,10 +80,10 @@ def check(ctx):
             return b""
     stage3e_concat_hex = stage3e_concat_hex
 
-    stage3e_runtime_source = ctx.read_source("src/runtime/tests.rs")
+    stage3e_runtime_source = ctx.read_source("crates/engine/src/runtime/tests.rs")
 
     stage3e_ordinary_source = ctx.read_source(
-        "src/runtime/binary_object/ordinary_leaf.rs"
+        "crates/engine/src/runtime/binary_object/ordinary_leaf.rs"
     )
 
     stage3e_manual_wire = stage3e_byte_array(

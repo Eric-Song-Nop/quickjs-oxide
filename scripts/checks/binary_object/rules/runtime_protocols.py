@@ -12,10 +12,10 @@ def check(ctx):
         return
 
     stage3b_sources = {
-        "src/runtime.rs": ctx.runtime_code,
-        "src/vm.rs": ctx.vm_code,
-        "src/bytecode.rs": ctx.bytecode_code,
-        "src/runtime/context/bytecode.rs": ctx.context_code,
+        "crates/engine/src/runtime.rs": ctx.runtime_code,
+        "crates/engine/src/vm.rs": ctx.vm_code,
+        "crates/core/src/bytecode.rs": ctx.bytecode_code,
+        "crates/engine/src/runtime/context/bytecode.rs": ctx.context_code,
     }
 
     stage3b_items: dict[tuple[str, str], str] = {}
@@ -82,7 +82,7 @@ def check(ctx):
         )
 
     constructor_from_value = ctx.stage3b_function(
-        "src/runtime.rs", "constructor_from_value", "stage3b-constructor-capability"
+        "crates/engine/src/runtime.rs", "constructor_from_value", "stage3b-constructor-capability"
     )
 
     normalized_constructor_from_value = " ".join(constructor_from_value.split())
@@ -129,7 +129,7 @@ def check(ctx):
     )
 
     stack_effect_item = ctx.stage3b_function(
-        "src/bytecode.rs", "stack_effect", "stage3c-tail-verifier"
+        "crates/core/src/bytecode.rs", "stack_effect", "stage3c-tail-verifier"
     )
 
     ctx.require_normalized_code_sha256(
@@ -148,7 +148,7 @@ def check(ctx):
         )
 
     verify_parts_item = ctx.stage3b_function(
-        "src/bytecode.rs", "verify_parts", "stage3c-tail-verifier"
+        "crates/core/src/bytecode.rs", "verify_parts", "stage3c-tail-verifier"
     )
 
     normalized_verify_parts = " ".join(verify_parts_item.split())
@@ -186,7 +186,7 @@ def check(ctx):
         )
 
     take_call_arguments_item = ctx.stage3b_function(
-        "src/vm.rs", "take_call_arguments", "stage3c-tail-vm"
+        "crates/engine/src/vm.rs", "take_call_arguments", "stage3c-tail-vm"
     )
 
     ctx.require_normalized_code_sha256(
@@ -197,7 +197,7 @@ def check(ctx):
     )
 
     call_dispatch_item = ctx.stage3b_function(
-        "src/vm.rs", "execute_call_instruction", "stage3c-tail-vm"
+        "crates/engine/src/vm.rs", "execute_call_instruction", "stage3c-tail-vm"
     )
 
     ctx.require_normalized_code_sha256(
@@ -288,7 +288,7 @@ def check(ctx):
         "53668ef453a43fc676e96f2c6f01c017f3f336df4bba96674562e77361e0f63e",
     )
 
-    raise_item = ctx.stage3b_function("src/vm.rs", "raise", "stage3c-tail-completion")
+    raise_item = ctx.stage3b_function("crates/engine/src/vm.rs", "raise", "stage3c-tail-completion")
 
     ctx.require_normalized_code_sha256(
         "stage3c-tail-completion",
@@ -316,7 +316,7 @@ def check(ctx):
     )
 
     execute_inner_item = ctx.stage3b_function(
-        "src/vm.rs", "execute_inner", "stage3c-tail-vm"
+        "crates/engine/src/vm.rs", "execute_inner", "stage3c-tail-vm"
     )
 
     normalized_execute_inner = " ".join(execute_inner_item.split())
@@ -339,7 +339,7 @@ def check(ctx):
             "e425f4d42ef9a3a7b6552994a6f7da31009e70451f5b48e3312581929a54e54c",
         )
 
-    capability_relative = "src/runtime/binary_object/function_translate/capability.rs"
+    capability_relative = "crates/engine/src/runtime/binary_object/function_translate/capability.rs"
 
     capability_code = ctx.stage3b_code(capability_relative)
 
@@ -377,7 +377,7 @@ def check(ctx):
         "e05d664bfc0b3bdd581c293111a0a81440e7227aa75b46baab209c061ce3f131",
     )
 
-    dto_relative = "src/runtime/binary_object/function_translate/dto.rs"
+    dto_relative = "crates/engine/src/runtime/binary_object/function_translate/dto.rs"
 
     for ctx.name, ctx.description, ctx.expected_hash in (
         (
@@ -408,7 +408,7 @@ def check(ctx):
             ctx.expected_hash,
         )
 
-    translate_relative = "src/runtime/binary_object/function_translate/mod.rs"
+    translate_relative = "crates/engine/src/runtime/binary_object/function_translate/mod.rs"
 
     translate_code = ctx.stage3b_code(translate_relative)
 
@@ -478,7 +478,7 @@ def check(ctx):
         "154a0d0ab86cab0cb75aebcc4bb31e8cd6e7b8015e02a4f61dd32eadf17842ae",
     )
 
-    ordinary_relative = "src/runtime/binary_object/ordinary_leaf.rs"
+    ordinary_relative = "crates/engine/src/runtime/binary_object/ordinary_leaf.rs"
 
     ctx.require_normalized_code_sha256(
         "stage3d-throw-ordinary-route",
@@ -612,7 +612,7 @@ def check(ctx):
         )
 
     execute_hot_item = ctx.stage3b_function(
-        "src/vm.rs", "execute_hot_instruction", "stage3d-throw-completion"
+        "crates/engine/src/vm.rs", "execute_hot_instruction", "stage3d-throw-completion"
     )
 
     throw_vm_arm = ctx.unique_braced_item(
@@ -668,7 +668,7 @@ def check(ctx):
         )
 
     object_vm_cold_item = ctx.stage3b_function(
-        "src/vm.rs", "execute_cold_instruction", "stage3g-object-vm"
+        "crates/engine/src/vm.rs", "execute_cold_instruction", "stage3g-object-vm"
     )
 
     ctx.require_normalized_code_sha256(
@@ -703,7 +703,7 @@ def check(ctx):
         "stage3g-object-realm",
         "the runtime VM host must allocate Object through the executing bytecode's current defining realm",
         ctx.stage3b_function(
-            "src/runtime/vm_host.rs", "object", "stage3g-object-realm"
+            "crates/engine/src/runtime/vm_host.rs", "object", "stage3g-object-realm"
         ),
         "90cbeb40094a4266ebba996ce790be75ce46b2ab8959a4996265ddcc656924ce",
     )
@@ -737,7 +737,7 @@ def check(ctx):
         "stage3h-to-object-realm",
         "the runtime VM host must allocate every primitive wrapper through the executing bytecode's current defining realm",
         ctx.stage3b_function(
-            "src/runtime/vm_host.rs", "box_primitive", "stage3h-to-object-realm"
+            "crates/engine/src/runtime/vm_host.rs", "box_primitive", "stage3h-to-object-realm"
         ),
         "47f1cf4db70f24b86c09ea669b93a0f0a9780ae35a119c5b2f7698f959984ffa",
     )
@@ -757,7 +757,7 @@ def check(ctx):
     )
 
     execute_published_item = ctx.stage3b_function(
-        "src/vm.rs", "execute_published", "stage3d-throw-critical-route"
+        "crates/engine/src/vm.rs", "execute_published", "stage3d-throw-critical-route"
     )
 
     ctx.require_normalized_code_sha256(
@@ -767,7 +767,7 @@ def check(ctx):
         "b2743fde8341d22bb2592d3810e10030ecce6f812befe9be150a80ccd982a0a7",
     )
 
-    runtime_vm_host_relative = "src/runtime/vm_host.rs"
+    runtime_vm_host_relative = "crates/engine/src/runtime/vm_host.rs"
 
     execute_bytecode_callable_item = ctx.stage3b_function(
         runtime_vm_host_relative,
@@ -794,7 +794,7 @@ def check(ctx):
     )
 
     call_internal_item = ctx.stage3b_function(
-        "src/runtime/native_dispatch.rs",
+        "crates/engine/src/runtime/native_dispatch.rs",
         "call_internal",
         "stage3d-throw-critical-route",
     )
@@ -823,13 +823,13 @@ def check(ctx):
             "c1970423cb9f5a75f26e5c309dcc724ee92f74bd48a6e8d24311a3fc94bb6a14",
         ),
         (
-            "src/runtime/internal_methods.rs",
+            "crates/engine/src/runtime/internal_methods.rs",
             "call_value_internal",
             "call_value_internal must preserve callable and Proxy completions for the current activation",
             "d7564209dc646e4a18641690161eefba207110f7a244377489a96510bb9d66b5",
         ),
         (
-            "src/runtime/context/calls.rs",
+            "crates/engine/src/runtime/context/calls.rs",
             "call",
             "Context::call must pass call_internal's completion directly to finish_completion",
             "bf80579858f0ce24fdb44408eb43a1b3a7263bba07ef972026a22a2b1ff0fa89",
@@ -923,7 +923,7 @@ def check(ctx):
         ctx.require_normalized_code_sha256(
             "stage3d-throw-pending",
             ctx.description,
-            ctx.stage3b_function("src/runtime.rs", ctx.name, "stage3d-throw-pending"),
+            ctx.stage3b_function("crates/engine/src/runtime.rs", ctx.name, "stage3d-throw-pending"),
             ctx.expected_hash,
         )
 
@@ -942,12 +942,12 @@ def check(ctx):
         ctx.require_normalized_code_sha256(
             "stage3d-throw-pending",
             ctx.description,
-            ctx.stage3b_function("src/runtime/context.rs", ctx.name, "stage3d-throw-pending"),
+            ctx.stage3b_function("crates/engine/src/runtime/context.rs", ctx.name, "stage3d-throw-pending"),
             ctx.expected_hash,
         )
 
     finish_completion_item = ctx.stage3b_function(
-        "src/runtime/context.rs", "finish_completion", "stage3d-throw-pending"
+        "crates/engine/src/runtime/context.rs", "finish_completion", "stage3d-throw-pending"
     )
 
     ctx.require_normalized_code_sha256(

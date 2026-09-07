@@ -9,13 +9,14 @@ from ..evidence import source_ownership as evidence
 
 
 def check(ctx):
-    src_root = ctx.root / "src"
-
-    if src_root.is_symlink() or not src_root.is_dir():
-        ctx.fail("missing-source", "src must be a regular directory")
-        production_sources: list[Path] = []
-    else:
-        production_sources = sorted(src_root.rglob("*.rs"))
+    production_sources: list[Path] = []
+    for relative in ("crates", "apps", "tools/test262"):
+        src_root = ctx.root / relative
+        if src_root.is_symlink() or not src_root.is_dir():
+            if not ctx.self_test_marker_authorized:
+                ctx.fail("missing-source", f"{relative} must be a regular directory")
+        else:
+            production_sources.extend(sorted(src_root.rglob("*.rs")))
 
     allowed_assertion_namespace_imports = {
         "use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};",
@@ -59,16 +60,16 @@ def check(ctx):
         if ctx.path.is_symlink() or not ctx.path.is_file():
             continue
         ctx.relative = ctx.path.relative_to(ctx.root).as_posix()
-        if ctx.relative.startswith("src/runtime/binary_object/"):
+        if ctx.relative.startswith("crates/engine/src/runtime/binary_object/"):
             continue
         ctx.source = ctx.path.read_text(encoding="utf-8")
         ctx.code = ctx.rust_code_only(ctx.source)
         binary_mentions = list(re.finditer(r"\bbinary_object\b", ctx.code))
-        if ctx.relative == "src/runtime.rs":
+        if ctx.relative == "crates/engine/src/runtime.rs":
             if len(binary_mentions) != 1:
                 ctx.fail(
                     "binary-object-consumer-set",
-                    "src/runtime.rs may name binary_object only in its private module declaration",
+                    "crates/engine/src/runtime.rs may name binary_object only in its private module declaration",
                 )
         elif ctx.relative == ctx.consumer_relative and ctx.consumer_exists:
             if len(binary_mentions) != 1:
@@ -110,7 +111,7 @@ def check(ctx):
                 + ctx.location(ctx.relative, ctx.source, ctx.match.start()),
             )
 
-    cursor_relative = "src/runtime/binary_object/read_cursor.rs"
+    cursor_relative = "crates/engine/src/runtime/binary_object/read_cursor.rs"
 
     cursor_source = ctx.read_source(cursor_relative)
 
@@ -227,15 +228,15 @@ def check(ctx):
             f"found {sealed_impl_headers}",
         )
 
-    graph_decode_relative = "src/runtime/binary_object/graph/decode.rs"
+    graph_decode_relative = "crates/engine/src/runtime/binary_object/graph/decode.rs"
 
-    image_decode_relative = "src/runtime/binary_object/bytecode_image/decode/mod.rs"
+    image_decode_relative = "crates/engine/src/runtime/binary_object/bytecode_image/decode/mod.rs"
 
-    ctx.sab_transport_relative = "src/runtime/binary_object/graph/sab_transport.rs"
+    ctx.sab_transport_relative = "crates/engine/src/runtime/binary_object/graph/sab_transport.rs"
 
-    ctx.image_model_relative = "src/runtime/binary_object/bytecode_image/model.rs"
+    ctx.image_model_relative = "crates/engine/src/runtime/binary_object/bytecode_image/model.rs"
 
-    image_atoms_relative = "src/runtime/binary_object/bytecode_image/atoms.rs"
+    image_atoms_relative = "crates/engine/src/runtime/binary_object/bytecode_image/atoms.rs"
 
     graph_decode_source = ctx.read_source(graph_decode_relative)
 
@@ -422,7 +423,7 @@ def check(ctx):
                 "scalar admission may consume boolean atom predicates, not raw atom identities; found "
                 + ctx.location(ctx.relative, ctx.source, ctx.match.start()),
             )
-        if not ctx.relative.startswith("src/runtime/binary_object/bytecode_image/") or ctx.is_test_source(ctx.path):
+        if not ctx.relative.startswith("crates/engine/src/runtime/binary_object/bytecode_image/") or ctx.is_test_source(ctx.path):
             continue
         for ctx.match in visible_function_pattern.finditer(ctx.code):
             visibility = " ".join(ctx.match.group("visibility").split())
@@ -447,7 +448,7 @@ def check(ctx):
     if ctx.is_full_binary_inventory:
         expected_atom_sensitive_visible_sites.append(
             (
-                "src/runtime/binary_object/bytecode_image/model.rs",
+                "crates/engine/src/runtime/binary_object/bytecode_image/model.rs",
                 "pub(in crate::runtime::binary_object)",
                 "name_is_null",
             )

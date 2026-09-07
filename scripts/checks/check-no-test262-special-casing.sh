@@ -20,18 +20,18 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/quickjs-oxide-anticheat.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 
 # Production modules must remain under the scanned source tree. Internal
-# module tests use the normal cfg(test) child-module layout below src/.
+# module tests use the normal cfg(test) child-module layout below crates/engine/src/.
 external_module_paths=$(rg --with-filename --no-heading --color never \
-    --glob '*.rs' -- '^#\[path[[:space:]]*=[[:space:]]*"\.\./' src || true)
+    --glob '*.rs' --glob '!**/tests/**' -- '^#\[path[[:space:]]*=[[:space:]]*"\.\./' crates apps tools/test262 || true)
 [[ -z "$external_module_paths" ]] \
     || die 'production sources contain an unauthenticated external module path'
 rg --quiet --multiline --pcre2 -- \
-    '^#\[cfg\(test\)\]\nmod tests;$' src/runtime/module.rs \
+    '^#\[cfg\(test\)\]\nmod tests;$' crates/engine/src/runtime/module.rs \
     || die 'runtime module unit tests must be guarded by cfg(test)'
-[[ -f src/runtime/module/tests.rs && ! -L src/runtime/module/tests.rs ]] \
+[[ -f crates/engine/src/runtime/module/tests.rs && ! -L crates/engine/src/runtime/module/tests.rs ]] \
     || die 'runtime module unit tests must be a regular source file'
 
-scan_roots=(src web/wasm/src Cargo.toml web/wasm/Cargo.toml)
+scan_roots=(crates apps tools/test262 Cargo.toml)
 while IFS= read -r build_script; do
     scan_roots+=("$build_script")
 done < <(find . -path './target' -prune -o -name build.rs -print | LC_ALL=C sort)
@@ -40,8 +40,8 @@ scan_globs=(
     --glob '*.toml'
     --glob '!**/*tests.rs'
     --glob '!**/tests/**'
-    --glob '!src/bin/run_test262.rs'
-    --glob '!src/bin/run_test262/**'
+    --glob '!tools/test262/src/main.rs'
+    --glob '!tools/test262/src/run_test262/**'
 )
 
 path_pattern='\b(?:test/)?(?:built-ins|language|intl402|annexB|staging|harness)/[A-Za-z0-9_./@+-]+\.js\b|[A-Za-z0-9_.@+-]+_FIXTURE\.js\b'
@@ -56,31 +56,31 @@ source_alias_identity_pattern='(?i:\blet\s+(?:mut\s+)?([a-z_][a-z0-9_]*)\s*=\s*(
 filename_probe_pattern='(?i:\b(?:filename|file_name|path)\b)[^;\n]{0,160}(?:\.(?:contains|starts_with|ends_with|find|rfind|match_indices|strip_prefix|strip_suffix)\(\s*(?:r\#*)?"[^"\n]+|(?:==|!=)\s*(?:r\#*)?"[^"\n]+"\#*)|(?:r\#*)?"[^"\n]+"\#*\s*(?:==|!=)[^;\n]{0,160}(?i:\b(?:filename|file_name|path)\b)|(?i:\bmatch\s+(?:&\s*)?(?:filename|file_name|path)\b)[^\{\n]{0,80}\{[\s\S]{0,240}?(?:r\#*)?"[^"\n]+"\#*\s*=>'
 filename_alias_pattern='(?i:\blet\s+(?:mut\s+)?([a-z_][a-z0-9_]*)\s*=\s*(?:&\s*)?(?:filename|file_name|path)(?:\.(?:to_owned|to_string|clone|as_str|as_ref|trim|trim_start|trim_end)\(\))*\s*;)[\s\S]{0,400}?\b\1[^;\n]{0,140}(?:(?:==|!=)\s*(?:r\#*)?"[^"\n]+"\#*|\.(?:contains|starts_with|ends_with|find|rfind|match_indices|strip_prefix|strip_suffix)\(\s*(?:r\#*)?"[^"\n]+)'
 embedded_fixture_pattern='include_(?:str|bytes)!\s*\([^;\n]{0,180}(?:r\#*)?"[^"\n]*(?:test262|fixture|(?:^|/)test/)[^"\n]*"'
-source_literal_allow_pattern="^src/lexer\\.rs:[0-9]+:[[:space:]]*let limit = if source == \"'abc'\" \\{ 2 \\} else \\{ 1 \\};$"
+source_literal_allow_pattern="^crates/compiler/src/lexer\\.rs:[0-9]+:[[:space:]]*let limit = if source == \"'abc'\" \\{ 2 \\} else \\{ 1 \\};$"
 
 source_probe_allowlist=$tmp/source-probe-allowlist.txt
 printf '%s\n' \
-    "src/lexer.rs:        if ch == '\\r' && self.source[self.offset..].starts_with(\"\\r\\n\") {" \
-    "src/lexer.rs:            '/' if source.starts_with(\"//\") => {" \
-    "src/lexer.rs:            '/' if source.starts_with(\"/*\") => {" \
-    "src/lexer.rs:                let Some(end) = source[2..].find(\"*/\") else {" \
-    "src/lexer.rs:        if source.starts_with(\"//\") {" \
-    "src/lexer.rs:        } else if source.starts_with(\"/*\") {" \
-    "src/lexer.rs:            let Some(end) = source[2..].find(\"*/\") else {" \
-    "src/lexer.rs:    let Some(after) = source.strip_prefix(\"of\") else {" \
-    "src/lexer.rs:    if !source.starts_with(b\"#!\") {" \
-    "src/lexer.rs:        if source.starts_with(b\"//\") {" \
-    "src/lexer.rs:        } else if source.starts_with(b\"/*\") {" \
-    "src/lexer.rs:    if let Some(rest) = source.strip_prefix(b\"import\")" \
-    "src/lexer.rs:    } else if let Some(rest) = source.strip_prefix(b\"export\")" \
-    "src/lexer.rs:    } else if let Some(rest) = source.strip_prefix(b\".\") {" \
-    "src/lexer.rs:    } else if let Some(rest) = source.strip_prefix(b\"(\") {" \
+    "crates/compiler/src/lexer.rs:        if ch == '\\r' && self.source[self.offset..].starts_with(\"\\r\\n\") {" \
+    "crates/compiler/src/lexer.rs:            '/' if source.starts_with(\"//\") => {" \
+    "crates/compiler/src/lexer.rs:            '/' if source.starts_with(\"/*\") => {" \
+    "crates/compiler/src/lexer.rs:                let Some(end) = source[2..].find(\"*/\") else {" \
+    "crates/compiler/src/lexer.rs:        if source.starts_with(\"//\") {" \
+    "crates/compiler/src/lexer.rs:        } else if source.starts_with(\"/*\") {" \
+    "crates/compiler/src/lexer.rs:            let Some(end) = source[2..].find(\"*/\") else {" \
+    "crates/compiler/src/lexer.rs:    let Some(after) = source.strip_prefix(\"of\") else {" \
+    "crates/compiler/src/lexer.rs:    if !source.starts_with(b\"#!\") {" \
+    "crates/compiler/src/lexer.rs:        if source.starts_with(b\"//\") {" \
+    "crates/compiler/src/lexer.rs:        } else if source.starts_with(b\"/*\") {" \
+    "crates/compiler/src/lexer.rs:    if let Some(rest) = source.strip_prefix(b\"import\")" \
+    "crates/compiler/src/lexer.rs:    } else if let Some(rest) = source.strip_prefix(b\"export\")" \
+    "crates/compiler/src/lexer.rs:    } else if let Some(rest) = source.strip_prefix(b\".\") {" \
+    "crates/compiler/src/lexer.rs:    } else if let Some(rest) = source.strip_prefix(b\"(\") {" \
     > "$source_probe_allowlist"
 
 filename_probe_allowlist=$tmp/filename-probe-allowlist.txt
 printf '%s\n' \
-    "src/main.rs:        if filename.ends_with(\".json\") || import_type_is(attributes, \"json\") {" \
-    "src/main.rs:    filename.ends_with(\".mjs\") || quickjs_detect_module_bytes(source)" \
+    "apps/cli/src/main.rs:        if filename.ends_with(\".json\") || import_type_is(attributes, \"json\") {" \
+    "apps/cli/src/main.rs:    filename.ends_with(\".mjs\") || quickjs_detect_module_bytes(source)" \
     > "$filename_probe_allowlist"
 
 filter_exact_allowlist() {
@@ -154,7 +154,7 @@ case $hash_status in
         : > "$unexpected_hashes"
         while IFS= read -r occurrence; do
             case $occurrence in
-                src/unicode_*"$unicode_source_sha"*|src/generated/unicode/unicode_*"$unicode_source_sha"*) ;;
+                crates/core/src/unicode_*"$unicode_source_sha"*|crates/core/src/generated/unicode/unicode_*"$unicode_source_sha"*) ;;
                 *) printf '%s\n' "$occurrence" >> "$unexpected_hashes" ;;
             esac
         done <<< "$hash_output"
@@ -256,19 +256,19 @@ printf 'let name = filename.to_owned(); if name.contains("no-new-call-expression
 rg --quiet --multiline --pcre2 -- "$filename_alias_pattern" "$tmp/filename-owned-alias.rs" \
     || die "owned filename-alias canary escaped the anti-cheat pattern"
 
-allowed_source_occurrence="src/lexer.rs:1:        if source.starts_with(\"//\") {"
+allowed_source_occurrence="crates/compiler/src/lexer.rs:1:        if source.starts_with(\"//\") {"
 [[ -z $(filter_exact_allowlist "$source_probe_allowlist" <<< "$allowed_source_occurrence") ]] \
     || die "exact source-probe allowlist rejected its authenticated expression"
-blocked_source_occurrence='src/lexer.rs:999:if source.find("import").is_some() { syntax_error(); }'
+blocked_source_occurrence='crates/compiler/src/lexer.rs:999:if source.find("import").is_some() { syntax_error(); }'
 [[ $(filter_exact_allowlist "$source_probe_allowlist" <<< "$blocked_source_occurrence") == \
     "$blocked_source_occurrence" ]] \
     || die "source-probe allowlist admitted a different expression with an allowed literal"
-blocked_filename_occurrence='src/main.rs:999:if filename.ends_with(".mjs") { syntax_error(); }'
+blocked_filename_occurrence='apps/cli/src/main.rs:999:if filename.ends_with(".mjs") { syntax_error(); }'
 [[ $(filter_exact_allowlist "$filename_probe_allowlist" <<< "$blocked_filename_occurrence") == \
     "$blocked_filename_occurrence" ]] \
     || die "filename-probe allowlist admitted a different expression with an allowed suffix"
 
-printf 'const CASE: &str = include_str!("tests/test262/fixture.js");\n' > "$tmp/include.rs"
+printf 'const CASE: &str = include_str!("crates/quickjs-oxide/tests/test262/fixture.js");\n' > "$tmp/include.rs"
 rg --quiet --multiline --pcre2 -- "$embedded_fixture_pattern" "$tmp/include.rs" \
     || die "embedded-fixture canary escaped the anti-cheat pattern"
 

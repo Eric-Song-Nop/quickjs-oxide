@@ -20,7 +20,7 @@ def check(ctx):
             f"found {translate_atom_classes}",
         )
 
-    ordinary_leaf_relative = "src/runtime/binary_object/ordinary_leaf.rs"
+    ordinary_leaf_relative = "crates/engine/src/runtime/binary_object/ordinary_leaf.rs"
 
     ordinary_leaf_source = ctx.read_source(ordinary_leaf_relative)
 
@@ -335,7 +335,7 @@ def check(ctx):
             ),
         )
 
-    ctx.scalar_script_relative = "src/runtime/binary_object/scalar_script.rs"
+    ctx.scalar_script_relative = "crates/engine/src/runtime/binary_object/scalar_script.rs"
 
     ctx.scalar_script_source = ctx.read_source(ctx.scalar_script_relative)
 

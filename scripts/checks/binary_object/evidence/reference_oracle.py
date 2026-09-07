@@ -1,8 +1,8 @@
 """Pinned data and expected shapes for reference_oracle."""
 
-STAGE3J_C_EVIDENCE_HASHES = {'tests/fixtures/inputs/function_bytecode_wire.c': '815baf3fbf14de146b53d103401279cd9d5eacd006e60b468f8d141b34e2bd92',
- 'tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt': '58d8327f176950aeb8ab682dcf8fc11577421c46c5eb146f078adb073fbf03ec',
- 'dev-support/quickjs-c-oracles.tsv': 'd89a56d7de7b16d2a8430318d62d8d736eedff3494946ddaba29c297d259d2e7'}
+STAGE3J_C_EVIDENCE_HASHES = {'apps/cli/tests/fixtures/inputs/function_bytecode_wire.c': '815baf3fbf14de146b53d103401279cd9d5eacd006e60b468f8d141b34e2bd92',
+ 'apps/cli/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt': '58d8327f176950aeb8ab682dcf8fc11577421c46c5eb146f078adb073fbf03ec',
+ 'dev-support/quickjs-c-oracles.tsv': '6a12fb701764299f86086be637bf816457f36fa7a4732029f96a04a0c9008db3'}
 
 STAGE3D_C_TRANSCRIPT_CONTRACT = ('ordinary-throw-wire-size=45',
  'ordinary-throw-wire-fnv1a64=73cf217e06c5fee2',

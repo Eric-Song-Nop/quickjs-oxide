@@ -41,7 +41,7 @@ def check(ctx):
         stage3d_c_sources[ctx.relative] = payload.decode("utf-8")
 
     stage3d_c_source = stage3d_c_sources.get(
-        "tests/fixtures/inputs/function_bytecode_wire.c", ""
+        "apps/cli/tests/fixtures/inputs/function_bytecode_wire.c", ""
     )
 
     if (
@@ -203,7 +203,7 @@ def check(ctx):
         )
 
     stage3d_c_transcript = stage3d_c_sources.get(
-        "tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt", ""
+        "apps/cli/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt", ""
     )
 
     stage3d_c_transcript_contract = deepcopy(evidence.STAGE3D_C_TRANSCRIPT_CONTRACT)
@@ -300,9 +300,9 @@ def check(ctx):
         or sum(
             line.startswith(
                 "function-bytecode-wire\tfunction-bytecode\t"
-                "tests/fixtures/inputs/function_bytecode_wire.c\t"
+                "apps/cli/tests/fixtures/inputs/function_bytecode_wire.c\t"
                 "815baf3fbf14de146b53d103401279cd9d5eacd006e60b468f8d141b34e2bd92\t"
-                "tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt\t"
+                "apps/cli/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt\t"
                 "58d8327f176950aeb8ab682dcf8fc11577421c46c5eb146f078adb073fbf03ec\t"
             )
             for line in stage3i_manifest_lines

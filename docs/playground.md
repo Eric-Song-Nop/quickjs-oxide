@@ -53,7 +53,7 @@ python3 -m http.server 4173 --directory target/pages
 ```
 
 Open <http://localhost:4173/>. The build script writes only generated files
-under `target/pages`; `web/site` remains the reviewable static source.
+under `target/pages`; `apps/web/site` remains the reviewable static source.
 If a local shared Cargo target is busy, set `CARGO_TARGET_DIR` to a separate
 build cache; the deployable tree still lands in `target/pages`.
 

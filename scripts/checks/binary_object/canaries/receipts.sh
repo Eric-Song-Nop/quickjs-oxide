@@ -2,14 +2,18 @@ run_stage3i_receipt_escape_canaries() {
     local suite_root=$1
     local base_root=$suite_root/base
 
-    mkdir -p "$base_root/tests/fixtures/inputs" "$base_root/tests/fixtures/expected" "$base_root/dev-support/test262/generated" \
+    mkdir -p "$base_root/apps/cli/tests/fixtures/inputs" "$base_root/apps/cli/tests/fixtures/expected" "$base_root/dev-support/test262/generated" \
         "$base_root/docs"
-    cp -R "$repository_root/src" "$base_root/src"
+    local tree
+    for tree in crates apps tools; do
+        mkdir -p "$base_root/$tree"
+        cp -R "$repository_root/$tree/." "$base_root/$tree"
+    done
     cp -- "$repository_root/Cargo.toml" "$base_root/Cargo.toml"
-    cp -- "$repository_root/tests/fixtures/inputs/function_bytecode_wire.c" \
-        "$base_root/tests/fixtures/inputs/function_bytecode_wire.c"
-    cp -- "$repository_root/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt" \
-        "$base_root/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt"
+    cp -- "$repository_root/apps/cli/tests/fixtures/inputs/function_bytecode_wire.c" \
+        "$base_root/apps/cli/tests/fixtures/inputs/function_bytecode_wire.c"
+    cp -- "$repository_root/apps/cli/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt" \
+        "$base_root/apps/cli/tests/fixtures/expected/function_bytecode_wire.quickjs-2026-06-04.txt"
     cp -- "$repository_root/dev-support/quickjs-c-oracles.tsv" \
         "$base_root/dev-support/quickjs-c-oracles.tsv"
     cp -- "$repository_root/dev-support/test262/current.conf" \

@@ -454,7 +454,7 @@ baseline_engine_semantics_sha256=$(node "$engine_fingerprint_tool" --root "$root
 workspace_engine_fingerprint() {
     node "$engine_fingerprint_tool" --root "$root" \
         --worktree --files "Cargo.lock,Cargo.toml,compat/test262-oxide.conf,compat/upstream.toml,scripts/test262/prepare-test262.sh,scripts/test262/test-test262.sh,scripts/test262/verify-report.cjs" \
-        --trees "$(spec_value engine_semantics_trees)"
+        --trees "apps,crates,tools/test262"
 }
 workspace_engine_semantics_sha256=$(workspace_engine_fingerprint)
 
@@ -504,7 +504,7 @@ esac
 build_host=$(rustc -vV | awk '$1=="host:" { print $2; found++ } END { if (found!=1) exit 1 }')
 QUICKJS_OXIDE_TEST262_ENGINE_SEMANTICS_SHA256=$workspace_engine_semantics_sha256 \
     cargo build --locked --release --target "$build_host" \
-    --target-dir "$target_dir" --features test262-host --bin run-test262
+    --target-dir "$target_dir" -p quickjs-oxide-test262 --bin run-test262
 assert_workspace_engine_unchanged 'runner build'
 built_runner=$target_dir/$build_host/release/run-test262
 [[ -f "$built_runner" && -x "$built_runner" && ! -L "$built_runner" ]] \

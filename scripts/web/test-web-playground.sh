@@ -19,24 +19,24 @@ if ! command -v rg >/dev/null 2>&1; then
 fi
 
 if ! grep -Fqx \
-  'quickjs-oxide = { path = "../..", default-features = false }' \
-  web/wasm/Cargo.toml; then
+  'quickjs-oxide = { workspace = true, default-features = false }' \
+  apps/web/Cargo.toml; then
   echo "web wrapper must path-depend on quickjs-oxide without dev-support features" >&2
   exit 1
 fi
 
-if ! grep -Fqx 'wasm-bindgen = "=0.2.126"' web/wasm/Cargo.toml \
+if ! grep -Fqx 'wasm-bindgen = "=0.2.126"' Cargo.toml \
   || ! grep -Fqx \
     'js-sys = { version = "=0.3.103", default-features = false }' \
-    web/wasm/Cargo.toml; then
+    Cargo.toml; then
   echo "web bindings must stay exactly pinned with js-sys unsafe-eval disabled" >&2
   exit 1
 fi
 
 rust_host_pattern='js_sys::(eval|Function)|Function::new'
 browser_host_pattern='(^|[^.$[:alnum:]_])eval[[:space:]]*[(]|(globalThis|window|self)[.]eval[[:space:]]*[(]|new[[:space:]]+Function[[:space:]]*[(]|(^|[^.$[:alnum:]_])Function[[:space:]]*[(]'
-if rg -n "${rust_host_pattern}" web/wasm \
-  || rg -n --glob '!pkg/**' "${browser_host_pattern}" web/site; then
+if rg -n "${rust_host_pattern}" apps/web \
+  || rg -n --glob '!pkg/**' "${browser_host_pattern}" apps/web/site; then
   echo "playground source must not delegate evaluation to the browser host" >&2
   exit 1
 fi

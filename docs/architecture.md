@@ -1,82 +1,98 @@
-# Engine module responsibilities
+# Workspace architecture
 
-The engine currently lives in one Rust crate. Internal modules separate
-implementation responsibilities. Callers import types from their owning module.
+The repository contains five library packages and three executable/adapter
+packages. The root Cargo manifest owns shared dependencies, lint policy, and
+build profiles. Source belongs to its package; no old source entry points are
+retained at the repository root.
 
-## Heap
+| Package | Responsibility | Production workspace dependencies |
+| --- | --- | --- |
+| `crates/core` | Strings, atoms, source positions, numeric primitives, bytecode, function/module drafts, and representation-only validation | None |
+| `crates/compiler` | Lexing, parsing, scope analysis, name resolution, and lowering into unlinked drafts | core |
+| `crates/engine` | Heap/GC, VM, rooted values, realm state, publication, objects, builtins, module execution, and jobs | core, compiler |
+| `crates/host` | Native clock, timezone, random seed, and qjs output implementation | core |
+| `crates/quickjs-oxide` | The Rust embedding entry point and default runtime construction | engine, host |
+| `apps/cli` | qjs arguments, file loading, diagnostics, and process policy | quickjs-oxide |
+| `apps/web` | WASM exports, browser host services, and result conversion | quickjs-oxide |
+| `tools/test262` | Test262 admission, scheduling, execution, and reporting | quickjs-oxide with test262-host |
 
-- `src/heap.rs` owns heap identities, stored payloads, allocation, and
-  representation validation.
-- `src/heap/buffers.rs` owns ArrayBuffer backing-store access, resizing,
-  copying, transfer, and detach, plus SharedArrayBuffer handle cloning and
-  growth. Observable coercions and view validation remain in the runtime.
-- `src/heap/collections.rs` owns Map/Set and weak-collection records, their
-  storage mutations, and live collection iterator state. Key comparison and
-  the JavaScript iterator protocol remain runtime responsibilities.
-- `src/heap/gc.rs` owns reference counting, edge and atom traversal, the
-  ordered weak-reference pass, finalization, and cycle collection. Publication
-  and mutation reuse the same ownership primitives and graph traversal.
-- `src/heap/bytecode_validation.rs` validates frame pseudo bindings, parameter
-  layouts, and eval environments before bytecode publication.
-- `src/heap/private_validation.rs` authenticates private binding metadata and
-  private callable initialization protocols before publication.
-- `src/heap/native.rs` defines builtin selectors and native call descriptors.
-  It describes callable metadata; builtin execution belongs to the runtime.
-- `src/heap/tests.rs` provides shared test builders. Its child modules group
-  tests by storage, payload, collection, buffer, module, and bytecode behavior.
+## Shared models and compilation
 
-Heap validation checks whether a stored representation is valid. It must not
-execute JavaScript or invoke host callbacks while borrowing heap storage.
-Heap nodes and storage types belong to `quickjs_oxide::heap`. Shared function
-descriptors belong to `quickjs_oxide::function::metadata`; callers use that
-path directly.
+Core owns `JsString`, atoms, instructions, function descriptors, and unlinked
+function/module products. `PrimitiveValue` contains only runtime-independent
+constants. Object and symbol roots remain in the engine's `Value`. Publication
+converts between these representations explicitly; no runtime handles enter
+compiler-owned constant pools.
 
-## Function model
+The pure regular-expression compiler/matcher lives in core because both literal
+compilation and runtime RegExp construction consume it. The ECMAScript RegExp
+object shell remains an engine builtin. This migration retains the existing
+matcher rather than introducing a separate package or replacement engine.
 
-`src/function/metadata.rs` owns function, parameter, closure, and eval
-descriptors shared by compilation, publication, and execution. It depends on
-atom identities rather than heap nodes or runtime handles. Runtime-owned
-bytecode nodes and authenticated private-binding storage remain in the heap.
-`src/function.rs` still contains both unlinked functions and rooted published
-function handles; it is not yet an independent compiler crate.
+Compiler owns its lexer and parser modules and the existing resolution and
+lowering passes. There is no new AST pipeline. Bytecode layout checks which are
+independent from allocation live in core; private-binding authentication and
+heap identity checks remain with engine storage/publication.
 
-## Compiler
+Engine depends on compiler for `eval`, dynamic functions, and module compilation.
+Compiler has no production dependency on engine. A module attribute callback
+can stop parsing with `ModuleCompileFailure::Host`; the caller retains the exact
+thrown engine value. The parser neither stringifies the exception nor owns it.
 
-- `src/compiler.rs` owns compilation entry points, shared IR, and the parser.
-  Existing syntax-specific child modules extend the parser.
-- `src/compiler/scope_validation.rs` checks the completed scope and binding
-  graph before name resolution.
-- `src/compiler/resolution.rs` resolves names, declaration hoists, eval
-  environments, and closure captures.
-- `src/compiler/lowering.rs` converts resolved IR into verified bytecode and
-  debug information. Its private scope-lifetime representation stays local.
+## Engine internals
 
-These passes operate on compiler-owned IR and produce unlinked functions.
-Publishing functions into a realm remains a runtime responsibility.
+- `heap/` owns storage, allocation, reference counting, edge traversal and GC.
+- `vm.rs` owns execution frames, instructions, unwinding and suspension.
+- `object.rs`, `property.rs`, `shape.rs`, and runtime property/internal-method
+  modules own object representation and observable property semantics.
+- `runtime/intrinsics/` owns ECMAScript builtin behavior.
+- `runtime/bootstrap/` and `context/` own realm construction and operations.
+- `runtime/bytecode_publish.rs` owns draft validation and publication.
+- `runtime/module/` and `jobs.rs` own module execution and pending jobs.
+- Engine `function.rs` and `object.rs` own rooted published handles.
+- `runtime/host.rs` exposes the embedding service contract. The data-only
+  contract is defined in core so providers need no dependency on engine state.
 
-## Runtime
+These are internal module boundaries, not additional Cargo packages. They may
+share engine-private state without exporting heap mutation to an outer crate.
 
-- `src/runtime.rs` owns runtime state and engine orchestration.
-- `src/runtime/bootstrap.rs` installs primitive and function intrinsics and
-  their initial property relationships.
-- `src/runtime/context.rs` provides the realm-facing embedding operations.
-- `src/runtime/intrinsics/` implements builtin behavior.
-- `src/runtime/host.rs` defines host services; `src/runtime/host/system.rs`
-  implements the default clock, timezone, and random-seed provider. These
-  runtime-wide services do not belong to the Date intrinsic.
-- Other existing child modules handle jobs, module execution, property
-  semantics, callable state, and host integration.
+## Host and Rust embedding
 
-The parent heap, compiler, and runtime files still contain multiple
-responsibilities. Further extraction should follow ownership and execution
-boundaries, preserve feature gates, and keep helper visibility within the
-owning module. Splitting these modules into workspace crates is a separate step.
+`quickjs-oxide::Runtime::new()` selects the native host provider. Explicit host
+services remain supported. The facade runtime owns an engine runtime and
+forwards access through `Deref`; Context, Value, and rooted handles retain a
+single engine-owned representation. `into_engine()` transfers that ownership
+when composing lower-level APIs.
 
-## Tests
+Engine-only callers construct a runtime with `Runtime::new_with_host_services`.
+The engine does not select an operating-system provider. qjs helper installation
+and value formatting remain with internal native dispatch; the host service
+receives formatted output bytes and the flush policy. Custom providers may
+capture output by implementing `HostServices::write_output`; its default is a
+sink. The native provider preserves stdout writes and ignored I/O errors.
 
-Internal unit tests stay beside their owning modules under `src/`; integration
-tests exercise public interfaces under `tests/`. The oracle suite has one Cargo
-entry point, `tests/oracle/main.rs`, with topic modules below the same directory.
-Compiler and runtime unit suites are split into behavior topics; their parent
-test modules retain only shared setup. Ordinary integration targets use Cargo
-automatic discovery. See [the test layout guide](../tests/README.md) for placement and check commands.
+Test262 is opt-in. Agent sessions accept a runtime factory; each worker creates
+its runtime on its own thread. The runner supplies native services. No runtime
+root crosses a thread boundary.
+
+## Tests and tooling
+
+Unit tests live with their owner. Compiler execution tests use an engine dev
+dependency and narrowly gated `test-support` APIs, without introducing a
+production dependency cycle. Detached bytecode tests can use primitive values
+in core/compiler and rooted values in engine.
+
+Rust embedding integration tests live in `crates/quickjs-oxide/tests`. CLI and
+oracle integration tests live in `apps/cli/tests`, where Cargo provides the qjs
+binary. Oracle fixtures and expected outputs live with those tests. A shared
+syntax-error assertion remains in the embedding test helpers and is imported
+explicitly by the CLI test helpers.
+
+Scripts retain their checks/test262/quickjs/unicode/web responsibilities.
+Current Test262 fingerprints cover the new package trees, while historical
+receipt input lists continue to authenticate their original commits.
+
+For quick iteration, check the affected packages with `cargo check -p PACKAGE`.
+At a completed migration boundary, use `cargo check --workspace --all-targets`.
+Run focused tests for changed semantics; reserve the full oracle and mutation
+suites for a deliberate broader validation pass.

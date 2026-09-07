@@ -23,7 +23,7 @@ class OracleRegistryTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='qjo-oracle-registry-')
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.oracle = self.root / 'tests/oracle'
+        self.oracle = self.root / 'apps/cli/tests/oracle'
         self.oracle.mkdir(parents=True)
         self.write('main.rs', 'mod ordinary;\n' + ''.join(
             '#[cfg(feature = "test262-host")]\nmod ' + name + ';\n'
@@ -85,8 +85,8 @@ class OracleRegistryTests(unittest.TestCase):
             self.inventory()
 
     def test_legacy_top_level_wrapper_is_rejected(self):
-        (self.root / 'tests/oracle_legacy.rs').write_text('')
-        with self.assertRaisesRegex(SystemExit, 'must live under tests/oracle'):
+        (self.root / 'apps/cli/tests/oracle_legacy.rs').write_text('')
+        with self.assertRaisesRegex(SystemExit, 'must live under apps/cli/tests/oracle'):
             self.inventory()
 
 

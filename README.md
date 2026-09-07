@@ -80,3 +80,22 @@ npm ci && npx playwright install chromium && npm run test:browser
 ## License
 
 [MIT](LICENSE). Third-party notices: [NOTICE](NOTICE), [LICENSES](LICENSES/).
+
+## Workspace layout
+
+The engine is organized into `crates/core`, `crates/compiler`, and
+`crates/engine`. Native host implementations live in `crates/host`, and
+`crates/quickjs-oxide` is the Rust embedding entry point. The qjs CLI and
+browser application live in `apps/cli` and `apps/web`; the Test262 runner lives
+in `tools/test262`. See [architecture](docs/architecture.md) for ownership and
+production dependency boundaries.
+
+```sh
+cargo run -p quickjs-oxide-cli -- -e 'print(6 * 7)'
+cargo run -p quickjs-oxide --example eval -- '6 * 7'
+cargo check --workspace --all-targets
+cargo test -p quickjs-oxide-compiler --lib
+```
+
+Generated Unicode tables are checked in under `crates/core/src/generated`;
+normal product builds do not run their generators.

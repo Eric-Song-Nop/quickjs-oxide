@@ -7,8 +7,8 @@ set -euo pipefail
 tool_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 script_dir=$(CDPATH= cd -- "$tool_dir/.." && pwd)
 root=$(CDPATH= cd -- "$script_dir/.." && pwd)
-fixture=$root/tests/fixtures/inputs/host_gc_reentrant.js
-expected=$root/tests/fixtures/expected/host_gc_reentrant.quickjs-2026-06-04.txt
+fixture=$root/apps/cli/tests/fixtures/inputs/host_gc_reentrant.js
+expected=$root/apps/cli/tests/fixtures/expected/host_gc_reentrant.quickjs-2026-06-04.txt
 fixture_sha256=0cb5dd063148070cd18507c51057a6664e3726705fca5af051b9f7486ee3d740
 expected_sha256=4081eb2feb9f81b57c58beae27d863136ca69c94825687b09fe96edc5bbdf931
 run_oxide=false

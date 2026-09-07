@@ -8,7 +8,7 @@ from ..evidence import native_plan as evidence
 
 
 def check(ctx):
-    native_plan_relative = "src/runtime/binary_object/bytecode_image/native_plan.rs"
+    native_plan_relative = "crates/engine/src/runtime/binary_object/bytecode_image/native_plan.rs"
 
     native_plan_source = ctx.read_source(native_plan_relative)
 
@@ -425,7 +425,7 @@ def check(ctx):
     native_operand_variants = ctx.enum_variant_names(native_operands_code)
 
     if ctx.is_full_binary_inventory:
-        ctx.pinned_opcode_relative = "src/runtime/binary_object/pinned_opcodes.rs"
+        ctx.pinned_opcode_relative = "crates/engine/src/runtime/binary_object/pinned_opcodes.rs"
         pinned_opcode_code = ctx.binary_code_cache[ctx.root / ctx.pinned_opcode_relative]
         opcode_format_pattern = re.compile(
             rf"\b{native_plan_visibility_pattern.replace('binary_object', 'runtime')}"
@@ -691,7 +691,7 @@ def check(ctx):
                         for mention in unexpected
                     ),
                 )
-        elif ctx.relative == "src/runtime/binary_object/function_translate/mod.rs":
+        elif ctx.relative == "crates/engine/src/runtime/binary_object/function_translate/mod.rs":
             continue
         elif mentions:
             ctx.fail(
@@ -714,7 +714,7 @@ def check(ctx):
     allowed_native_plan_symbol_files = {
         native_plan_relative,
         ctx.image_root_relative,
-        "src/runtime/binary_object/function_translate/mod.rs",
+        "crates/engine/src/runtime/binary_object/function_translate/mod.rs",
     }
 
     for ctx.path, ctx.code in ctx.binary_code_cache.items():
@@ -739,7 +739,7 @@ def check(ctx):
 
     for ctx.path, ctx.code in ctx.binary_code_cache.items():
         ctx.relative = ctx.path.relative_to(ctx.root).as_posix()
-        if not ctx.relative.startswith("src/runtime/binary_object/bytecode_image/"):
+        if not ctx.relative.startswith("crates/engine/src/runtime/binary_object/bytecode_image/"):
             continue
         for ctx.match in bytecode_image_alias_pattern.finditer(ctx.code):
             ctx.fail(
@@ -760,7 +760,7 @@ def check(ctx):
                 + ctx.location(ctx.relative, ctx.binary_source_cache[ctx.path], ctx.match.start()),
             )
 
-    function_translate_root = "src/runtime/binary_object/function_translate"
+    function_translate_root = "crates/engine/src/runtime/binary_object/function_translate"
 
     ctx.function_translate_relative = f"{function_translate_root}/mod.rs"
 

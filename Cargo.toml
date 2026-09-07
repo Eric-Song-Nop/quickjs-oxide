@@ -1,43 +1,30 @@
-[package]
-name = "quickjs-oxide"
+[workspace]
+members = ["crates/core", "crates/compiler", "crates/engine", "crates/host", "crates/quickjs-oxide", "apps/cli", "apps/web", "tools/test262"]
+default-members = ["crates/quickjs-oxide", "apps/cli"]
+resolver = "3"
+
+[workspace.package]
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.88"
-description = "A memory-safe Rust rewrite aiming for QuickJS feature parity"
 license = "MIT"
 repository = "https://github.com/pocket-stack/quickjs-oxide"
 
-[workspace]
-members = ["web/wasm"]
-default-members = ["."]
-resolver = "3"
-
-[dependencies]
+[workspace.dependencies]
+quickjs-oxide-core = { path = "crates/core" }
+quickjs-oxide-compiler = { path = "crates/compiler" }
+quickjs-oxide-engine = { path = "crates/engine" }
+quickjs-oxide-host = { path = "crates/host" }
+quickjs-oxide = { path = "crates/quickjs-oxide", default-features = false }
 num-bigint = "=0.5.1"
 num-traits = "=0.2.19"
 tz-rs = "=0.7.3"
+js-sys = { version = "=0.3.103", default-features = false }
+wasm-bindgen = "=0.2.126"
 
-[features]
-default = []
-test262-host = []
-
-[lib]
-name = "quickjs_oxide"
-path = "src/lib.rs"
-
-[[bin]]
-name = "qjs"
-path = "src/main.rs"
-
-[[bin]]
-name = "run-test262"
-path = "src/bin/run_test262.rs"
-required-features = ["test262-host"]
-
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
-
-[lints.clippy]
+[workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
 [profile.web]
