@@ -84,6 +84,7 @@ jobs:
           node --check scripts/generate-test262-module-json-a.mjs
           node --check scripts/test-generate-test262-module-json-a.mjs
           ./scripts/check-oracle-registry.sh
+          python3 scripts/test-oracle-registry.py
           ./scripts/test-quickjs-fixtures.sh --validate
           ./scripts/test-quickjs-c-oracles.sh --validate
           ./scripts/test-quickjs-dynamic-import-trace.sh --validate
@@ -95,10 +96,9 @@ jobs:
 
       - name: Run fast engine tests
         run: |
-          cargo test --locked --workspace --lib --bins
+          cargo test --locked --workspace --all-targets
+          cargo test --locked --workspace --doc
           cargo test --locked -p quickjs-oxide --features test262-host --lib --bins
-          cargo test --locked --test cli
-          cargo test --locked --test oracle
           cargo test --locked --features test262-host \
             --test unsupported_diagnostics
           cargo test --locked --features test262-host \

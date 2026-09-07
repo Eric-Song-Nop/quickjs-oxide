@@ -63,4 +63,6 @@ owning module. Splitting these modules into workspace crates is a separate step.
 Internal unit tests stay beside their owning modules under `src/`; integration
 tests exercise public interfaces under `tests/`. The oracle suite has one Cargo
 entry point, `tests/oracle/main.rs`, with topic modules below the same directory.
-See [the test layout guide](../tests/README.md) for placement and check commands.
+Compiler and runtime unit suites are split into behavior topics; their parent
+test modules retain only shared setup. Ordinary integration targets use Cargo
+automatic discovery. See [the test layout guide](../tests/README.md) for placement and check commands.

@@ -122,7 +122,7 @@ mixed-source baseline.
 
 The repository keeps only the current profile and focused receipt plus the
 small semantic ledgers used by runner unit tests. A fast inventory gate requires
-every tracked `tests/test262-*` artifact to be referenced by the current spec,
+every tracked `dev-support/test262/generated/test262-*` artifact to be referenced by the current spec,
 runner, or a generator. Earlier milestone profiles, 168 cohort-specific gates,
 result vectors, baselines, 313 superseded manifests, and former long-form status
 ledgers are preserved in the public `test262-history-*` release assets. Their
@@ -137,3 +137,7 @@ Official progress reports lead with full pass and eligible coverage. Runnable
 pass rate is secondary. A new admission must be expressed in profile data and
 must validate the correct negative phase/type and QuickJS diagnostic rule; the
 central gate must not acquire cohort names or fixture-specific branches.
+
+Active generated manifests and ledgers live in [`generated/`](generated/README.md).
+Handwritten test inputs and frozen QuickJS observations are separated under
+`tests/fixtures/inputs/` and `tests/fixtures/expected/`.
