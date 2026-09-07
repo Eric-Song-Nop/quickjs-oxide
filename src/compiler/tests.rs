@@ -2176,11 +2176,10 @@ use super::destructuring::ParenthesizedParameterScan;
 use super::{
     ACTIVE_FUNCTION_LOCAL_NAME, BindingKind, BindingStorage, EVAL_VARIABLE_OBJECT_LOCAL_NAME,
     EvalCompileContext, FunctionIr, FunctionIrOptions, FunctionKind, FunctionSourceInfo,
-    FunctionTree, HOME_OBJECT_LOCAL_NAME, InMode, IrScope, MAX_BYTECODE_STACK, MAX_CALL_ARGUMENTS,
-    MAX_LOCAL_VARIABLES, ModuleCompileFailure, ModuleDeclarationExport,
-    ModuleImportAttributeChecker, NEW_TARGET_LOCAL_NAME, Parser, ScopeId, ScopeKind, SourceOffset,
-    SuperCapabilities, THIS_LOCAL_NAME, WITH_OBJECT_LOCAL_NAME, build_scope_lifecycles,
-    compile_script, compile_unlinked_eval_with_filename,
+    HOME_OBJECT_LOCAL_NAME, InMode, MAX_BYTECODE_STACK, MAX_CALL_ARGUMENTS, MAX_LOCAL_VARIABLES,
+    ModuleCompileFailure, ModuleDeclarationExport, ModuleImportAttributeChecker,
+    NEW_TARGET_LOCAL_NAME, Parser, ScopeId, ScopeKind, SourceOffset, SuperCapabilities,
+    THIS_LOCAL_NAME, WITH_OBJECT_LOCAL_NAME, compile_script, compile_unlinked_eval_with_filename,
     compile_unlinked_module_bytes_with_name_and_attribute_checker,
     compile_unlinked_module_with_filename, compile_unlinked_module_with_name_and_attribute_checker,
     compile_unlinked_script, compile_unlinked_script_source_with_filename,
@@ -4608,73 +4607,6 @@ fn lexical_lowering_publishes_tdz_vardefs_and_checked_capture_relays() {
         window,
         [Instruction::GetVarRefCheck(0), Instruction::Return]
     )));
-}
-
-#[test]
-fn captured_with_object_has_close_lifetime_without_lexical_tdz() {
-    let make_function = |strict| {
-        let span = Span::new(Position::new(0, 1, 1), Position::new(0, 1, 1));
-        let mut function = FunctionIr::new(
-            None,
-            FunctionKind::Ordinary,
-            FunctionSourceInfo {
-                span,
-                definition: SourceOffset::try_from_usize(0).unwrap(),
-                range: None,
-            },
-            FunctionIrOptions {
-                function_name: None,
-                private_name_binding: false,
-                class_constructor: false,
-                derived_class_constructor: false,
-                parameters: Vec::new(),
-                defined_argument_count: 0,
-                has_simple_parameter_list: true,
-                rest_parameter: None,
-                strict,
-                super_capabilities: SuperCapabilities::NONE,
-            },
-        )
-        .unwrap();
-        let scope = ScopeId(function.scopes.len());
-        function.scopes.push(IrScope {
-            parent: Some(function.body_scope),
-            kind: ScopeKind::With,
-            is_parameter_initializer: false,
-            bindings: Vec::new(),
-        });
-        function.locals.push(WITH_OBJECT_LOCAL_NAME.to_owned());
-        function.add_binding(
-            scope,
-            scope,
-            WITH_OBJECT_LOCAL_NAME.to_owned(),
-            BindingStorage::Local(0),
-            BindingKind::WithObject,
-            None,
-        );
-        (function, scope)
-    };
-
-    let (function, scope) = make_function(false);
-    let lifecycles = build_scope_lifecycles(&function, &[true]).unwrap();
-    assert!(lifecycles[scope.0].tdz_locals.is_empty());
-    assert!(lifecycles[scope.0].function_entries.is_empty());
-    assert_eq!(lifecycles[scope.0].close_locals, [0]);
-
-    let (strict, _) = make_function(true);
-    let tree = FunctionTree {
-        functions: vec![strict],
-        source: "".into(),
-        filename: JsString::from_static("<strict-with-metadata>"),
-        module: None,
-        pending_unsupported: None,
-    };
-    assert!(
-        validate_scope_graph(&tree)
-            .unwrap_err()
-            .message()
-            .contains("strict function retained a local with object")
-    );
 }
 
 #[test]

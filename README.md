@@ -58,6 +58,7 @@ Neither is a general untrusted-bytecode loader or Feature Parity claim.
 
 ## Status
 
+- [Engine module responsibilities](docs/architecture.md)
 - [Current implementation status](docs/status.md)
 - [Pinned Test262 baseline and metric definitions](docs/test262.md)
 - [Parity acceptance contract](docs/parity.md)

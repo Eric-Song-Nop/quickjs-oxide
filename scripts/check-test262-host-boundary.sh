@@ -159,7 +159,7 @@ require_gated(
     ("pub use runtime::{Test262AgentError, Test262AgentSession};",),
 )
 require_gated(
-    "src/heap.rs",
+    "src/heap/native.rs",
     (
         "pub enum Test262AgentKind {",
         "    StringCodePointRange,",
@@ -169,6 +169,12 @@ require_gated(
         "    Test262IsHtmlDda,",
         "    Test262Gc,",
         "    Test262Agent(Test262AgentKind),",
+    ),
+)
+require_gated(
+    "src/heap.rs",
+    (
+        "pub use native::Test262AgentKind;",
         "    pub(crate) fn set_object_is_html_dda(&mut self, id: ObjectId) -> Result<(), HeapError> {",
     ),
 )
