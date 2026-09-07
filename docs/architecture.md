@@ -10,6 +10,9 @@ implementation responsibilities while the existing public paths remain stable.
 - `src/heap/buffers.rs` owns ArrayBuffer backing-store access, resizing,
   copying, transfer, and detach, plus SharedArrayBuffer handle cloning and
   growth. Observable coercions and view validation remain in the runtime.
+- `src/heap/collections.rs` owns Map/Set and weak-collection records, their
+  storage mutations, and live collection iterator state. Key comparison and
+  the JavaScript iterator protocol remain runtime responsibilities.
 - `src/heap/bytecode_validation.rs` validates frame pseudo bindings, parameter
   layouts, and eval environments before bytecode publication.
 - `src/heap/private_validation.rs` authenticates private binding metadata and
