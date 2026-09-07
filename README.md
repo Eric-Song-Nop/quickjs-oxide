@@ -70,10 +70,10 @@ Neither is a general untrusted-bytecode loader or Feature Parity claim.
 
 ```sh
 cargo test --locked --workspace --all-targets
-./scripts/test-test262.sh --check
-./scripts/test-test262.sh --focused
-TEST262_WORKERS=2 ./scripts/test-test262.sh --full
-./scripts/test-web-playground.sh
+./scripts/test262/test-test262.sh --check
+./scripts/test262/test-test262.sh --focused
+TEST262_WORKERS=2 ./scripts/test262/test-test262.sh --full
+./scripts/web/test-web-playground.sh
 npm ci && npx playwright install chromium && npm run test:browser
 ```
 

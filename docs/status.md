@@ -988,11 +988,11 @@ Fast CI rejects any new unreferenced Test262 bookkeeping file.
 ```sh
 cargo test --locked --workspace --all-targets
 cargo test --locked --features test262-host --lib --bins
-./scripts/test-quickjs-c-oracles.sh --check
-./scripts/test-test262.sh --check
-./scripts/test-test262.sh --focused
-TEST262_WORKERS=2 ./scripts/test-test262.sh --full
-./scripts/test-web-playground.sh
+./scripts/quickjs/test-quickjs-c-oracles.sh --check
+./scripts/test262/test-test262.sh --check
+./scripts/test262/test-test262.sh --focused
+TEST262_WORKERS=2 ./scripts/test262/test-test262.sh --full
+./scripts/web/test-web-playground.sh
 ```
 
 Historical milestone gates, profiles, result vectors, baselines, and the former

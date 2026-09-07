@@ -1,7 +1,7 @@
 /*
  * Test-only fingerprint oracle for checksum-pinned Unicode normalization.
  *
- * This file is compiled only by scripts/check-unicode-normalize-fingerprint.sh.
+ * This file is compiled only by scripts/unicode/check-unicode-normalize-fingerprint.sh.
  * Product builds consume the generated Rust tables and never compile or link
  * QuickJS C code.
  */

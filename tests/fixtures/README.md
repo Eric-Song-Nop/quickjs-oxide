@@ -10,10 +10,10 @@ The move to separate directories preserves every input and output byte. Paths in
 registries and callers change; the fixture checksums remain the same.
 
 - `dev-support/quickjs-fixture-gates.tsv` records JS probe inputs, expected outputs,
-  checksums, and driver modes. Run `scripts/test-quickjs-fixtures.sh --validate`
+  checksums, and driver modes. Run `scripts/quickjs/test-quickjs-fixtures.sh --validate`
   to authenticate the registry, or `--all` to execute it with the pinned engine.
 - `dev-support/quickjs-c-oracles.tsv` records C probes and expected transcripts.
-  Run `scripts/test-quickjs-c-oracles.sh --validate` to authenticate them, or
+  Run `scripts/quickjs/test-quickjs-c-oracles.sh --validate` to authenticate them, or
   `--check` to build and compare them with the reference engine.
 - Dedicated host and dynamic-import probes retain their `scripts/test-*.sh`
   drivers. Unicode C probes support the existing Unicode generation tools.

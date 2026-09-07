@@ -12,8 +12,8 @@ verify the frozen output without rewriting it. Use the pinned corpus prepared by
 the conformance tooling, and inspect generator usage before regenerating files.
 New outputs from these producers use this directory too.
 
-`scripts/check-test262-artifact-inventory.mjs` checks that tracked artifacts have
-consumers. `scripts/test-test262.sh --spec dev-support/test262/current.conf --check`
+`scripts/checks/check-test262-artifact-inventory.mjs` checks that tracked artifacts have
+consumers. `scripts/test262/test-test262.sh --spec dev-support/test262/current.conf --check`
 authenticates the current conformance spec and receipts. A structural change can
 make a historical engine fingerprint stale without invalidating those receipts;
 only a new conformance run establishes results for the new source revision.

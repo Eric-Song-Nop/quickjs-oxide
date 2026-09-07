@@ -101,14 +101,14 @@ cargo test --locked --test cli
 cargo test --locked --test oracle module_global_shadow
 
 # Oracle tree registration and compiled default/host inventory.
-./scripts/check-oracle-registry.sh --compiled
-python3 scripts/test-oracle-registry.py
+./scripts/checks/check-oracle-registry.sh --compiled
+python3 scripts/checks/test-oracle-registry.py
 
 # Pinned differential suite (prepares its reference engine).
-./scripts/test-parity-slice.sh
+./scripts/checks/test-parity-slice.sh
 
 # Authenticate conformance inputs and existing receipts without a full run.
-./scripts/test-test262.sh --spec dev-support/test262/current.conf --check
+./scripts/test262/test-test262.sh --spec dev-support/test262/current.conf --check
 ```
 
 Formatting and Clippy use the CI toolchain recorded in `.github/workflows/ci.yml`.

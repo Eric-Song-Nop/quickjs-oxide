@@ -83,11 +83,11 @@ cannot replace workers during a long run. `TEST262_RUNNER` is retired; use
 Use the one parameterized entry point:
 
 ```sh
-./scripts/test-test262.sh --check
-./scripts/test-test262.sh --runner-provenance
-./scripts/test-test262.sh --focused
-TEST262_WORKERS=2 ./scripts/test-test262.sh --full
-node scripts/audit-negative-diagnostics.mjs --suite /path/to/test262 \
+./scripts/test262/test-test262.sh --check
+./scripts/test262/test-test262.sh --runner-provenance
+./scripts/test262/test-test262.sh --focused
+TEST262_WORKERS=2 ./scripts/test262/test-test262.sh --full
+node scripts/test262/audit-negative-diagnostics.mjs --suite /path/to/test262 \
   --qjs /path/to/pinned/qjs
 ```
 
@@ -95,7 +95,7 @@ For new Script-goal admissions, prepare a bytewise-sorted candidate TSV with
 the header `path\tvariant\trule`, then generate source-authenticated rows with:
 
 ```sh
-node scripts/audit-negative-diagnostics.mjs \
+node scripts/test262/audit-negative-diagnostics.mjs \
   --generate /path/to/candidates.tsv --output /path/to/contracts.tsv \
   --suite /path/to/test262 --qjs /path/to/pinned/qjs \
   --oxide target/debug/qjs

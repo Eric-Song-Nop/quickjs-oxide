@@ -212,6 +212,7 @@ fn assert_rejected(configure: impl FnOnce(&Fixture), expected: &str) {
 fn gate_script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
+        .join("checks")
         .join("check-rust-only.sh")
 }
 

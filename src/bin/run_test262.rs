@@ -246,7 +246,7 @@ fn validate_runner_provenance_binding(
     }
     let Some(compiled) = compiled else {
         return Err(format!(
-            "runner was built without {ENGINE_SEMANTICS_ENV}; use scripts/test-test262.sh"
+            "runner was built without {ENGINE_SEMANTICS_ENV}; use scripts/test262/test-test262.sh"
         ));
     };
     if !is_lowercase_sha256(compiled) {
@@ -1400,7 +1400,7 @@ mod cli_tests {
         assert!(validate_runner_provenance_binding(Some(current), current).is_ok());
         assert_eq!(
             validate_runner_provenance_binding(None, current).unwrap_err(),
-            "runner was built without QUICKJS_OXIDE_TEST262_ENGINE_SEMANTICS_SHA256; use scripts/test-test262.sh"
+            "runner was built without QUICKJS_OXIDE_TEST262_ENGINE_SEMANTICS_SHA256; use scripts/test262/test-test262.sh"
         );
         assert_eq!(
             validate_runner_provenance_binding(Some("invalid"), current).unwrap_err(),
