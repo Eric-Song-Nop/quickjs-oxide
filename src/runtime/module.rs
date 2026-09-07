@@ -4650,5 +4650,4 @@ impl Context {
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/runtime_module/tests.rs"]
 mod tests;

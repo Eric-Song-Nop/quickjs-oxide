@@ -1,0 +1,11 @@
+// Keep the function-declaration oracle implementations in isolated modules
+// while Cargo builds one integration target.
+
+use crate::quickjs_argv_completion_oracle;
+
+#[path = "function_declarations/oracle_block_functions.rs"]
+mod oracle_block_functions;
+#[path = "function_declarations/oracle_function_body_declarations.rs"]
+mod oracle_function_body_declarations;
+#[path = "function_declarations/oracle_function_body_lexicals.rs"]
+mod oracle_function_body_lexicals;

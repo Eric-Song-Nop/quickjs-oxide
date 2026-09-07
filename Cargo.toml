@@ -45,7 +45,7 @@ path = "tests/cli.rs"
 
 [[test]]
 name = "oracle"
-path = "tests/oracle.rs"
+path = "tests/oracle/main.rs"
 
 [[test]]
 name = "rust_only"

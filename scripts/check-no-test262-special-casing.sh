@@ -18,23 +18,17 @@ command -v rg >/dev/null 2>&1 || die "ripgrep is required"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/quickjs-oxide-anticheat.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 
-# A Rust `#[path]` can make a production module compile source outside the
-# roots scanned below. Permit exactly one such escape: the runtime module's
-# unit tests, guarded by `cfg(test)` and rooted under the repository test tree.
-# Keeping the declaration exact makes deleting the cfg guard or adding another
-# unscanned production input fail closed.
+# Production modules must remain under the scanned source tree. Internal
+# module tests use the normal cfg(test) child-module layout below src/.
 external_module_paths=$(rg --with-filename --no-heading --color never \
     --glob '*.rs' -- '^#\[path[[:space:]]*=[[:space:]]*"\.\./' src || true)
-[[ "$external_module_paths" == \
-    'src/runtime/module.rs:#[path = "../../tests/unit/runtime_module/tests.rs"]' ]] \
+[[ -z "$external_module_paths" ]] \
     || die 'production sources contain an unauthenticated external module path'
 rg --quiet --multiline --pcre2 -- \
-    '^#\[cfg\(test\)\]\n#\[path = "\.\./\.\./tests/unit/runtime_module/tests\.rs"\]\nmod tests;$' \
-    src/runtime/module.rs \
-    || die 'external runtime unit tests are not protected by the exact cfg(test) boundary'
-[[ -f tests/unit/runtime_module/tests.rs \
-    && ! -L tests/unit/runtime_module/tests.rs ]] \
-    || die 'external runtime unit-test module must be a regular repository file'
+    '^#\[cfg\(test\)\]\nmod tests;$' src/runtime/module.rs \
+    || die 'runtime module unit tests must be guarded by cfg(test)'
+[[ -f src/runtime/module/tests.rs && ! -L src/runtime/module/tests.rs ]] \
+    || die 'runtime module unit tests must be a regular source file'
 
 scan_roots=(src web/wasm/src Cargo.toml web/wasm/Cargo.toml)
 while IFS= read -r build_script; do

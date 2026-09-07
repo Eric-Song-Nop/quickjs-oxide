@@ -129,7 +129,7 @@ def require_gated(path: str, declarations: tuple[str, ...]) -> None:
 
 
 require_gated(
-    "tests/oracle.rs",
+    "tests/oracle/main.rs",
     (
         "mod test262_create_realm;",
         "mod test262_host_gc;",

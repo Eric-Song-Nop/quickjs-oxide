@@ -94,7 +94,7 @@ pub extern "C" fn rust_owned_js_runtime() -> u32 { 42 }
 "#,
     );
     fixture.write(
-        "tests/oracle.rs",
+        "tests/oracle/main.rs",
         r#"#[test]
 fn external_qjs_is_only_an_oracle() {
     let _ = std::process::Command::new("qjs").arg("--version");

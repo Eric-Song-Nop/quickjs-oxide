@@ -26,7 +26,7 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/quickjs-oxide-oracle-registry.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 
 check_harness() {
-    local entry=tests/oracle.rs
+    local entry=tests/oracle/main.rs
     local actual=$tmp/harness.actual
     local declared=$tmp/harness.declared
     local duplicates
@@ -41,8 +41,11 @@ check_harness() {
 
     [[ -f "$entry" && ! -L "$entry" ]] || die "missing shared oracle harness: $entry"
 
-    rg --files tests -g 'oracle_*.rs' | awk -F/ 'NF == 2' | sort >"$actual"
-    [[ -s "$actual" ]] || die 'no top-level oracle wrappers found under tests'
+    [[ -z $(rg --files tests -g 'oracle_*.rs' | awk -F/ 'NF == 2') ]] \
+        || die 'oracle wrappers must live under tests/oracle'
+
+    rg --files tests/oracle -g 'oracle_*.rs' | awk -F/ 'NF == 3' | sort >"$actual"
+    [[ -s "$actual" ]] || die 'no oracle wrappers found under tests/oracle'
     while IFS= read -r wrapper; do
         [[ -f "$wrapper" && ! -L "$wrapper" ]] \
             || die "oracle wrapper must be a regular file: $wrapper"
@@ -78,7 +81,7 @@ check_harness() {
             if ((getline declaration) <= 0 || declaration != "mod " module ";") {
                 fail("path " path " must be followed by mod " module ";")
             }
-            print "tests/" path
+            print "tests/oracle/" path
             previous=declaration
             next
         }
@@ -110,7 +113,7 @@ check_harness() {
         || die "oracle wrapper count drifted: expected 50, found $wrapper_count"
 
     if rg -l --fixed-strings 'cfg(feature = "test262-host")' \
-        tests/oracle_*.rs tests/oracle -g '*.rs' \
+        tests/oracle -g '*.rs' -g '!main.rs' \
         | sort >"$host_cfg_actual"; then
         sed -n '1,40p' "$host_cfg_actual" >&2
         die 'test262-host gating must live only on shared harness module declarations'
@@ -118,7 +121,6 @@ check_harness() {
 
     test_count=$(
         {
-            rg -o --no-filename '^[[:space:]]*#\[test\]' tests/oracle_*.rs
             rg -o --no-filename '^[[:space:]]*#\[test\]' tests/oracle -g '*.rs'
         } | wc -l | tr -d '[:space:]'
     )
@@ -134,9 +136,9 @@ check_harness() {
             || die "$host_wrapper test count drifted: expected $expected_count, found $local_count"
         host_test_count=$((host_test_count + local_count))
     done <<'EOF'
-tests/oracle_create_realm.rs	3
-tests/oracle_host_gc.rs	1
-tests/oracle_is_html_dda.rs	1
+tests/oracle/oracle_create_realm.rs	3
+tests/oracle/oracle_host_gc.rs	1
+tests/oracle/oracle_is_html_dda.rs	1
 EOF
     [[ "$host_test_count" == 5 ]] \
         || die "host oracle test count drifted: expected 5, found $host_test_count"
@@ -222,7 +224,7 @@ check_registry() {
             if ((getline declaration) <= 0 || declaration != "mod " stem ";") {
                 fail("path " path " must be followed by mod " stem ";")
             }
-            print "tests/" path
+            print "tests/oracle/" path
             next
         }
         $0 ~ malformed_pattern {
@@ -247,75 +249,75 @@ check_registry() {
 
 check_harness
 node "$script_dir/check-oracle-helper-duplication.mjs"
-check_registry array Array tests/oracle_array_methods.rs \
-    tests/oracle/array oracle/array oracle_array_
-check_registry string String tests/oracle_string_methods.rs \
-    tests/oracle/string oracle/string oracle_string_
-check_registry object Object tests/oracle_object_semantics.rs \
-    tests/oracle/object oracle/object oracle_object
-check_registry regexp RegExp tests/oracle_regexp.rs \
-    tests/oracle/regexp oracle/regexp oracle_regexp_
-check_registry promise Promise tests/oracle_promise.rs \
-    tests/oracle/promise oracle/promise oracle_promise_
-check_registry collections Collections tests/oracle_collections.rs \
-    tests/oracle/collections oracle/collections oracle_
-check_registry number_kernels "Number kernels" tests/oracle_number_kernels.rs \
-    tests/oracle/number_kernels oracle/number_kernels oracle_
-check_registry updates Updates tests/oracle_updates.rs \
-    tests/oracle/update oracle/update oracle_update_
+check_registry array Array tests/oracle/oracle_array_methods.rs \
+    tests/oracle/array array oracle_array_
+check_registry string String tests/oracle/oracle_string_methods.rs \
+    tests/oracle/string string oracle_string_
+check_registry object Object tests/oracle/oracle_object_semantics.rs \
+    tests/oracle/object object oracle_object
+check_registry regexp RegExp tests/oracle/oracle_regexp.rs \
+    tests/oracle/regexp regexp oracle_regexp_
+check_registry promise Promise tests/oracle/oracle_promise.rs \
+    tests/oracle/promise promise oracle_promise_
+check_registry collections Collections tests/oracle/oracle_collections.rs \
+    tests/oracle/collections collections oracle_
+check_registry number_kernels "Number kernels" tests/oracle/oracle_number_kernels.rs \
+    tests/oracle/number_kernels number_kernels oracle_
+check_registry updates Updates tests/oracle/oracle_updates.rs \
+    tests/oracle/update update oracle_update_
 check_registry function_declarations "Function declarations" \
-    tests/oracle_function_declarations.rs tests/oracle/function_declarations \
-    oracle/function_declarations oracle_
-check_registry errors Errors tests/oracle_error_semantics.rs \
-    tests/oracle/errors oracle/errors oracle_
-check_registry parameters Parameters tests/oracle_parameters.rs \
-    tests/oracle/parameters oracle/parameters oracle_
-check_registry exponentiation Exponentiation tests/oracle_exponentiation.rs \
-    tests/oracle/exponentiation oracle/exponentiation oracle_power_
-check_registry async_methods "Async methods" tests/oracle_async_methods.rs \
-    tests/oracle/async_methods oracle/async_methods oracle_async_
-check_registry control_flow "Control flow" tests/oracle_control_flow.rs \
-    tests/oracle/control_flow oracle/control_flow oracle_
-check_registry typed_array TypedArray tests/oracle_typed_array_methods.rs \
-    tests/oracle/typed_array oracle/typed_array oracle_typed_array_
+    tests/oracle/oracle_function_declarations.rs tests/oracle/function_declarations \
+    function_declarations oracle_
+check_registry errors Errors tests/oracle/oracle_error_semantics.rs \
+    tests/oracle/errors errors oracle_
+check_registry parameters Parameters tests/oracle/oracle_parameters.rs \
+    tests/oracle/parameters parameters oracle_
+check_registry exponentiation Exponentiation tests/oracle/oracle_exponentiation.rs \
+    tests/oracle/exponentiation exponentiation oracle_power_
+check_registry async_methods "Async methods" tests/oracle/oracle_async_methods.rs \
+    tests/oracle/async_methods async_methods oracle_async_
+check_registry control_flow "Control flow" tests/oracle/oracle_control_flow.rs \
+    tests/oracle/control_flow control_flow oracle_
+check_registry typed_array TypedArray tests/oracle/oracle_typed_array_methods.rs \
+    tests/oracle/typed_array typed_array oracle_typed_array_
 check_registry program_declarations "Program declarations" \
-    tests/oracle_program_declarations.rs tests/oracle/program_declarations \
-    oracle/program_declarations oracle_program_
-check_registry json JSON tests/oracle_json.rs \
-    tests/oracle/json oracle/json oracle_json_
-check_registry arguments Arguments tests/oracle_argument_semantics.rs \
-    tests/oracle/arguments oracle/arguments oracle_argument
-check_registry iterator Iterator tests/oracle_iterator_methods.rs \
-    tests/oracle/iterator oracle/iterator oracle_iterator_
-check_registry unicode_lexical "Unicode lexical" tests/oracle_unicode_lexical.rs \
-    tests/oracle/unicode_lexical oracle/unicode_lexical oracle_unicode_
-check_registry binary_data "Binary data" tests/oracle_binary_data.rs \
-    tests/oracle/binary_data oracle/binary_data oracle_
-check_registry member_access "Member access" tests/oracle_member_access.rs \
-    tests/oracle/member_access oracle/member_access oracle_member_
-check_registry templates "Template semantics" tests/oracle_template_semantics.rs \
-    tests/oracle/templates oracle/templates oracle_
-check_registry global "Global semantics" tests/oracle_global_semantics.rs \
-    tests/oracle/global oracle/global oracle_global_
-check_registry proxy_reflect "Proxy and Reflect" tests/oracle_proxy_reflect.rs \
-    tests/oracle/proxy_reflect oracle/proxy_reflect oracle_
+    tests/oracle/oracle_program_declarations.rs tests/oracle/program_declarations \
+    program_declarations oracle_program_
+check_registry json JSON tests/oracle/oracle_json.rs \
+    tests/oracle/json json oracle_json_
+check_registry arguments Arguments tests/oracle/oracle_argument_semantics.rs \
+    tests/oracle/arguments arguments oracle_argument
+check_registry iterator Iterator tests/oracle/oracle_iterator_methods.rs \
+    tests/oracle/iterator iterator oracle_iterator_
+check_registry unicode_lexical "Unicode lexical" tests/oracle/oracle_unicode_lexical.rs \
+    tests/oracle/unicode_lexical unicode_lexical oracle_unicode_
+check_registry binary_data "Binary data" tests/oracle/oracle_binary_data.rs \
+    tests/oracle/binary_data binary_data oracle_
+check_registry member_access "Member access" tests/oracle/oracle_member_access.rs \
+    tests/oracle/member_access member_access oracle_member_
+check_registry templates "Template semantics" tests/oracle/oracle_template_semantics.rs \
+    tests/oracle/templates templates oracle_
+check_registry global "Global semantics" tests/oracle/oracle_global_semantics.rs \
+    tests/oracle/global global oracle_global_
+check_registry proxy_reflect "Proxy and Reflect" tests/oracle/oracle_proxy_reflect.rs \
+    tests/oracle/proxy_reflect proxy_reflect oracle_
 check_registry class_initialization "Class initialization" \
-    tests/oracle_class_initialization.rs tests/oracle/class_initialization \
-    oracle/class_initialization oracle_class_
-check_registry operators "Expression operators" tests/oracle_operator_semantics.rs \
-    tests/oracle/operators oracle/operators oracle_
+    tests/oracle/oracle_class_initialization.rs tests/oracle/class_initialization \
+    class_initialization oracle_class_
+check_registry operators "Expression operators" tests/oracle/oracle_operator_semantics.rs \
+    tests/oracle/operators operators oracle_
 check_registry function_semantics "Function semantics" \
-    tests/oracle_function_semantics.rs tests/oracle/function_semantics \
-    oracle/function_semantics oracle_function
+    tests/oracle/oracle_function_semantics.rs tests/oracle/function_semantics \
+    function_semantics oracle_function
 check_registry primitive_intrinsics "Primitive intrinsics" \
-    tests/oracle_primitive_intrinsics.rs tests/oracle/primitive_intrinsics \
-    oracle/primitive_intrinsics oracle_
-check_registry number "Number semantics" tests/oracle_number_semantics.rs \
-    tests/oracle/number oracle/number oracle_number_
-check_registry eval "Eval semantics" tests/oracle_eval_semantics.rs \
-    tests/oracle/eval oracle/eval oracle_eval_
-check_registry async_functions "Async functions" tests/oracle_async_functions.rs \
-    tests/oracle/async_functions oracle/async_functions oracle_async_
+    tests/oracle/oracle_primitive_intrinsics.rs tests/oracle/primitive_intrinsics \
+    primitive_intrinsics oracle_
+check_registry number "Number semantics" tests/oracle/oracle_number_semantics.rs \
+    tests/oracle/number number oracle_number_
+check_registry eval "Eval semantics" tests/oracle/oracle_eval_semantics.rs \
+    tests/oracle/eval eval oracle_eval_
+check_registry async_functions "Async functions" tests/oracle/oracle_async_functions.rs \
+    tests/oracle/async_functions async_functions oracle_async_
 
 if $compiled; then
     check_compiled_harness

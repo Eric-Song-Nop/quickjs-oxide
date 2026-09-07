@@ -57,3 +57,10 @@ The parent heap, compiler, and runtime files still contain multiple
 responsibilities. Further extraction should follow ownership and execution
 boundaries, preserve feature gates, and keep helper visibility within the
 owning module. Splitting these modules into workspace crates is a separate step.
+
+## Tests
+
+Internal unit tests stay beside their owning modules under `src/`; integration
+tests exercise public interfaces under `tests/`. The oracle suite has one Cargo
+entry point, `tests/oracle/main.rs`, with topic modules below the same directory.
+See [the test layout guide](../tests/README.md) for placement and check commands.
