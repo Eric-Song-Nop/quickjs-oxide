@@ -1,0 +1,381 @@
+{
+  "before_commit": "16540677694d6358695160fd4351782388559f7f",
+  "after_commit": "553c73e60681bea89dbb2d109e8d24c80ae95a75",
+  "binaries": {
+    "before": "0a26c977fe2734a83ece0924bd3997d8cbe1e467fd0dafd60d1e7f086318539f",
+    "after": "c399d4297e68307b9b100d4e977518f941463544b98908386e5a3e3d565dc434"
+  },
+  "workloads": {
+    "richards_fixed": {
+      "path": "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards-fixed-investigation.js",
+      "sha256": "cf295e5d11938844ff3b8dbe354fae237f08e7f3f3e72a86bc4d6766fb3a27d5"
+    },
+    "richards": {
+      "path": "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards.js",
+      "sha256": "3a6a75ed44921a21ccb5d651c4fa40e1168cc398497f5783f70f520b5880f816"
+    }
+  },
+  "summary": {
+    "richards_fixed": {
+      "before": {
+        "median_ms": 2411.233531,
+        "samples_ms": [
+          2444.869129,
+          2409.347143,
+          2411.233531,
+          2419.840793,
+          2391.682766
+        ]
+      },
+      "after": {
+        "median_ms": 2167.420968,
+        "samples_ms": [
+          2160.125944,
+          2174.456532,
+          2167.420968,
+          2170.635247,
+          2145.845675
+        ]
+      },
+      "reduction_percent": 10.111528388496016
+    },
+    "richards": {
+      "before": {
+        "median_ms": 9627.839762,
+        "samples_ms": [
+          9631.701601,
+          9627.839762,
+          9631.894162,
+          9590.231886,
+          9615.636636
+        ],
+        "harness_scores": [
+          14.7,
+          14.7,
+          14.7,
+          14.7,
+          14.7
+        ],
+        "median_harness_score": 14.7
+      },
+      "after": {
+        "median_ms": 8726.416353,
+        "samples_ms": [
+          8762.501996,
+          8726.416353,
+          8674.375048,
+          8774.306922,
+          8690.053726
+        ],
+        "harness_scores": [
+          16.2,
+          16.2,
+          16.3,
+          16.1,
+          16.3
+        ],
+        "median_harness_score": 16.2
+      },
+      "reduction_percent": 9.362675649815188
+    }
+  },
+  "schema": "array-own-key-comparison-v1",
+  "date": "2026-09-09",
+  "machine": {
+    "host": "eric-83am / Herdr PocketLab",
+    "cpu": "AMD Ryzen 7 7840HS",
+    "kernel": "6.18.44-1-lts",
+    "rust_build": "1.94.1",
+    "rust_validation": "1.88.0"
+  },
+  "build_command": "CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none CARGO_TARGET_DIR=target/cpu-profile QUICKJS_OXIDE_BUILD_COMMIT=$(git rev-parse HEAD) cargo build --locked --release -p quickjs-oxide-cli --no-default-features --features profiling",
+  "method": {
+    "timer": "time.perf_counter_ns; whole-process wall time",
+    "repetitions": 5,
+    "ordering": "serial; before/after on even repetitions, after/before on odd repetitions",
+    "timeout_seconds": 90,
+    "diagnostics": "disabled; no diagnostic source probes; no forced frame pointers",
+    "workload_revision": "ahaoboy/js-engine-benchmark@2034d98fc8c5f8044e186267593f5d5ea5232caf",
+    "workload_bodies": "reused prior investigation scripts unchanged; fixed version calls runRichards ten times and retains internal checks"
+  },
+  "validation": {
+    "engine_lib_tests": 1885,
+    "failures": 0,
+    "fmt": "passed",
+    "strict_production_clippy": "passed",
+    "strict_all_targets_clippy": "failed: 3 unused imports in unchanged context/string-test source",
+    "full_test262": "not rerun for this change"
+  },
+  "samples": [
+    {
+      "case": "richards_fixed",
+      "repetition": 0,
+      "version": "before",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/before-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards-fixed-investigation.js"
+      ],
+      "wall_ns": 2444869129,
+      "exit_code": 0,
+      "stdout": "richards-fixed:10\n",
+      "stderr": ""
+    },
+    {
+      "case": "richards_fixed",
+      "repetition": 0,
+      "version": "after",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/after-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards-fixed-investigation.js"
+      ],
+      "wall_ns": 2160125944,
+      "exit_code": 0,
+      "stdout": "richards-fixed:10\n",
+      "stderr": ""
+    },
+    {
+      "case": "richards_fixed",
+      "repetition": 1,
+      "version": "after",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/after-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards-fixed-investigation.js"
+      ],
+      "wall_ns": 2174456532,
+      "exit_code": 0,
+      "stdout": "richards-fixed:10\n",
+      "stderr": ""
+    },
+    {
+      "case": "richards_fixed",
+      "repetition": 1,
+      "version": "before",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/before-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards-fixed-investigation.js"
+      ],
+      "wall_ns": 2409347143,
+      "exit_code": 0,
+      "stdout": "richards-fixed:10\n",
+      "stderr": ""
+    },
+    {
+      "case": "richards_fixed",
+      "repetition": 2,
+      "version": "before",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/before-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards-fixed-investigation.js"
+      ],
+      "wall_ns": 2411233531,
+      "exit_code": 0,
+      "stdout": "richards-fixed:10\n",
+      "stderr": ""
+    },
+    {
+      "case": "richards_fixed",
+      "repetition": 2,
+      "version": "after",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/after-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards-fixed-investigation.js"
+      ],
+      "wall_ns": 2167420968,
+      "exit_code": 0,
+      "stdout": "richards-fixed:10\n",
+      "stderr": ""
+    },
+    {
+      "case": "richards_fixed",
+      "repetition": 3,
+      "version": "after",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/after-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards-fixed-investigation.js"
+      ],
+      "wall_ns": 2170635247,
+      "exit_code": 0,
+      "stdout": "richards-fixed:10\n",
+      "stderr": ""
+    },
+    {
+      "case": "richards_fixed",
+      "repetition": 3,
+      "version": "before",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/before-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards-fixed-investigation.js"
+      ],
+      "wall_ns": 2419840793,
+      "exit_code": 0,
+      "stdout": "richards-fixed:10\n",
+      "stderr": ""
+    },
+    {
+      "case": "richards_fixed",
+      "repetition": 4,
+      "version": "before",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/before-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards-fixed-investigation.js"
+      ],
+      "wall_ns": 2391682766,
+      "exit_code": 0,
+      "stdout": "richards-fixed:10\n",
+      "stderr": ""
+    },
+    {
+      "case": "richards_fixed",
+      "repetition": 4,
+      "version": "after",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/after-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards-fixed-investigation.js"
+      ],
+      "wall_ns": 2145845675,
+      "exit_code": 0,
+      "stdout": "richards-fixed:10\n",
+      "stderr": ""
+    },
+    {
+      "case": "richards",
+      "repetition": 0,
+      "version": "before",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/before-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards.js"
+      ],
+      "wall_ns": 9631701601,
+      "exit_code": 0,
+      "stdout": "Richards: 14.7\n----\nScore: 14.7\n",
+      "stderr": "",
+      "harness_score": 14.7
+    },
+    {
+      "case": "richards",
+      "repetition": 0,
+      "version": "after",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/after-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards.js"
+      ],
+      "wall_ns": 8762501996,
+      "exit_code": 0,
+      "stdout": "Richards: 16.2\n----\nScore: 16.2\n",
+      "stderr": "",
+      "harness_score": 16.2
+    },
+    {
+      "case": "richards",
+      "repetition": 1,
+      "version": "after",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/after-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards.js"
+      ],
+      "wall_ns": 8726416353,
+      "exit_code": 0,
+      "stdout": "Richards: 16.2\n----\nScore: 16.2\n",
+      "stderr": "",
+      "harness_score": 16.2
+    },
+    {
+      "case": "richards",
+      "repetition": 1,
+      "version": "before",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/before-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards.js"
+      ],
+      "wall_ns": 9627839762,
+      "exit_code": 0,
+      "stdout": "Richards: 14.7\n----\nScore: 14.7\n",
+      "stderr": "",
+      "harness_score": 14.7
+    },
+    {
+      "case": "richards",
+      "repetition": 2,
+      "version": "before",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/before-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards.js"
+      ],
+      "wall_ns": 9631894162,
+      "exit_code": 0,
+      "stdout": "Richards: 14.7\n----\nScore: 14.7\n",
+      "stderr": "",
+      "harness_score": 14.7
+    },
+    {
+      "case": "richards",
+      "repetition": 2,
+      "version": "after",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/after-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards.js"
+      ],
+      "wall_ns": 8674375048,
+      "exit_code": 0,
+      "stdout": "Richards: 16.3\n----\nScore: 16.3\n",
+      "stderr": "",
+      "harness_score": 16.3
+    },
+    {
+      "case": "richards",
+      "repetition": 3,
+      "version": "after",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/after-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards.js"
+      ],
+      "wall_ns": 8774306922,
+      "exit_code": 0,
+      "stdout": "Richards: 16.1\n----\nScore: 16.1\n",
+      "stderr": "",
+      "harness_score": 16.1
+    },
+    {
+      "case": "richards",
+      "repetition": 3,
+      "version": "before",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/before-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards.js"
+      ],
+      "wall_ns": 9590231886,
+      "exit_code": 0,
+      "stdout": "Richards: 14.7\n----\nScore: 14.7\n",
+      "stderr": "",
+      "harness_score": 14.7
+    },
+    {
+      "case": "richards",
+      "repetition": 4,
+      "version": "before",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/before-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards.js"
+      ],
+      "wall_ns": 9615636636,
+      "exit_code": 0,
+      "stdout": "Richards: 14.7\n----\nScore: 14.7\n",
+      "stderr": "",
+      "harness_score": 14.7
+    },
+    {
+      "case": "richards",
+      "repetition": 4,
+      "version": "after",
+      "command": [
+        "/home/eric/Documents/Sources/PocketLab/quickjs-oxide/target/array-own-key-validation/after-qjs",
+        "/home/eric/Documents/Sources/PocketLab/js-engine-benchmark/dist/quickjs-oxide/richards.js"
+      ],
+      "wall_ns": 8690053726,
+      "exit_code": 0,
+      "stdout": "Richards: 16.3\n----\nScore: 16.3\n",
+      "stderr": "",
+      "harness_score": 16.3
+    }
+  ]
+}
