@@ -23,6 +23,7 @@
 </aside>
 <main id="main">
 <header>
+<div class="note"><strong>实施说明：</strong>本文保留 2026-09-09 初始设计与当时验证状态。已实现的开关、API、部分 arena 分配覆盖及外部 benchmark 运行方式，参见 <a href="../profiling.md">当前 profiling 文档</a>；下文“待实现”属于原始方案记录。</div>
 <div class="topline"><span class="eyebrow">PERFORMANCE OBSERVABILITY / DESIGN REPORT</span><button class="print" id="print-button" type="button">打印 / 保存 PDF</button></div>
 <h1>复现 QuickJS 的<br>性能观测方式</h1>
 <p class="lede">先确定如何测量、如何解释数据、如何关闭观测。具体的 Value 表示、分配器与 VM 实现，可以继续演进。</p>
