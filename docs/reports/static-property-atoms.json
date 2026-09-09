@@ -228,6 +228,17 @@
       "test_binaries": 13,
       "command": "cargo +1.88.0 test --locked --workspace --all-targets --features profiling"
     },
+    "binary_object_boundary": {
+      "status": "passed",
+      "isolation_canaries": 690,
+      "all_canaries_rejected": true,
+      "command": "QUICKJS_OXIDE_BOUNDARY_JOBS=12 ./scripts/checks/check-binary-object-boundary.sh",
+      "host": "eric-83am / PocketLab (Herdr)",
+      "revision": "a9ddf42ad32cb515335b5db9628897b17bbab0c8",
+      "log_sha256": "7abf1bc6d9854823ce4bd47d926a9def883f8c90af675ba9ac6d30e5d93d31aa",
+      "log_location": "target/static-atoms-validation/binary-object-boundary.log (local); target/static-atoms-boundary.log (remote)",
+      "archive_note": "Final boundary log retained separately; it postdates the raw measurement archive."
+    },
     "fmt": "passed",
     "strict_clippy": {
       "production_profiling": "passed",
