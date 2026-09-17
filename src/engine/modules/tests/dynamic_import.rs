@@ -2,6 +2,8 @@ use super::*;
 
 #[test]
 fn dynamic_import_load_and_finish_are_distinct_fifo_jobs_with_gc_roots() {
+    #[cfg(feature = "profiling")]
+    let profile = crate::engine::api::profiling::CostProfile::start();
     let runtime = Runtime::new();
     let mut context = runtime.new_context();
     let (loader, loads, _) = MapModuleLoader::new([(
@@ -44,10 +46,16 @@ fn dynamic_import_load_and_finish_are_distinct_fifo_jobs_with_gc_roots() {
         Completion::Return(Value::Int(42))
     );
     assert!(!runtime.is_job_pending());
+    #[cfg(feature = "profiling")]
+    {
+        let _snapshot = profile.snapshot();
+    }
 }
 
 #[test]
 fn dynamic_import_waits_for_a_pending_tla_evaluation_and_reuses_it() {
+    #[cfg(feature = "profiling")]
+    let profile = crate::engine::api::profiling::CostProfile::start();
     let runtime = Runtime::new();
     let mut context = runtime.new_context();
     context
@@ -140,6 +148,10 @@ fn dynamic_import_waits_for_a_pending_tla_evaluation_and_reuses_it() {
         "globalThis.__dynamicTlaLog.join(',') === 'start,end'",
     );
     assert!(!runtime.is_job_pending());
+    #[cfg(feature = "profiling")]
+    {
+        let _snapshot = profile.snapshot();
+    }
 }
 
 #[test]

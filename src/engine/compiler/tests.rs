@@ -5,6 +5,15 @@ use crate::engine::api::context::Context;
 use crate::engine::api::error::{Error, ErrorKind};
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
+use crate::engine::compiler::model::ir::function::FunctionIr;
+use crate::engine::compiler::model::ir::function::FunctionIrOptions;
+use crate::engine::compiler::model::ir::function::FunctionKind;
+use crate::engine::compiler::model::ir::function::FunctionSourceInfo;
+use crate::engine::compiler::model::ir::function::SuperCapabilities;
+use crate::engine::compiler::parser::context::InMode;
+use crate::engine::compiler::parser::context::ModuleDeclarationExport;
+use crate::engine::compiler::parser::context::Parser;
+use crate::engine::compiler::parser::diagnostics::lex_error;
 
 use crate::engine::code::bytecode::{
     ApplyKind, ArgumentsKind, DefineMethodKind, DynamicEnvironmentSource, EvalVariableSource,
@@ -30,26 +39,23 @@ use crate::engine::object::{
 };
 use crate::engine::value::JsString;
 use crate::engine::value::bigint::JsBigInt;
-use crate::engine::vm::Vm;
 use crate::source::text::SourceText;
 
 use super::{
     ACTIVE_FUNCTION_LOCAL_NAME, BindingKind, BindingStorage, EVAL_VARIABLE_OBJECT_LOCAL_NAME,
-    EvalCompileContext, FunctionIr, FunctionIrOptions, FunctionKind, FunctionSourceInfo,
-    HOME_OBJECT_LOCAL_NAME, InMode, MAX_BYTECODE_STACK, MAX_CALL_ARGUMENTS, MAX_LOCAL_VARIABLES,
-    ModuleCompileFailure, ModuleDeclarationExport, ModuleImportAttributeChecker,
-    NEW_TARGET_LOCAL_NAME, Parser, ScopeId, ScopeKind, SourceOffset, SuperCapabilities,
-    THIS_LOCAL_NAME, WITH_OBJECT_LOCAL_NAME, compile_script, compile_unlinked_eval_with_filename,
+    EvalCompileContext, HOME_OBJECT_LOCAL_NAME, MAX_BYTECODE_STACK, MAX_CALL_ARGUMENTS,
+    MAX_LOCAL_VARIABLES, ModuleCompileFailure, ModuleImportAttributeChecker, NEW_TARGET_LOCAL_NAME,
+    ScopeId, ScopeKind, SourceOffset, THIS_LOCAL_NAME, WITH_OBJECT_LOCAL_NAME, compile_script,
+    compile_unlinked_eval_with_filename,
     compile_unlinked_module_bytes_with_name_and_attribute_checker,
     compile_unlinked_module_with_filename, compile_unlinked_module_with_name_and_attribute_checker,
     compile_unlinked_script, compile_unlinked_script_source_with_filename,
-    compile_unlinked_script_with_filename, ensure_closure_variable, lex_error, lower_unlinked_tree,
+    compile_unlinked_script_with_filename, ensure_closure_variable, lower_unlinked_tree,
     resolve_identifiers, validate_scope_graph, validate_source_length,
 };
 
 fn evaluate(source: &str) -> Value {
-    let bytecode = compile_script(source).unwrap();
-    Vm::new().execute(&bytecode).unwrap()
+    Runtime::new().new_context().eval(source).unwrap()
 }
 
 fn evaluate_in_context(source: &str) -> Value {
@@ -65,8 +71,12 @@ fn evaluate_error(runtime: &Runtime, context: &mut Context, source: &str) -> (Js
     let Value::Object(error) = context.take_exception().unwrap().unwrap() else {
         panic!("source did not throw an Error object: {source}");
     };
-    let name = runtime.intern_property_key("name").unwrap();
-    let message = runtime.intern_property_key("message").unwrap();
+    let name = runtime
+        .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Name)
+        .unwrap();
+    let message = runtime
+        .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Message)
+        .unwrap();
     let Value::String(name) = context.get_property(&error, &name).unwrap() else {
         panic!("Error.name was not a string: {source}");
     };
@@ -82,7 +92,9 @@ fn evaluate_function_name(source: &str) -> (JsString, bool, bool, bool) {
     let Value::Object(function) = context.eval(source).unwrap() else {
         panic!("source did not evaluate to a function object");
     };
-    let name = runtime.intern_property_key("name").unwrap();
+    let name = runtime
+        .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Name)
+        .unwrap();
     let CompleteOrdinaryPropertyDescriptor::Data {
         value: Value::String(value),
         writable,

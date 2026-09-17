@@ -16,21 +16,72 @@ use crate::engine::heap::{
 
 use crate::engine::object::builtin_properties::NativeBuiltinProperty;
 
-use super::*;
+use super::MAX_ARRAY_BUFFER_LENGTH;
+#[cfg(test)]
+use crate::engine::api::context::Context;
+use crate::engine::{
+    api::{
+        error::{Error, ErrorKind, NativeErrorKind},
+        runtime::Runtime,
+        runtime_error::RuntimeError,
+    },
+    builtins::native::NativeFunctionId,
+    heap::{ContextId, ObjectId},
+    object::{
+        AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, DescriptorField, ObjectRef,
+        OrdinaryPropertyDescriptor, PropertyKey, WellKnownSymbol,
+    },
+    value::{JsString, Value, conversion::NativeConversion},
+    vm::{
+        Completion,
+        call::{NativeArguments, NativeInvocation},
+    },
+};
 
+mod collect;
+
+pub(crate) use collect::{
+    TypedCollectResume, TypedCollectStep, TypedIteratorMethodResume, TypedIteratorMethodStep,
+};
+
+mod create;
+
+pub(crate) use create::{TypedCreateResume, TypedCreateStep};
 mod copying;
+
+pub(crate) use copying::{TypedWithResume, TypedWithStep};
+pub(crate) mod element;
 mod find;
 mod iteration;
+
+pub(crate) use iteration::{TypedIterationResume, TypedIterationStep};
 mod mutation;
+
+pub(crate) use mutation::{TypedMutationKind, TypedMutationResume, TypedMutationStep};
 mod reduce;
+mod traversal;
+
+pub(crate) use traversal::{TypedTraversalKind, TypedTraversalResume, TypedTraversalStep};
 mod search;
+
+pub(crate) use search::{TypedSearchKind, TypedSearchResume, TypedSearchStep};
+mod set;
+
+pub(crate) use set::{TypedSetResume, TypedSetStep};
 mod slice;
+
+pub(crate) use slice::{TypedSliceKind, TypedSliceResume, TypedSliceStep};
 mod sort;
 mod species;
+
+pub(crate) use species::{TypedSpeciesResume, TypedSpeciesStep};
 mod stringification;
+
+pub(crate) use stringification::{TypedStringResume, TypedStringStep};
 #[cfg(test)]
 mod tests;
 mod uint8_codec;
+pub(crate) mod write;
 
 /// Classification of an ECMAScript CanonicalNumericIndexString.
 ///
@@ -378,7 +429,8 @@ impl Runtime {
             let id = self.0.state.borrow().heap.context(realm)?.array_prototype;
             ObjectRef::from_borrowed_handle(self.clone(), id)?
         };
-        let to_string_key = self.intern_property_key("toString")?;
+        let to_string_key =
+            self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::ToString)?;
         let to_string = match self.get_property_in_realm(realm, &array_prototype, &to_string_key)? {
             Completion::Return(value @ Value::Object(_)) => value,
             Completion::Return(_) | Completion::Throw(_) => {
@@ -403,7 +455,8 @@ impl Runtime {
             ));
         }
 
-        let values_key = self.intern_property_key("values")?;
+        let values_key =
+            self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Values)?;
         let values = match self.get_property_in_realm(realm, &base_prototype, &values_key)? {
             Completion::Return(value @ Value::Object(_)) => value,
             Completion::Return(_) | Completion::Throw(_) => {
@@ -499,17 +552,17 @@ impl Runtime {
             }
             TypedArrayNativeKind::From => self.call_typed_array_from(realm, invocation, arguments),
             TypedArrayNativeKind::Of => self.call_typed_array_of(realm, invocation, arguments),
-            TypedArrayNativeKind::Species => self.call_typed_array_species(invocation),
+            TypedArrayNativeKind::Species => self.call_typed_array_species(&invocation),
             TypedArrayNativeKind::Length
             | TypedArrayNativeKind::Buffer
             | TypedArrayNativeKind::ByteLength
             | TypedArrayNativeKind::ByteOffset
             | TypedArrayNativeKind::ToStringTag => {
-                self.call_typed_array_getter(realm, kind, invocation)
+                self.call_typed_array_getter(realm, kind, &invocation)
             }
             TypedArrayNativeKind::Set => self.call_typed_array_set(realm, invocation, arguments),
             TypedArrayNativeKind::Iterator(kind) => {
-                self.call_typed_array_iterator(realm, kind, invocation)
+                self.call_typed_array_iterator(realm, kind, &invocation)
             }
             TypedArrayNativeKind::CopyWithin => {
                 self.call_typed_array_copy_within(realm, invocation, arguments)
@@ -521,11 +574,11 @@ impl Runtime {
                 self.call_typed_array_reduce(realm, kind, invocation, arguments)
             }
             TypedArrayNativeKind::Fill => self.call_typed_array_fill(realm, invocation, arguments),
-            TypedArrayNativeKind::Reverse => self.call_typed_array_reverse(realm, invocation),
+            TypedArrayNativeKind::Reverse => self.call_typed_array_reverse(realm, &invocation),
             TypedArrayNativeKind::At => self.call_typed_array_at(realm, invocation, arguments),
             TypedArrayNativeKind::With => self.call_typed_array_with(realm, invocation, arguments),
             TypedArrayNativeKind::ToReversed => {
-                self.call_typed_array_to_reversed(realm, invocation)
+                self.call_typed_array_to_reversed(realm, &invocation)
             }
             TypedArrayNativeKind::Search(kind) => {
                 self.call_typed_array_search(realm, kind, invocation, arguments)
@@ -556,124 +609,11 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Construct { new_target } = invocation else {
-            return Err(RuntimeError::Invariant(
-                "TypedArray constructor did not receive a constructor invocation",
-            ));
-        };
-        let first = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "TypedArray constructor argv was not padded",
-            ))?;
-
-        let Value::Object(source) = first else {
-            // ToIndex precedes the observable newTarget.prototype lookup, but
-            // the backing-store size limit is checked only while allocating
-            // after that lookup, matching js_typed_array_constructor.
-            let length = match self.native_to_index(realm, &first)? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-            let prototype =
-                match self.typed_array_prototype_from_new_target(realm, new_target, element)? {
-                    NativeConversion::Value(value) => value,
-                    NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-                };
-            let target =
-                match self.new_typed_array_for_length(realm, &prototype, element, length)? {
-                    NativeConversion::Value(value) => value,
-                    NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-                };
-            return Ok(Completion::Return(Value::Object(target)));
-        };
-        if !source.belongs_to(self) {
-            return Err(RuntimeError::WrongRuntime("TypedArray constructor source"));
-        }
-
-        if self.snapshot_buffer_access_if_branded(&source)?.is_some() {
-            return self
-                .construct_typed_array_from_buffer(realm, element, new_target, &source, arguments);
-        }
-        if let Some(source_snapshot) = self.typed_array_snapshot_if_branded(&source)? {
-            return self.construct_typed_array_from_typed_array(
-                realm,
-                element,
-                new_target,
-                &source,
-                source_snapshot,
-            );
-        }
-        self.construct_typed_array_from_object(realm, element, new_target, &source)
-    }
-
-    fn construct_typed_array_from_buffer(
-        &self,
-        realm: ContextId,
-        element: TypedArrayElementKind,
-        new_target: Value,
-        buffer: &ObjectRef,
-        arguments: &NativeArguments,
-    ) -> Result<Completion, RuntimeError> {
-        // QuickJS gets the public instance prototype before coercing either
-        // byteOffset or length in the raw-ArrayBuffer overload.
-        let prototype =
-            match self.typed_array_prototype_from_new_target(realm, new_target, element)? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-        let byte_offset = if arguments.actual_arg_count > 1 {
-            match self.native_to_index(
-                realm,
-                arguments.readable.get(1).ok_or(RuntimeError::Invariant(
-                    "TypedArray byteOffset argv was not padded",
-                ))?,
-            )? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            }
-        } else {
-            0
-        };
-        // Pinned QuickJS rejects a misaligned offset before touching the
-        // explicit length argument.
-        if byte_offset % u64::from(element.byte_length()) != 0 {
-            return Ok(Completion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Range,
-                "invalid offset",
-            )?));
-        }
-        let explicit_length = arguments.actual_arg_count > 2
-            && !matches!(arguments.readable.get(2), Some(Value::Undefined));
-        let requested_length = if explicit_length {
-            let length = match self.native_to_index(
-                realm,
-                arguments.readable.get(2).ok_or(RuntimeError::Invariant(
-                    "TypedArray length argv was not padded",
-                ))?,
-            )? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-            Some(length)
-        } else {
-            None
-        };
-
-        match self.new_typed_array_constructor_view_from_coerced(
+        create::finish(
+            self,
             realm,
-            &prototype,
-            element,
-            buffer,
-            byte_offset,
-            requested_length,
-        )? {
-            NativeConversion::Value(target) => Ok(Completion::Return(Value::Object(target))),
-            NativeConversion::Throw(value) => Ok(Completion::Throw(value)),
-        }
+            create::TypedCreateStep::constructor(self, realm, element, &invocation, arguments)?,
+        )
     }
 
     /// Finish the constructor's ArrayBuffer-family overload after prototype,
@@ -764,125 +704,23 @@ impl Runtime {
         )?))
     }
 
-    fn construct_typed_array_from_typed_array(
+    pub(in crate::engine::builtins) fn call_typed_array_species(
         &self,
-        realm: ContextId,
-        element: TypedArrayElementKind,
-        new_target: Value,
-        source: &ObjectRef,
-        source_snapshot: TypedArraySnapshot,
-    ) -> Result<Completion, RuntimeError> {
-        // QuickJS snapshots the current count before GetPrototypeFromConstructor.
-        // An initially OOB tracking view therefore retains count zero even if
-        // a prototype getter grows it back into bounds.
-        let source_count = self
-            .typed_array_state_from_snapshot(source_snapshot)?
-            .length;
-        let prototype =
-            match self.typed_array_prototype_from_new_target(realm, new_target, element)? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-        match self.typed_array_copy_into_new(
-            realm,
-            &prototype,
-            element,
-            source,
-            source_snapshot,
-            u64::from(source_count),
-        )? {
-            NativeConversion::Value(target) => Ok(Completion::Return(Value::Object(target))),
-            NativeConversion::Throw(value) => Ok(Completion::Throw(value)),
-        }
-    }
-
-    fn construct_typed_array_from_object(
-        &self,
-        realm: ContextId,
-        element: TypedArrayElementKind,
-        new_target: Value,
-        source: &ObjectRef,
-    ) -> Result<Completion, RuntimeError> {
-        let prototype =
-            match self.typed_array_prototype_from_new_target(realm, new_target, element)? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-        let source_value = Value::Object(source.clone());
-        let iterator = match self.typed_array_iterator_method(realm, source_value.clone())? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        if let Some(iterator) = iterator {
-            let values =
-                match self.collect_typed_array_iterator(realm, source_value, &iterator, element)? {
-                    NativeConversion::Value(value) => value,
-                    NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-                };
-            let target = match self.new_typed_array_for_length(
-                realm,
-                &prototype,
-                element,
-                u64::try_from(values.len()).map_err(|_| {
-                    RuntimeError::Invariant("TypedArray iterable length overflowed u64")
-                })?,
-            )? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-            for (index, value) in values.iter().enumerate() {
-                match self.typed_array_set_index(realm, &target, index as u64, value)? {
-                    NativeConversion::Value(()) => {}
-                    NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-                }
-            }
-            return Ok(Completion::Return(Value::Object(target)));
-        }
-
-        let length_key = self.intern_property_key("length")?;
-        let length_value = match self.get_property_in_realm(realm, source, &length_key)? {
-            Completion::Return(value) => value,
-            Completion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        let length = match self.native_to_length(realm, &length_value)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        let target = match self.new_typed_array_for_length(realm, &prototype, element, length)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        for index in 0..length {
-            let key = self.property_key_for_index(index)?;
-            let value = match self.get_property_in_realm(realm, source, &key)? {
-                Completion::Return(value) => value,
-                Completion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-            match self.typed_array_set_index(realm, &target, index, &value)? {
-                NativeConversion::Value(()) => {}
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            }
-        }
-        Ok(Completion::Return(Value::Object(target)))
-    }
-
-    fn call_typed_array_species(
-        &self,
-        invocation: NativeInvocation,
+        invocation: &NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
         let NativeInvocation::Getter { this_value } = invocation else {
             return Err(RuntimeError::Invariant(
                 "TypedArray species did not receive a getter invocation",
             ));
         };
-        Ok(Completion::Return(this_value))
+        Ok(Completion::Return(this_value.clone()))
     }
 
-    fn call_typed_array_getter(
+    pub(in crate::engine::builtins) fn call_typed_array_getter(
         &self,
         realm: ContextId,
         kind: TypedArrayNativeKind,
-        invocation: NativeInvocation,
+        invocation: &NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
         let NativeInvocation::Getter { this_value } = invocation else {
             return Err(RuntimeError::Invariant(
@@ -893,18 +731,18 @@ impl Runtime {
             let Value::Object(object) = this_value else {
                 return Ok(Completion::Return(Value::Undefined));
             };
-            let Some(snapshot) = self.typed_array_snapshot_if_branded(&object)? else {
+            let Some(snapshot) = self.typed_array_snapshot_if_branded(object)? else {
                 return Ok(Completion::Return(Value::Undefined));
             };
             return Ok(Completion::Return(Value::String(JsString::from_static(
                 snapshot.element.name(),
             ))));
         }
-        let object = match self.require_typed_array(realm, this_value)? {
+        let object = match self.require_typed_array_borrowed(realm, this_value)? {
             NativeConversion::Value(value) => value,
             NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
         };
-        let state = self.typed_array_state(&object)?;
+        let state = self.typed_array_state(object)?;
         let result = match kind {
             TypedArrayNativeKind::Buffer => Value::Object(ObjectRef::from_borrowed_handle(
                 self.clone(),
@@ -926,32 +764,28 @@ impl Runtime {
         Ok(Completion::Return(result))
     }
 
-    fn call_typed_array_iterator(
+    pub(in crate::engine::builtins) fn call_typed_array_iterator(
         &self,
         realm: ContextId,
         kind: ArrayIteratorKind,
-        invocation: NativeInvocation,
+        invocation: &NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
         let NativeInvocation::Call { this_value } = invocation else {
             return Err(RuntimeError::Invariant(
                 "TypedArray iterator factory received a constructor invocation",
             ));
         };
-        let object = match self.require_typed_array(realm, this_value)? {
+        let object = match self.require_typed_array_borrowed(realm, this_value)? {
             NativeConversion::Value(value) => value,
             NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
         };
-        match self.typed_array_validated_length(realm, &object)? {
+        match self.typed_array_validated_length(realm, object)? {
             NativeConversion::Value(_) => {}
             NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
         }
-        self.call_array_prototype_iterator(
-            realm,
-            kind,
-            NativeInvocation::Call {
-                this_value: Value::Object(object),
-            },
-        )
+        Ok(Completion::Return(Value::Object(
+            self.new_array_iterator(realm, object, kind)?,
+        )))
     }
 
     fn call_typed_array_from(
@@ -960,144 +794,11 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { this_value } = invocation else {
-            return Err(RuntimeError::Invariant(
-                "TypedArray.from received a constructor invocation",
-            ));
-        };
-        let source = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "TypedArray.from argv was not padded",
-            ))?;
-        let mapping =
-            arguments.actual_arg_count > 1 && !matches!(arguments.readable[1], Value::Undefined);
-        let mapfn = if mapping {
-            let Value::Object(object) = arguments.readable[1].clone() else {
-                return Ok(Completion::Throw(self.new_native_error(
-                    realm,
-                    NativeErrorKind::Type,
-                    "not a function",
-                )?));
-            };
-            let Some(callable) = self.as_callable(&object)? else {
-                return Ok(Completion::Throw(self.new_native_error(
-                    realm,
-                    NativeErrorKind::Type,
-                    "not a function",
-                )?));
-            };
-            Some(callable)
-        } else {
-            None
-        };
-        let map_this = if arguments.actual_arg_count > 2 {
-            arguments.readable[2].clone()
-        } else {
-            Value::Undefined
-        };
-        let nullish_iterator_error = match &source {
-            Value::Undefined => Some("cannot read property 'Symbol.iterator' of undefined"),
-            Value::Null => Some("cannot read property 'Symbol.iterator' of null"),
-            _ => None,
-        };
-        if let Some(message) = nullish_iterator_error {
-            return Ok(Completion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Type,
-                message,
-            )?));
-        }
-        let iterator = match self.typed_array_iterator_method(realm, source.clone())? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        if let Some(iterator) = iterator {
-            // TypedArray.from and the object constructor both materialize the
-            // entire iterator before allocation and numeric conversion.
-            let values = match self.collect_typed_array_iterator(
-                realm,
-                source,
-                &iterator,
-                TypedArrayElementKind::Uint8,
-            )? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-            let target = match self.typed_array_create_from_static_constructor(
-                realm,
-                this_value,
-                values.len() as u64,
-            )? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-            // QuickJS retains every materialized value in its hidden Array
-            // until the whole mapping/write phase completes. Iterate clones
-            // so already-processed object values have the same lifetime.
-            for (index, mut value) in values.iter().cloned().enumerate() {
-                if let Some(mapfn) = &mapfn {
-                    value = match self.call_internal(
-                        realm,
-                        mapfn,
-                        map_this.clone(),
-                        &[value, Value::number(index as f64)],
-                    )? {
-                        Completion::Return(value) => value,
-                        Completion::Throw(value) => return Ok(Completion::Throw(value)),
-                    };
-                }
-                match self.typed_array_set_index(realm, &target, index as u64, &value)? {
-                    NativeConversion::Value(()) => {}
-                    NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-                }
-            }
-            return Ok(Completion::Return(Value::Object(target)));
-        }
-
-        let source = match self.native_to_object(realm, source)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        let length_key = self.intern_property_key("length")?;
-        let length_value = match self.get_property_in_realm(realm, &source, &length_key)? {
-            Completion::Return(value) => value,
-            Completion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        let length = match self.native_to_length(realm, &length_value)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        let target =
-            match self.typed_array_create_from_static_constructor(realm, this_value, length)? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-        for index in 0..length {
-            let key = self.property_key_for_index(index)?;
-            let mut value = match self.get_property_in_realm(realm, &source, &key)? {
-                Completion::Return(value) => value,
-                Completion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-            if let Some(mapfn) = &mapfn {
-                value = match self.call_internal(
-                    realm,
-                    mapfn,
-                    map_this.clone(),
-                    &[value, Value::number(index as f64)],
-                )? {
-                    Completion::Return(value) => value,
-                    Completion::Throw(value) => return Ok(Completion::Throw(value)),
-                };
-            }
-            match self.typed_array_set_index(realm, &target, index, &value)? {
-                NativeConversion::Value(()) => {}
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            }
-        }
-        Ok(Completion::Return(Value::Object(target)))
+        create::finish(
+            self,
+            realm,
+            create::TypedCreateStep::from(self, realm, &invocation, arguments)?,
+        )
     }
 
     fn call_typed_array_of(
@@ -1106,28 +807,11 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { this_value } = invocation else {
-            return Err(RuntimeError::Invariant(
-                "TypedArray.of received a constructor invocation",
-            ));
-        };
-        let length = u64::try_from(arguments.actual_arg_count)
-            .map_err(|_| RuntimeError::Invariant("TypedArray.of argc overflowed u64"))?;
-        let target =
-            match self.typed_array_create_from_static_constructor(realm, this_value, length)? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-        for (index, value) in arguments.readable[..arguments.actual_arg_count]
-            .iter()
-            .enumerate()
-        {
-            match self.typed_array_set_index(realm, &target, index as u64, value)? {
-                NativeConversion::Value(()) => {}
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            }
-        }
-        Ok(Completion::Return(Value::Object(target)))
+        create::finish(
+            self,
+            realm,
+            create::TypedCreateStep::of(self, realm, &invocation, arguments)?,
+        )
     }
 
     fn call_typed_array_set(
@@ -1136,60 +820,11 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { this_value } = invocation else {
-            return Err(RuntimeError::Invariant(
-                "TypedArray.prototype.set received a constructor invocation",
-            ));
-        };
-        let target = match self.require_typed_array(realm, this_value)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        let offset = match self.native_to_int64_sat(
+        set::finish(
+            self,
             realm,
-            arguments.readable.get(1).ok_or(RuntimeError::Invariant(
-                "TypedArray.set offset argv was not padded",
-            ))?,
-        )? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        if offset < 0 {
-            return Ok(Completion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Range,
-                "invalid offset",
-            )?));
-        }
-        let offset = offset as u64;
-        // Offset coercion is followed by an explicit validation. Later
-        // array-like length/element getters use this cached count; detach or
-        // shrink during those getters makes individual writes disappear
-        // rather than retroactively throwing from `set`.
-        let target_length = match self.typed_array_validated_length(realm, &target)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        let source = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "TypedArray.set source argv was not padded",
-            ))?;
-        if let Value::Object(source_object) = &source
-            && let Some(source_snapshot) = self.typed_array_snapshot_if_branded(source_object)?
-        {
-            return self.set_typed_array_from_typed_array(
-                realm,
-                &target,
-                target_length,
-                offset,
-                source_object,
-                source_snapshot,
-            );
-        }
-        self.set_typed_array_from_array_like(realm, &target, target_length, offset, source)
+            set::TypedSetStep::start(self, realm, &invocation, arguments)?,
+        )
     }
 
     fn set_typed_array_from_typed_array(
@@ -1258,56 +893,22 @@ impl Runtime {
         Ok(Completion::Return(Value::Undefined))
     }
 
-    fn set_typed_array_from_array_like(
-        &self,
-        realm: ContextId,
-        target: &ObjectRef,
-        target_length: u32,
-        offset: u64,
-        source: Value,
-    ) -> Result<Completion, RuntimeError> {
-        let source = match self.native_to_object(realm, source)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        let length_key = self.intern_property_key("length")?;
-        let length_value = match self.get_property_in_realm(realm, &source, &length_key)? {
-            Completion::Return(value) => value,
-            Completion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        let length = match self.native_to_length(realm, &length_value)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-        };
-        if offset
-            .checked_add(length)
-            .is_none_or(|end| end > u64::from(target_length))
-        {
-            return Ok(Completion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Range,
-                "out of bound",
-            )?));
-        }
-        for index in 0..length {
-            let key = self.property_key_for_index(index)?;
-            let value = match self.get_property_in_realm(realm, &source, &key)? {
-                Completion::Return(value) => value,
-                Completion::Throw(value) => return Ok(Completion::Throw(value)),
-            };
-            match self.typed_array_set_index(realm, target, offset + index, &value)? {
-                NativeConversion::Value(()) => {}
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
-            }
-        }
-        Ok(Completion::Return(Value::Undefined))
-    }
-
     fn require_typed_array(
         &self,
         realm: ContextId,
         value: Value,
     ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
+        self.require_typed_array_borrowed(realm, &value)
+            .map(|result| match result {
+                NativeConversion::Value(object) => NativeConversion::Value(object.clone()),
+                NativeConversion::Throw(value) => NativeConversion::Throw(value),
+            })
+    }
+    fn require_typed_array_borrowed<'a>(
+        &self,
+        realm: ContextId,
+        value: &'a Value,
+    ) -> Result<NativeConversion<&'a ObjectRef>, RuntimeError> {
         let Value::Object(object) = value else {
             return Ok(NativeConversion::Throw(self.new_native_error(
                 realm,
@@ -1318,7 +919,7 @@ impl Runtime {
         if !object.belongs_to(self) {
             return Err(RuntimeError::WrongRuntime("TypedArray"));
         }
-        if self.typed_array_snapshot_if_branded(&object)?.is_none() {
+        if self.typed_array_snapshot_if_branded(object)?.is_none() {
             return Ok(NativeConversion::Throw(self.new_native_error(
                 realm,
                 NativeErrorKind::Type,
@@ -1326,17 +927,6 @@ impl Runtime {
             )?));
         }
         Ok(NativeConversion::Value(object))
-    }
-
-    fn typed_array_prototype_from_new_target(
-        &self,
-        realm: ContextId,
-        new_target: Value,
-        element: TypedArrayElementKind,
-    ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
-        self.prototype_from_constructor_value(realm, &new_target, |fallback_realm| {
-            self.typed_array_default_prototype(fallback_realm, element)
-        })
     }
 
     fn typed_array_default_prototype(
@@ -1439,36 +1029,11 @@ impl Runtime {
         realm: ContextId,
         source: Value,
     ) -> Result<NativeConversion<Option<CallableRef>>, RuntimeError> {
-        if matches!(source, Value::Null | Value::Undefined) {
-            return Ok(NativeConversion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Type,
-                "cannot get iterator",
-            )?));
-        }
-        let key = PropertyKey::from(self.well_known_symbol(WellKnownSymbol::Iterator));
-        let method = match self.get_value_property_in_realm(realm, source, &key)? {
-            Completion::Return(value) => value,
-            Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
-        };
-        if matches!(method, Value::Undefined | Value::Null) {
-            return Ok(NativeConversion::Value(None));
-        }
-        let Value::Object(method_object) = method else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Type,
-                "value is not iterable",
-            )?));
-        };
-        let Some(method) = self.as_callable(&method_object)? else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Type,
-                "value is not iterable",
-            )?));
-        };
-        Ok(NativeConversion::Value(Some(method)))
+        collect::finish_method(
+            self,
+            realm,
+            collect::TypedIteratorMethodStep::start(self, realm, source)?,
+        )
     }
 
     fn collect_typed_array_iterator(
@@ -1478,83 +1043,11 @@ impl Runtime {
         method: &CallableRef,
         element: TypedArrayElementKind,
     ) -> Result<NativeConversion<Vec<Value>>, RuntimeError> {
-        let iterator = match self.call_internal(realm, method, source, &[])? {
-            Completion::Return(Value::Object(value)) => value,
-            Completion::Return(_) => {
-                return Ok(NativeConversion::Throw(self.new_native_error(
-                    realm,
-                    NativeErrorKind::Type,
-                    "not an object",
-                )?));
-            }
-            Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
-        };
-        let next_key = self.intern_property_key("next")?;
-        let next = match self.get_property_in_realm(realm, &iterator, &next_key)? {
-            Completion::Return(Value::Object(next)) => {
-                let Some(next) = self.as_callable(&next)? else {
-                    return Ok(NativeConversion::Throw(self.new_native_error(
-                        realm,
-                        NativeErrorKind::Type,
-                        "not a function",
-                    )?));
-                };
-                next
-            }
-            Completion::Return(_) => {
-                return Ok(NativeConversion::Throw(self.new_native_error(
-                    realm,
-                    NativeErrorKind::Type,
-                    "not a function",
-                )?));
-            }
-            Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
-        };
-        let done_key = self.intern_property_key("done")?;
-        let value_key = self.intern_property_key("value")?;
-        let maximum = MAX_ARRAY_BUFFER_LENGTH / u64::from(element.byte_length());
-        let mut values = Vec::new();
-        // Pinned QuickJS collects through js_array_from_iterator, whose fail
-        // path releases local values without calling iterator.return. Keep
-        // that observable behavior for next/result/value/allocation failures.
-        loop {
-            let iteration =
-                match self.call_internal(realm, &next, Value::Object(iterator.clone()), &[])? {
-                    Completion::Return(Value::Object(value)) => value,
-                    Completion::Return(_) => {
-                        return Ok(NativeConversion::Throw(self.new_native_error(
-                            realm,
-                            NativeErrorKind::Type,
-                            "iterator must return an object",
-                        )?));
-                    }
-                    Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
-                };
-            let done = match self.get_property_in_realm(realm, &iteration, &done_key)? {
-                Completion::Return(value) => self.value_to_boolean(&value)?,
-                Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
-            };
-            if done {
-                return Ok(NativeConversion::Value(values));
-            }
-            if values.len() as u64 == maximum {
-                return Ok(NativeConversion::Throw(
-                    self.typed_array_invalid_length(realm)?,
-                ));
-            }
-            let value = match self.get_property_in_realm(realm, &iteration, &value_key)? {
-                Completion::Return(value) => value,
-                Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
-            };
-            if values.try_reserve(1).is_err() {
-                return Ok(NativeConversion::Throw(self.new_native_error(
-                    realm,
-                    NativeErrorKind::Internal,
-                    "out of memory",
-                )?));
-            }
-            values.push(value);
-        }
+        collect::finish_collect(
+            self,
+            realm,
+            collect::TypedCollectStep::start(realm, source, method.clone(), element),
+        )
     }
 
     pub(crate) fn typed_array_is_object(&self, object: &ObjectRef) -> Result<bool, RuntimeError> {
@@ -1580,15 +1073,9 @@ impl Runtime {
             return Err(RuntimeError::WrongRuntime("TypedArray"));
         }
         let state = self.0.state.borrow();
-        let ObjectPayload::TypedArray(data) = state.heap.object(object.object_id())?.payload else {
-            return Ok(None);
-        };
-        Ok(Some(TypedArraySnapshot {
-            buffer: data.view.buffer,
-            byte_offset: data.view.byte_offset,
-            fixed_byte_length: data.view.fixed_byte_length,
-            element: data.element,
-        }))
+        Ok(typed_array_snapshot_from_payload(
+            &state.heap.object(object.object_id())?.payload,
+        ))
     }
 
     pub(crate) fn typed_array_snapshot(
@@ -1796,15 +1283,20 @@ impl Runtime {
         index: u64,
     ) -> Result<Option<Value>, RuntimeError> {
         let snapshot = self.typed_array_snapshot(object)?;
-        let access = self.snapshot_buffer_access(snapshot.buffer)?;
-        let state = Self::typed_array_state_with_buffer(snapshot, access.state);
-        if state.out_of_bounds || index >= u64::from(state.length) {
-            return Ok(None);
+
+        match self.ordinary_typed_array_word(snapshot, index, None)? {
+            OrdinaryTypedWord::Missing => return Ok(None),
+            OrdinaryTypedWord::Word(bytes) => {
+                return Ok(Some(typed_array_decode(snapshot.element, bytes)));
+            }
+            OrdinaryTypedWord::Shared => {}
         }
-        let absolute = typed_array_absolute_byte_offset(state.snapshot, index)?;
-        let width = usize::from(state.snapshot.element.byte_length());
+        let access = self.snapshot_buffer_access(snapshot.buffer)?;
+        let Some((absolute, width)) = typed_array_word_range(snapshot, access.state, index)? else {
+            return Ok(None);
+        };
         let bytes = self.read_buffer_word(&access, absolute, width)?;
-        Ok(Some(typed_array_decode(state.snapshot.element, bytes)))
+        Ok(Some(typed_array_decode(snapshot.element, bytes)))
     }
 
     pub(crate) fn typed_array_get_index_descriptor(
@@ -1828,20 +1320,7 @@ impl Runtime {
         element: TypedArrayElementKind,
         value: &Value,
     ) -> Result<NativeConversion<[u8; 8]>, RuntimeError> {
-        if element.is_bigint() {
-            let bigint = match self.native_to_bigint(realm, value)? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(NativeConversion::Throw(value)),
-            };
-            return typed_array_encode_bigint(&bigint).map(NativeConversion::Value);
-        }
-        let number = match self.native_to_number(realm, value)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(NativeConversion::Throw(value)),
-        };
-        Ok(NativeConversion::Value(typed_array_encode_number(
-            element, number,
-        )))
+        element::ElementStep::start(self, realm, element, value.clone())?.finish_sync(self, realm)
     }
 
     /// Convert a primitive descriptor value for the public context-free
@@ -1909,15 +1388,100 @@ impl Runtime {
         bytes: &[u8; 8],
     ) -> Result<bool, RuntimeError> {
         let snapshot = self.typed_array_snapshot(object)?;
-        let access = self.snapshot_buffer_access(snapshot.buffer)?;
-        let state = Self::typed_array_state_with_buffer(snapshot, access.state);
-        if state.out_of_bounds || index >= u64::from(state.length) {
-            return Ok(false);
+
+        match self.ordinary_typed_array_word(snapshot, index, Some(bytes))? {
+            OrdinaryTypedWord::Missing => return Ok(false),
+            OrdinaryTypedWord::Word(_) => return Ok(true),
+            OrdinaryTypedWord::Shared => {}
         }
-        let absolute = typed_array_absolute_byte_offset(state.snapshot, index)?;
-        let width = usize::from(state.snapshot.element.byte_length());
+        let access = self.snapshot_buffer_access(snapshot.buffer)?;
+        let Some((absolute, width)) = typed_array_word_range(snapshot, access.state, index)? else {
+            return Ok(false);
+        };
         self.write_buffer_word(&access, absolute, &bytes[..width])?;
         Ok(true)
+    }
+
+    /// A rooted view owns its ordinary backing throughout this synchronous
+    /// leaf. No token/root is needed when validation and word access consume
+    /// the same state borrow. Conversion has already completed; this helper
+    /// never calls user code, allocates a JS value, or releases an owner.
+    /// Shared backing must leave the borrow before obtaining its access token.
+    fn ordinary_typed_array_word(
+        &self,
+        snapshot: TypedArraySnapshot,
+        index: u64,
+        write: Option<&[u8; 8]>,
+    ) -> Result<OrdinaryTypedWord, RuntimeError> {
+        let mut state = self.0.state.try_borrow_mut().map_err(|_| {
+            RuntimeError::Invariant(
+                "ArrayBuffer-family snapshot attempted during a runtime-state borrow",
+            )
+        })?;
+        ordinary_typed_array_word_in_heap(&mut state.heap, snapshot, index, write)
+    }
+
+    /// Scoped numeric read shared by the resident indexed-read selector. The
+    /// caller proves no-drain input release before taking this heap borrow.
+    /// Decode allocates no owner because BigInt kinds are declined first.
+    pub(crate) fn typed_array_number_read_in_heap(
+        heap: &mut crate::engine::heap::Heap,
+        object: ObjectId,
+        index: u32,
+    ) -> Option<Value> {
+        let data = heap.object(object).ok()?;
+        let snapshot = typed_array_snapshot_from_payload(&data.payload)?;
+        if snapshot.element.is_bigint() {
+            return None;
+        }
+        let OrdinaryTypedWord::Word(bytes) =
+            ordinary_typed_array_word_in_heap(heap, snapshot, u64::from(index), None).ok()?
+        else {
+            return None;
+        };
+        Some(typed_array_decode(snapshot.element, bytes))
+    }
+
+    /// Resident VM leaf: every decline precedes the only byte write. The
+    /// owning input may be dropped after success without running heap cleanup.
+    pub(crate) fn try_typed_array_number_write(
+        &self,
+        base: &Value,
+        index: u32,
+        number: f64,
+    ) -> bool {
+        use crate::engine::heap::SlotReleaseReadiness;
+        let Value::Object(object) = base else {
+            return false;
+        };
+        if !matches!(
+            self.slot_value_release_readiness(base),
+            Ok(SlotReleaseReadiness::Ready)
+        ) {
+            return false;
+        }
+        let Ok(mut state) = self.0.state.try_borrow_mut() else {
+            return false;
+        };
+        let Ok(data) = state.heap.object(object.object_id()) else {
+            return false;
+        };
+        let Some(snapshot) = typed_array_snapshot_from_payload(&data.payload) else {
+            return false;
+        };
+        if snapshot.element.is_bigint() {
+            return false;
+        }
+        let bytes = typed_array_encode_number(snapshot.element, number);
+        matches!(
+            ordinary_typed_array_word_in_heap(
+                &mut state.heap,
+                snapshot,
+                u64::from(index),
+                Some(&bytes)
+            ),
+            Ok(OrdinaryTypedWord::Word(_))
+        )
     }
 
     pub(crate) fn typed_array_set_index(
@@ -1927,13 +1491,14 @@ impl Runtime {
         index: u64,
         value: &Value,
     ) -> Result<NativeConversion<()>, RuntimeError> {
-        let element = self.typed_array_snapshot(object)?.element;
-        let bytes = match self.typed_array_convert_element(realm, element, value)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(NativeConversion::Throw(value)),
-        };
-        let _ = self.typed_array_write_converted_index(object, index, &bytes)?;
-        Ok(NativeConversion::Value(()))
+        Ok(
+            match write::TypedWriteStep::set(self, object.clone(), Some(index), value.clone())?
+                .finish_sync(self, realm)?
+            {
+                NativeConversion::Value(_) => NativeConversion::Value(()),
+                NativeConversion::Throw(value) => NativeConversion::Throw(value),
+            },
+        )
     }
 
     pub(crate) fn typed_array_define_index(
@@ -1943,29 +1508,8 @@ impl Runtime {
         index: u64,
         descriptor: &OrdinaryPropertyDescriptor,
     ) -> Result<NativeConversion<bool>, RuntimeError> {
-        if descriptor.get.is_present()
-            || descriptor.set.is_present()
-            || matches!(descriptor.writable, DescriptorField::Present(false))
-            || matches!(descriptor.enumerable, DescriptorField::Present(false))
-            || matches!(descriptor.configurable, DescriptorField::Present(false))
-        {
-            return Ok(NativeConversion::Value(false));
-        }
-        let state = self.typed_array_state(object)?;
-        if state.out_of_bounds || index >= u64::from(state.length) {
-            return Ok(NativeConversion::Value(false));
-        }
-        if let DescriptorField::Present(value) = &descriptor.value {
-            let bytes =
-                match self.typed_array_convert_element(realm, state.snapshot.element, value)? {
-                    NativeConversion::Value(value) => value,
-                    NativeConversion::Throw(value) => {
-                        return Ok(NativeConversion::Throw(value));
-                    }
-                };
-            let _ = self.typed_array_write_converted_index(object, index, &bytes)?;
-        }
-        Ok(NativeConversion::Value(true))
+        write::TypedWriteStep::define(self, object.clone(), index, descriptor)?
+            .finish_sync(self, realm)
     }
 
     pub(crate) fn typed_array_delete_index(
@@ -1975,6 +1519,71 @@ impl Runtime {
     ) -> Result<bool, RuntimeError> {
         Ok(self.typed_array_read_index(object, index)?.is_none())
     }
+}
+
+fn typed_array_snapshot_from_payload(payload: &ObjectPayload) -> Option<TypedArraySnapshot> {
+    let ObjectPayload::TypedArray(data) = payload else {
+        return None;
+    };
+    Some(TypedArraySnapshot {
+        buffer: data.view.buffer,
+        byte_offset: data.view.byte_offset,
+        fixed_byte_length: data.view.fixed_byte_length,
+        element: data.element,
+    })
+}
+
+fn ordinary_typed_array_word_in_heap(
+    heap: &mut crate::engine::heap::Heap,
+    snapshot: TypedArraySnapshot,
+    index: u64,
+    write: Option<&[u8; 8]>,
+) -> Result<OrdinaryTypedWord, RuntimeError> {
+    match heap.object(snapshot.buffer)?.kind {
+        crate::engine::heap::ObjectKind::SharedArrayBuffer => {
+            return Ok(OrdinaryTypedWord::Shared);
+        }
+        crate::engine::heap::ObjectKind::ArrayBuffer => {}
+        _ => {
+            return Err(RuntimeError::Invariant(
+                "ArrayBuffer-family access reached another object class",
+            ));
+        }
+    }
+    let buffer = heap.buffer_state(snapshot.buffer)?;
+    let Some((absolute, width)) = typed_array_word_range(snapshot, buffer, index)? else {
+        return Ok(OrdinaryTypedWord::Missing);
+    };
+    let bytes = if let Some(bytes) = write {
+        heap.write_array_buffer_word(snapshot.buffer, absolute, &bytes[..width])?;
+        [0; 8]
+    } else {
+        heap.read_array_buffer_word(snapshot.buffer, absolute, width)?
+    };
+    Ok(OrdinaryTypedWord::Word(bytes))
+}
+
+enum OrdinaryTypedWord {
+    Shared,
+    Missing,
+    Word([u8; 8]),
+}
+
+// One range calculation for rooted-token and scoped ordinary word access.
+// Bounds precede offset arithmetic, including detached and resized views.
+fn typed_array_word_range(
+    snapshot: TypedArraySnapshot,
+    buffer: crate::engine::heap::ArrayBufferState,
+    index: u64,
+) -> Result<Option<(usize, usize)>, RuntimeError> {
+    let state = Runtime::typed_array_state_with_buffer(snapshot, buffer);
+    if state.out_of_bounds || index >= u64::from(state.length) {
+        return Ok(None);
+    }
+    Ok(Some((
+        typed_array_absolute_byte_offset(snapshot, index)?,
+        usize::from(snapshot.element.byte_length()),
+    )))
 }
 
 fn typed_array_absolute_byte_offset(
@@ -2103,3 +1712,7 @@ fn typed_array_to_uint8_clamp(number: f64) -> u8 {
         floor as u8
     }
 }
+
+pub(crate) use sort::{TypedSortResume, TypedSortStep};
+
+pub(crate) use uint8_codec::{Uint8CodecResume, Uint8CodecStep};

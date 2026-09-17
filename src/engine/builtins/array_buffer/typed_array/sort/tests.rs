@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::api::Context;
 
 fn eval_string(context: &mut Context, source: &str) -> String {
     let Value::String(value) = context.eval(source).unwrap() else {
@@ -746,7 +747,9 @@ fn sort_errors_and_to_sorted_results_use_the_method_defining_realm() {
         Some(caller_uint8),
         "toSorted unexpectedly used the caller realm",
     );
-    let buffer_key = runtime.intern_property_key("buffer").unwrap();
+    let buffer_key = runtime
+        .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Buffer)
+        .unwrap();
     let Value::Object(result_buffer) = caller.get_property(&result, &buffer_key).unwrap() else {
         panic!("cross-realm toSorted result buffer was not an Object");
     };

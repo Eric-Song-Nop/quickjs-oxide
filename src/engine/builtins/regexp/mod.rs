@@ -8,23 +8,62 @@
 //! syntax remains a separate parity slice.
 
 mod compile;
+
+pub(crate) use compile::{RegExpCompileResume, RegExpCompileStep};
 mod constructor;
+
+pub(crate) use constructor::{RegExpConstructorResume, RegExpConstructorStep};
 mod escape;
 mod exec;
+
+pub(crate) use exec::{RegExpExecResume, RegExpExecStep};
+mod iterator_next;
+
+pub(crate) use iterator_next::{RegExpIteratorResume, RegExpIteratorStep};
 mod match_all;
+mod match_all_protocol;
+
+pub(crate) use match_all_protocol::{RegExpMatchAllResume, RegExpMatchAllStep};
 mod match_protocol;
+
+pub(crate) use match_protocol::{RegExpMatchResume, RegExpMatchStep};
 mod prototype;
+
+pub(crate) use prototype::{RegExpPresentationResume, RegExpPresentationStep};
 mod replace;
+
+pub(crate) use replace::{RegExpReplaceResume, RegExpReplaceStep};
 mod result;
 mod search;
+
+pub(crate) use search::{RegExpSearchResume, RegExpSearchStep};
+mod species;
+
+pub(crate) use species::{RegExpSpeciesResume, RegExpSpeciesStep};
 mod split;
+
+pub(crate) use split::{RegExpSplitResume, RegExpSplitStep};
 #[cfg(test)]
 mod tests;
 
 use crate::engine::builtins::native::{RegExpFlagKind, RegExpNativeKind};
 use crate::engine::heap::RegExpRealmData;
 
-use super::*;
+use crate::engine::{
+    api::{runtime::Runtime, runtime_error::RuntimeError},
+    builtins::native::NativeFunctionId,
+    heap::ContextId,
+    object::{
+        AccessorValue, DescriptorField, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey,
+        WellKnownSymbol,
+        shape::{PropertyFlags, ShapeEntry},
+    },
+    value::{JsString, Value},
+    vm::{
+        Completion,
+        call::{NativeArguments, NativeInvocation},
+    },
+};
 
 impl Runtime {
     /// Install the linked subset of pinned `js_regexp_funcs` and
@@ -232,7 +271,8 @@ impl Runtime {
         // QuickJS retains a realm-local canonical shape for literal-created
         // RegExp objects.  Constructors with a custom derived prototype use a
         // shape with the same property layout but that explicit prototype.
-        let last_index = self.intern_property_key("lastIndex")?;
+        let last_index =
+            self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::LastIndex)?;
         let entries = [ShapeEntry {
             atom: last_index.atom(),
             flags: PropertyFlags::data(true, false, false),
@@ -242,6 +282,44 @@ impl Runtime {
             .state
             .borrow_mut()
             .get_or_create_shape(Some(regexp_prototype.object_id()), &entries)?;
+        let mut result_shapes = Vec::new();
+        for names in [
+            &["index", "input", "groups"][..],
+            &["index", "input", "groups", "indices"][..],
+            &["groups"][..],
+        ] {
+            let keys = std::iter::once("length")
+                .chain(names.iter().copied())
+                .map(|name| self.intern_property_key(name))
+                .collect::<Result<Vec<_>, _>>()?;
+            let entries = keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| ShapeEntry {
+                    atom: key.atom(),
+                    flags: if index == 0 {
+                        PropertyFlags::data(true, false, false)
+                    } else {
+                        PropertyFlags::data(true, true, true)
+                    },
+                })
+                .collect::<Vec<_>>();
+            let mut state = self.0.state.borrow_mut();
+            let prototype = state.heap.context(realm)?.array_prototype;
+            match state.get_or_create_shape(Some(prototype), &entries) {
+                Ok(shape) => result_shapes.push(shape),
+                Err(error) => {
+                    for shape in result_shapes.into_iter().chain([object_shape]) {
+                        let cleanup = state.heap.release_shape(shape)?;
+                        state.apply_cleanup(cleanup)?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let result_shapes: [_; 3] = result_shapes
+            .try_into()
+            .expect("three RegExp result layouts");
         let mut state = self.0.state.borrow_mut();
         let attached = state.heap.attach_regexp_intrinsics(
             realm,
@@ -249,6 +327,7 @@ impl Runtime {
                 prototype: regexp_prototype.object_id(),
                 constructor: constructor.as_object().object_id(),
                 object_shape,
+                result_shapes: Some(result_shapes),
                 string_iterator_prototype: regexp_string_iterator_prototype.object_id(),
             },
             last_index.atom(),
@@ -256,8 +335,10 @@ impl Runtime {
         // `get_or_create_shape` returned one construction reference. The
         // Context owns the durable edge only when `attached` succeeded; on
         // failure this release reclaims the unpublished shape instead.
-        let cleanup = state.heap.release_shape(object_shape)?;
-        state.apply_cleanup(cleanup)?;
+        for shape in result_shapes.into_iter().chain([object_shape]) {
+            let cleanup = state.heap.release_shape(shape)?;
+            state.apply_cleanup(cleanup)?;
+        }
         attached?;
         Ok(())
     }
@@ -274,8 +355,8 @@ impl Runtime {
             RegExpNativeKind::Constructor => {
                 self.call_regexp_constructor(realm, invocation, arguments)
             }
-            RegExpNativeKind::Escape => self.call_regexp_escape(realm, invocation, arguments),
-            RegExpNativeKind::Species => self.call_regexp_species(invocation),
+            RegExpNativeKind::Escape => self.call_regexp_escape(realm, &invocation, arguments),
+            RegExpNativeKind::Species => self.call_regexp_species(&invocation),
             RegExpNativeKind::Source | RegExpNativeKind::Flags | RegExpNativeKind::Flag(_) => {
                 self.call_regexp_accessor(realm, kind, invocation)
             }

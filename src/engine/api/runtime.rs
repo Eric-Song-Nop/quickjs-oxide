@@ -7,7 +7,7 @@ use crate::engine::heap::Heap;
 use crate::engine::heap::runtime::{NEXT_RUNTIME_DOMAIN_ID, RuntimeInner, RuntimeState};
 use crate::engine::host::HostServices;
 use crate::engine::object::WellKnownSymbol;
-use crate::engine::vm::host_bridge as vm_host;
+
 #[cfg(test)]
 use quickjs_oxide_host::SystemHostServices;
 
@@ -44,8 +44,10 @@ impl Runtime {
         let host_services: Rc<dyn HostServices> = Rc::new(host_services);
         let domain_id = NEXT_RUNTIME_DOMAIN_ID.fetch_add(1, Ordering::Relaxed);
         assert_ne!(domain_id, 0, "runtime domain ID space exhausted");
-        let mut atoms = AtomTable::with_static_atoms(vm_host::TYPEOF_STATIC_ATOMS)
+        let mut atoms = AtomTable::with_static_atoms(crate::engine::vm::TYPEOF_STATIC_ATOMS)
             .expect("fixed typeof atom set fits the atom table");
+        let pinned_atoms = crate::engine::atom::pinned::PinnedAtoms::new(&mut atoms)
+            .expect("static property atoms fit");
         let mut well_known_symbols = HashMap::new();
         for symbol in WellKnownSymbol::ALL {
             let atom = atoms
@@ -53,9 +55,11 @@ impl Runtime {
                 .expect("fixed well-known symbol set fits the atom table");
             well_known_symbols.insert(symbol, atom);
         }
+        let active_frame_depth = Rc::new(Cell::new(0));
         Self(Rc::new(RuntimeInner {
             state: RefCell::new(RuntimeState {
                 atoms,
+                pinned_atoms,
                 heap: {
                     #[cfg(feature = "profiling")]
                     {
@@ -69,8 +73,15 @@ impl Runtime {
                 debug_info_mode: DebugInfoMode::Full,
                 shape_cache: HashMap::new(),
                 shape_fingerprints: HashMap::new(),
+                shape_transitions: HashMap::new(),
+                shape_transition_parents: HashMap::new(),
                 well_known_symbols,
-                active_frames: Vec::new(),
+                proxy_trap_reads: std::array::from_fn(|_| {
+                    crate::engine::object::property_ic::PropertyReadCache::default()
+                }),
+                active_frames: crate::engine::vm::frames::ActiveFrames::with_depth(
+                    active_frame_depth.clone(),
+                ),
                 active_collection_records: Vec::new(),
                 next_active_frame_token: 1,
                 next_module_async_evaluation_order: 0,
@@ -79,6 +90,7 @@ impl Runtime {
                 #[cfg(test)]
                 iterator_result_allocations: 0,
             }),
+            active_frame_depth,
             deferred_references: Default::default(),
             host_services,
             can_block: Cell::new(false),
@@ -89,6 +101,7 @@ impl Runtime {
             module_host_callback_depth: Cell::new(0),
             host_stack_top: Cell::new(None),
             proxy_method_depth: Cell::new(0),
+            recursion_limit: Cell::new(u16::MAX as usize),
             next_context_id: Cell::new(0),
             domain_id,
         }))
@@ -147,6 +160,24 @@ impl Runtime {
     pub fn domain_id(&self) -> u64 {
         self.0.domain_id
     }
+
+    /// Set the maximum number of installed JavaScript call frames for one
+    /// top-level execution. This is the JavaScript-frame ceiling only; the
+    /// native host-stack budget that protects Rust reentry is independent and
+    /// unaffected.
+    ///
+    /// The value is sampled when a top-level execution starts, so already
+    /// running executions keep the limit they began with. A limit of `0` is
+    /// raised to `1`.
+    pub fn set_recursion_limit(&self, limit: usize) {
+        self.0.recursion_limit.set(limit.max(1));
+    }
+
+    /// Return the configured JavaScript call-frame recursion limit.
+    #[must_use]
+    pub fn recursion_limit(&self) -> usize {
+        self.0.recursion_limit.get()
+    }
 }
 
 /// A single-threaded QuickJS-compatible runtime.
@@ -160,5 +191,42 @@ pub struct Runtime(pub(crate) Rc<RuntimeInner>);
 impl Default for Runtime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod recursion_limit_tests {
+    use super::*;
+    use crate::engine::value::{JsString, Value};
+
+    // Deep enough to exceed a small configured limit but not the default one.
+    const DEEP: &str = "(function(){try{(function f(n){return n<=0?0:1+f(n-1)})(5000);return 'ok'}catch(e){return e.message}})()";
+
+    #[test]
+    fn runtime_recursion_limit_is_configurable_and_default_is_unchanged() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        assert_eq!(runtime.recursion_limit(), u16::MAX as usize);
+        assert_eq!(
+            context.eval(DEEP).unwrap(),
+            Value::String(JsString::from_static("ok"))
+        );
+
+        runtime.set_recursion_limit(200);
+        assert_eq!(runtime.recursion_limit(), 200);
+        let Value::String(message) = context.eval(DEEP).unwrap() else {
+            panic!("expected a message string")
+        };
+        assert!(message.to_string().contains("stack overflow"), "{message}");
+
+        // A zero limit is clamped to one; a very low but usable limit still
+        // produces a catchable overflow from inside JavaScript.
+        runtime.set_recursion_limit(0);
+        assert_eq!(runtime.recursion_limit(), 1);
+        runtime.set_recursion_limit(10);
+        let Value::String(message) = context.eval(DEEP).unwrap() else {
+            panic!("expected a message string")
+        };
+        assert!(message.to_string().contains("stack overflow"), "{message}");
     }
 }

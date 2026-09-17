@@ -72,7 +72,8 @@ impl Runtime {
         // QuickJS explicitly materializes aliases instead of putting an
         // AutoInit alias in the shape. Preserve both identity and the aliased
         // function's original `name`.
-        let utc_string_key = self.intern_property_key("toUTCString")?;
+        let utc_string_key =
+            self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::ToUTCString)?;
         let utc_string = match self.get_property_in_realm(realm, date_prototype, &utc_string_key)? {
             Completion::Return(value @ Value::Object(_)) => value,
             Completion::Return(_) => {
@@ -226,7 +227,7 @@ impl Runtime {
             | DateNativeKind::Utc => {
                 self.call_date_constructor_native(realm, kind, invocation, arguments)
             }
-            _ => self.call_date_prototype_native(realm, kind, invocation, arguments),
+            _ => self.call_date_prototype_native(realm, kind, &invocation, arguments),
         }
     }
 
@@ -238,6 +239,10 @@ impl Runtime {
         self.0.host_services.timezone_offset_minutes(epoch_millis)
     }
 }
+
+pub(crate) use constructor::operation::{DateConstructorResume, DateConstructorStep};
+
+pub(crate) use prototype::operation::{DatePrototypeResume, DatePrototypeStep};
 
 #[cfg(test)]
 mod tests {

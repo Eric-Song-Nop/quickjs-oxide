@@ -7,6 +7,22 @@ pub(crate) struct SlotReplacementError {
 }
 
 impl Heap {
+    pub(crate) const fn property_layout_epoch(&self) -> u64 {
+        self.property_layout_epoch
+    }
+
+    pub(super) fn invalidate_property_layout(&mut self, id: ObjectId) {
+        if self.object(id).is_ok_and(|object| object.used_as_prototype) {
+            self.property_layout_epoch = self.property_layout_epoch.saturating_add(1);
+        }
+    }
+
+    /// A short storage transaction must decline when the ordinary path has
+    /// pending cleanup to observe at its next RuntimeOperation boundary.
+    pub(crate) fn has_pending_zero_cleanup(&self) -> bool {
+        !self.zero_queue.is_empty()
+    }
+
     /// Read one live object record.
     pub fn object(&self, id: ObjectId) -> Result<&ObjectData, HeapError> {
         match self.live_node(RawId::Object(id))?.data {
@@ -106,7 +122,10 @@ impl Heap {
         id: ShapeId,
     ) -> Result<&mut Shape, HeapError> {
         match self.live_node_mut(RawId::Shape(id))?.data {
-            NodeData::Shape(ref mut shape) => Ok(shape),
+            NodeData::Shape(ref mut shape) => {
+                shape.invalidate_layout();
+                Ok(shape)
+            }
             NodeData::Object(_)
             | NodeData::VarRef(_)
             | NodeData::Context(_)
@@ -319,6 +338,29 @@ impl Heap {
                 "Array dense state requested for an object with the wrong class",
             )),
         }
+    }
+
+    /// Publish a complete dense payload into a prevalidated empty Array.
+    pub(crate) fn fill_empty_array_dense(
+        &mut self,
+        id: ObjectId,
+        values: Vec<RawValue>,
+    ) -> Result<(), HeapError> {
+        let ObjectPayload::Array { dense: Some(dense) } = &self.object(id)?.payload else {
+            return Err(HeapError::Invariant("dense fill requires fast Array"));
+        };
+        if !dense.is_empty() {
+            return Err(HeapError::Invariant("dense fill requires empty payload"));
+        }
+        let edges = values.iter().flat_map(raw_value_edges).collect::<Vec<_>>();
+        self.retain_edges_transactionally(&edges)?;
+        let ObjectPayload::Array { dense: Some(dense) } = &mut self.object_mut(id)?.payload else {
+            unreachable!()
+        };
+        *dense = values;
+
+        self.invalidate_property_layout(id);
+        Ok(())
     }
 
     /// Append one consecutive C/W/E element to a fast Array. Object edges are
@@ -704,6 +746,70 @@ impl Heap {
                         operation: "appending an in-place shape property",
                     },
                 })?;
+        self.append_unique_object_property_at_index(
+            id,
+            shape_id,
+            atom,
+            flags,
+            replacement,
+            index,
+            slot_count,
+        )
+    }
+
+    /// Consume the storage owner's immediate missing-property selection.
+    /// Ordinary independent append callers retain the complete duplicate check.
+    pub(crate) fn append_selected_missing_object_property(
+        &mut self,
+        selected: crate::engine::object::SelectedMissingAppend,
+        flags: PropertyFlags,
+        replacement: PropertySlot,
+    ) -> Result<(), HeapError> {
+        let (id, shape_id, atom, selected_count) = selected.into_parts();
+        let object = self.object(id)?;
+        if object.shape != shape_id
+            || object.slots.len() != selected_count
+            || self.shape(shape_id)?.entries().len() != selected_count
+        {
+            return Err(HeapError::Invariant(
+                "selected missing append changed shape or slot count",
+            ));
+        }
+        if self.shape_strong_count(shape_id)? != 1 {
+            return Err(HeapError::Invariant(
+                "in-place property append reached a shared shape",
+            ));
+        }
+        if atom.is_null() {
+            return Err(HeapError::Invariant(
+                "in-place property append used a null atom",
+            ));
+        }
+        let index = u32::try_from(selected_count).map_err(|_| HeapError::Overflow {
+            operation: "appending an in-place shape property",
+        })?;
+        self.append_unique_object_property_at_index(
+            id,
+            shape_id,
+            atom,
+            flags,
+            replacement,
+            index,
+            selected_count,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_unique_object_property_at_index(
+        &mut self,
+        id: ObjectId,
+        shape_id: ShapeId,
+        atom: Atom,
+        flags: PropertyFlags,
+        replacement: PropertySlot,
+        index: u32,
+        slot_count: usize,
+    ) -> Result<(), HeapError> {
         if usize::try_from(index) != Ok(slot_count) {
             return Err(HeapError::Invariant(
                 "in-place property append found mismatched shape and slot lengths",
@@ -721,6 +827,8 @@ impl Heap {
         }
 
         self.retain_edges_transactionally(&property_slot_edges(&replacement))?;
+
+        self.invalidate_property_layout(id);
         let shape = match self.shape_mut(shape_id) {
             Ok(shape) => shape,
             Err(_) => unreachable!("authenticated unique shape disappeared before append"),
@@ -939,6 +1047,7 @@ impl Heap {
         let new_edges = object_layout_edges(shape, &slots);
         self.retain_edges_transactionally(&new_edges)?;
 
+        self.invalidate_property_layout(id);
         let (previous_shape, previous_slots) = {
             let object = self
                 .object_mut(id)
@@ -1005,6 +1114,7 @@ impl Heap {
             })?;
         self.retain_shape(shape)?;
 
+        self.invalidate_property_layout(id);
         let detached_shape = {
             let object = self
                 .object_mut(id)
@@ -1674,6 +1784,8 @@ impl Heap {
                     )
                     || function.is_constructor
                     || activation.arguments.len() < usize::from(bytecode.metadata.argument_count)
+                    || activation.actual_argument_count > activation.arguments.len()
+                    || activation.original_arguments.len() != activation.actual_argument_count
                     || activation.locals.len() != usize::from(bytecode.metadata.local_count)
                     || activation.reusable_captured_locals.len() != activation.locals.len()
                     || vm.stack.len() > usize::from(bytecode.metadata.max_stack)
@@ -1703,6 +1815,7 @@ impl Heap {
                 for value in vm
                     .stack
                     .iter()
+                    .chain(activation.original_arguments.iter())
                     .chain(std::iter::once(&vm.this_value))
                     .chain(vm.normalized_this.iter())
                     .chain(std::iter::once(&vm.new_target))
@@ -2040,5 +2153,16 @@ impl Heap {
             });
         }
         Ok(index)
+    }
+}
+
+impl ObjectData {
+    /// A dense prefix entry is an existing own data value. Missing entries
+    /// need the authoritative property lookup, including the prototype path.
+    pub(crate) fn dense_array_value(&self, index: u32) -> Option<&RawValue> {
+        match &self.payload {
+            ObjectPayload::Array { dense: Some(dense) } => dense.get(index as usize),
+            _ => None,
+        }
     }
 }

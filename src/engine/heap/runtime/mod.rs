@@ -30,6 +30,8 @@ pub(crate) static NEXT_RUNTIME_DOMAIN_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct RuntimeInner {
     pub(crate) state: RefCell<RuntimeState>,
+    /// Incremental activation count, readable without borrowing heap state.
+    pub(crate) active_frame_depth: Rc<Cell<usize>>,
     pub(crate) deferred_references: super::deferred::DeferredOperations,
     pub(crate) host_services: Rc<dyn HostServices>,
     /// Embedder policy sampled by synchronous Atomics waits. QuickJS leaves
@@ -52,6 +54,9 @@ pub(crate) struct RuntimeInner {
     /// host-stack budget; no pointer is dereferenced after the marker ends.
     pub(crate) host_stack_top: Cell<Option<usize>>,
     pub(crate) proxy_method_depth: Cell<usize>,
+    /// Maximum number of installed JavaScript call frames for one top-level
+    /// execution. Read at execution entry; the default matches `ExecutionLimits`.
+    pub(crate) recursion_limit: Cell<usize>,
     pub(crate) next_context_id: Cell<u64>,
     pub(crate) domain_id: u64,
 }
@@ -88,6 +93,7 @@ impl Drop for RuntimeOperation<'_> {
 
 pub(crate) struct RuntimeState {
     pub(crate) atoms: AtomTable,
+    pub(crate) pinned_atoms: crate::engine::atom::pinned::PinnedAtoms,
     pub(crate) heap: Heap,
     /// Runtime-owned pending JavaScript exception. Object and Symbol payloads
     /// carry one manually retained root; no public `Value::Exception` sentinel
@@ -103,11 +109,18 @@ pub(crate) struct RuntimeState {
     /// weak and are validated before reuse.
     pub(crate) shape_cache: HashMap<ShapeFingerprint, ShapeId>,
     pub(crate) shape_fingerprints: HashMap<ShapeId, ShapeFingerprint>,
+    pub(crate) shape_transitions: HashMap<ShapeId, HashMap<ShapeEntry, ShapeId>>,
+    pub(crate) shape_transition_parents: HashMap<ShapeId, Vec<(ShapeId, ShapeEntry)>>,
     pub(crate) well_known_symbols: HashMap<WellKnownSymbol, Atom>,
+    /// One guarded handler-trap location cache per Proxy internal method.
+    /// Indexed by the closed trap selector in `PinnedAtom::proxy_method`.
+    pub(crate) proxy_trap_reads: [crate::engine::object::property_ic::PropertyReadCache;
+        crate::engine::atom::pinned::PROXY_METHOD_COUNT],
     /// Unified QuickJS-style execution-frame chain. Records contain only raw
     /// stable identities and diagnostic state; the corresponding stack-local
-    /// [`ActiveFrameGuard`] owns the object and bytecode roots.
-    pub(crate) active_frames: Vec<ActiveFrameRecord>,
+    /// [`ActiveFrameGuard`] or its authenticated running frame owns the object
+    /// and bytecode roots; the registry never owns Runtime roots.
+    pub(crate) active_frames: crate::engine::vm::frames::ActiveFrames,
     /// Collection records retained across an active user callback. QuickJS
     /// keeps the current Map/Set record alive during `forEach` and direct Set
     /// method traversal, which makes a deletion transiently visible to
@@ -281,6 +294,64 @@ impl RuntimeState {
         Ok(shape)
     }
 
+    /// Append-only edges borrow both shapes; collection/mutation unlinks them.
+    pub(crate) fn append_transition(
+        &mut self,
+        parent: ShapeId,
+        entry: ShapeEntry,
+    ) -> Result<ShapeId, RuntimeError> {
+        if let Some(&target) = self
+            .shape_transitions
+            .get(&parent)
+            .and_then(|edges| edges.get(&entry))
+        {
+            if self.heap.shape(target).is_ok() {
+                self.heap.retain_shape(target)?;
+                return Ok(target);
+            }
+            // A weak target may have entered zero-queue before its cleanup was
+            // delivered to the runtime. Never revive a stale location blindly.
+            self.unlink_shape_transitions(target);
+        }
+        let source = self.heap.shape(parent)?;
+        let prototype = source.prototype();
+        let mut entries = source.entries().to_vec();
+        entries.push(entry);
+        let target = self.get_or_create_shape(prototype, &entries)?;
+        self.shape_transitions
+            .entry(parent)
+            .or_default()
+            .insert(entry, target);
+        self.shape_transition_parents
+            .entry(target)
+            .or_default()
+            .push((parent, entry));
+        Ok(target)
+    }
+
+    pub(crate) fn unlink_shape_transitions(&mut self, shape: ShapeId) {
+        if let Some(edges) = self.shape_transitions.remove(&shape) {
+            for (entry, target) in edges {
+                if let Some(parents) = self.shape_transition_parents.get_mut(&target) {
+                    parents.retain(|pair| *pair != (shape, entry));
+                    if parents.is_empty() {
+                        self.shape_transition_parents.remove(&target);
+                    }
+                }
+            }
+        }
+        if let Some(parents) = self.shape_transition_parents.remove(&shape) {
+            for (parent, entry) in parents {
+                if let Some(edges) = self.shape_transitions.get_mut(&parent) {
+                    edges.remove(&entry);
+                    if edges.is_empty() {
+                        self.shape_transitions.remove(&parent);
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn retain_shape_atoms(
         &mut self,
         entries: &[ShapeEntry],
@@ -327,14 +398,11 @@ impl RuntimeState {
         &mut self,
         values: impl IntoIterator<Item = &'a RawValue>,
     ) -> Result<Vec<Atom>, RuntimeError> {
-        let atoms = values
-            .into_iter()
-            .filter_map(|value| match value {
-                RawValue::Symbol(atom) | RawValue::Private(atom) => Some(*atom),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let mut retained = Vec::with_capacity(atoms.len());
+        let atoms = values.into_iter().filter_map(|value| match value {
+            RawValue::Symbol(atom) | RawValue::Private(atom) => Some(*atom),
+            _ => None,
+        });
+        let mut retained = Vec::new();
         for atom in atoms {
             if let Err(error) = self.atoms.retain(atom) {
                 self.release_atoms(retained)?;
@@ -359,7 +427,17 @@ impl RuntimeState {
         {
             return self.replace_dictionary_layout(object, prototype, entries, slots);
         }
-        let shape = self.get_or_create_shape(prototype, entries)?;
+        let previous = self.heap.object(object)?.shape;
+        let source = self.heap.shape(previous)?;
+        let appended = entries.len() == source.entries().len() + 1
+            && prototype == source.prototype()
+            && entries[..source.entries().len()] == *source.entries();
+        let shape = if appended {
+            self.append_transition(previous, *entries.last().expect("append entry"))?
+        } else {
+            self.unlink_shape_transitions(previous);
+            self.get_or_create_shape(prototype, entries)?
+        };
         self.replace_layout_with_owned_shape(object, shape, slots)
     }
 
@@ -446,6 +524,7 @@ impl RuntimeState {
 
     pub(crate) fn unlink_finalized_shapes(&mut self, shapes: impl IntoIterator<Item = ShapeId>) {
         for shape in shapes {
+            self.unlink_shape_transitions(shape);
             let Some(fingerprint) = self.shape_fingerprints.remove(&shape) else {
                 continue;
             };

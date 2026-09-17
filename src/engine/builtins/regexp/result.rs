@@ -3,7 +3,7 @@
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
 use crate::engine::atom::Atom;
-use crate::engine::heap::{ContextId, ObjectData, ObjectPayload, PropertySlot};
+use crate::engine::heap::{ContextId, ObjectData, PropertySlot};
 use crate::engine::object::shape::{PropertyFlags, ShapeEntry};
 use std::collections::HashMap;
 
@@ -42,6 +42,8 @@ impl Runtime {
         program: Rc<CompiledRegExp>,
         matched: RegExpMatch,
     ) -> Result<Value, RuntimeError> {
+        #[cfg(feature = "profiling")]
+        crate::engine::api::profiling::record_owned_execution_event("regexp_result.build");
         let capture_count = matched.captures().len();
         if usize::from(program.capture_count()) != capture_count {
             return Err(RuntimeError::Invariant(
@@ -111,16 +113,16 @@ impl Runtime {
         }
 
         let groups = if group_names.is_some() {
-            Value::Object(self.new_regexp_groups(&named, false)?)
+            Value::Object(self.new_regexp_groups(realm, &named, false)?)
         } else {
             Value::Undefined
         };
         let indices_groups = if has_indices && group_names.is_some() {
-            Value::Object(self.new_regexp_groups(&named, true)?)
+            Value::Object(self.new_regexp_groups(realm, &named, true)?)
         } else {
             Value::Undefined
         };
-        let result = self.new_array_from_values(realm, captures)?;
+
         let complete = matched.capture(0).ok_or(RuntimeError::Invariant(
             "successful RegExp result omitted capture zero",
         ))?;
@@ -135,27 +137,54 @@ impl Runtime {
             ("groups", groups),
         ];
         if let Some(values) = indices_values {
-            let indices = self.new_array_from_values(realm, values)?;
-            self.initialize_regexp_array_properties(&indices, &[("groups", indices_groups)])?;
+            let indices = self.new_regexp_result_array(realm, values, vec![indices_groups], 2)?;
             properties.push(("indices", Value::Object(indices)));
         }
-        self.initialize_regexp_array_properties(&result, &properties)?;
+        let result = self.new_regexp_result_array(
+            realm,
+            captures,
+            properties.into_iter().map(|(_, value)| value).collect(),
+            usize::from(has_indices),
+        )?;
         Ok(Value::Object(result))
     }
 
     fn new_regexp_groups(
         &self,
+        realm: ContextId,
         named: &NamedCaptures,
         indices: bool,
     ) -> Result<ObjectRef, RuntimeError> {
-        let entries = named
+        #[cfg(feature = "profiling")]
+        crate::engine::api::profiling::record_owned_execution_event("regexp_result.groups_layout");
+        let names = named
             .values
             .iter()
-            .map(|(key, _, _)| ShapeEntry {
-                atom: key.atom(),
-                flags: PropertyFlags::data(true, true, true),
-            })
+            .map(|(key, _, _)| key.atom())
             .collect::<Vec<_>>();
+        let shape = {
+            let mut state = self.0.state.borrow_mut();
+            if let Some(&shape) = state.heap.context(realm)?.regexp_group_shapes.get(&names) {
+                shape
+            } else {
+                let entries = names
+                    .iter()
+                    .map(|&atom| ShapeEntry {
+                        atom,
+                        flags: PropertyFlags::data(true, true, true),
+                    })
+                    .collect::<Vec<_>>();
+                let shape = state.get_or_create_shape(None, &entries)?;
+                let cached = state.heap.cache_regexp_group_shape(realm, names, shape);
+                let cleanup = state.heap.release_shape(shape)?;
+                state.apply_cleanup(cleanup)?;
+                if let Some(evicted) = cached? {
+                    let cleanup = state.heap.release_shape(evicted)?;
+                    state.apply_cleanup(cleanup)?;
+                }
+                shape
+            }
+        };
         let slots = named
             .values
             .iter()
@@ -164,56 +193,57 @@ impl Runtime {
                     .map(PropertySlot::Data)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let id = self.0.state.borrow_mut().allocate_object_with_layout(
-            None,
-            &entries,
-            slots,
-            ObjectData::ordinary,
-        )?;
+        let id = {
+            let mut state = self.0.state.borrow_mut();
+            let atoms = state.retain_slot_atoms(&slots)?;
+            match state
+                .heap
+                .allocate_object(ObjectData::ordinary(shape, slots))
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    state.release_atoms(atoms)?;
+                    return Err(error.into());
+                }
+            }
+        };
         Ok(ObjectRef::from_owned_handle(self.clone(), id))
     }
 
-    /// Only called for privately held result Arrays. All keys are new named
-    /// C/W/E properties, so no Array index/length rule or JS callback is skipped.
-    fn initialize_regexp_array_properties(
+    /// Publish the final named layout before adding any dense captures. No
+    /// intermediate Array layout or property replacement is constructed.
+    fn new_regexp_result_array(
         &self,
-        object: &ObjectRef,
-        properties: &[(&str, Value)],
-    ) -> Result<(), RuntimeError> {
-        let keys = properties
-            .iter()
-            .map(|(name, _)| self.intern_property_key(name))
-            .collect::<Result<Vec<_>, _>>()?;
-        let values = properties
-            .iter()
-            .map(|(_, value)| self.raw_property_value(value))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut state = self.0.state.borrow_mut();
-        let data = state.heap.object(object.object_id())?;
-        if !matches!(data.payload, ObjectPayload::Array { .. }) || !data.extensible {
-            return Err(RuntimeError::Invariant(
-                "RegExp result initialization requires a fresh Array",
-            ));
+        realm: ContextId,
+        captures: Vec<Value>,
+        properties: Vec<Value>,
+        layout: usize,
+    ) -> Result<ObjectRef, RuntimeError> {
+        let shape = self
+            .regexp_realm_data(realm)?
+            .result_shapes
+            .ok_or(RuntimeError::Invariant("RegExp result layouts missing"))?[layout];
+        let mut slots = Vec::with_capacity(properties.len() + 1);
+        slots.push(PropertySlot::Data(crate::engine::heap::RawValue::Int(0)));
+        for value in &properties {
+            slots.push(PropertySlot::Data(self.raw_property_value(value)?));
         }
-        let shape = state.heap.shape(data.shape)?;
-        let prototype = shape.prototype();
-        let mut entries = shape.entries().to_vec();
-        let mut slots = data.slots.clone();
-        for (key, value) in keys.iter().zip(values) {
-            if state.atoms.array_index(key.atom())?.is_some()
-                || entries.iter().any(|entry| entry.atom == key.atom())
-            {
-                return Err(RuntimeError::Invariant(
-                    "RegExp result initialization requires new named keys",
-                ));
+        let id = {
+            let mut state = self.0.state.borrow_mut();
+            let atoms = state.retain_slot_atoms(&slots)?;
+            match state.heap.allocate_object(ObjectData::array(shape, slots)) {
+                Ok(id) => id,
+                Err(error) => {
+                    state.release_atoms(atoms)?;
+                    return Err(error.into());
+                }
             }
-            entries.push(ShapeEntry {
-                atom: key.atom(),
-                flags: PropertyFlags::data(true, true, true),
-            });
-            slots.push(PropertySlot::Data(value));
+        };
+        let result = ObjectRef::from_owned_handle(self.clone(), id);
+        for value in captures {
+            self.append_fresh_array_value(&result, value)?;
         }
-        state.replace_layout(object.object_id(), prototype, &entries, slots)
+        Ok(result)
     }
 }
 
@@ -228,6 +258,30 @@ mod tests {
             context.eval(source).expect("RegExp result probe threw"),
             Value::Bool(true),
         );
+    }
+
+    #[test]
+    fn named_shape_cache_is_bounded_and_eviction_preserves_results() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        assert_eq!(
+            context
+                .eval(
+                    r#"
+            var saved;
+            for (var i = 0; i < 100; i++) {
+                var result = new RegExp("(?<g" + i + ">a)", "d").exec("a");
+                if (i === 0) saved = result;
+                if (result.groups["g" + i] !== "a") throw "group lost";
+            }
+            saved.groups.g0 === "a" && saved.indices.groups.g0 === saved.indices[1]
+        "#
+                )
+                .unwrap(),
+            Value::Bool(true)
+        );
+        // Every live realm cache is bounded independently of user-held results.
+        // The runtime GC oracle also verifies their shape ownership edges.
     }
 
     #[test]
@@ -280,6 +334,66 @@ Object.keys(right.groups).join(",") === "x"
     fn named_groups_force_standard_string_replace_through_get_substitution() {
         assert_eval_true(
             r#"/b/[Symbol.replace]("b", "<$<x>>") === "<$<x>>" && /(?<x>b)/[Symbol.replace]("b", "<$<x>>") === "<b>""#,
+        );
+    }
+    #[test]
+    fn global_match_private_output_ignores_prototype_setters_and_keeps_callback_order() {
+        assert_eval_true(
+            r#"
+(function () {
+    var calls = 0, trace = "", setterCalls = 0;
+    var re = {flags: "g", lastIndex: 0, exec: function () {
+        trace += "e";
+        if (calls++ === 2) return null;
+        return {get 0() { trace += "g"; return {toString: function () {
+            trace += "s"; return "a";
+        }}; }};
+    }};
+    Object.defineProperty(Array.prototype, "0", {
+        configurable: true, set: function () { setterCalls++; }
+    });
+    var result;
+    try { result = RegExp.prototype[Symbol.match].call(re, "aa"); }
+    finally { delete Array.prototype["0"]; }
+    var first = Object.getOwnPropertyDescriptor(result, "0");
+    return trace === "egsegse" && setterCalls === 0 && result.length === 2 &&
+        result[0] === "a" && result[1] === "a" && first.writable &&
+        first.enumerable && first.configurable &&
+        Object.getPrototypeOf(result) === Array.prototype;
+})()
+"#,
+        );
+    }
+
+    #[test]
+    fn split_private_output_preserves_capture_identity_and_limit_order() {
+        assert_eval_true(
+            r#"
+(function () {
+    var token = {}, trace = "", setterCalls = 0;
+    var splitter = {lastIndex: 0, exec: function () {
+        trace += "e";
+        if (this.lastIndex === 0) return null;
+        this.lastIndex = 2;
+        return {length: 3, get 1() { trace += "a"; return token; },
+            get 2() { trace += "b"; throw "must not read past limit"; }};
+    }};
+    var re = {flags: "", constructor: {[Symbol.species]: function () {
+        trace += "c"; return splitter;
+    }}};
+    Object.defineProperty(Array.prototype, "1", {
+        configurable: true, set: function () { setterCalls++; }
+    });
+    var result;
+    try { result = RegExp.prototype[Symbol.split].call(re, "abc", 2); }
+    finally { delete Array.prototype["1"]; }
+    var capture = Object.getOwnPropertyDescriptor(result, "1");
+    return trace === "ceea" && setterCalls === 0 && result.length === 2 &&
+        result[0] === "a" && result[1] === token && capture.writable &&
+        capture.enumerable && capture.configurable &&
+        Object.getPrototypeOf(result) === Array.prototype;
+})()
+"#,
         );
     }
 }

@@ -34,7 +34,7 @@ impl Runtime {
         realm: ContextId,
         global_object: &ObjectRef,
     ) -> Result<(), RuntimeError> {
-        let key = self.intern_property_key("JSON")?;
+        let key = self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Json)?;
         self.store_property_slot(
             global_object,
             &key,
@@ -109,3 +109,11 @@ impl Runtime {
         }
     }
 }
+
+pub(crate) use raw::RawResume as JsonRawResume;
+
+pub(crate) use reviver::{ParseResume as JsonParseResume, ParseStep as JsonParseStep};
+
+pub(crate) use stringify::{
+    StringifyResume as JsonStringifyResume, StringifyStep as JsonStringifyStep,
+};

@@ -374,6 +374,11 @@ impl WellKnownSymbol {
 pub struct SymbolRef(AtomOwner);
 
 impl SymbolRef {
+    /// Fallible retain for an owning VM slot, without deferred work or GC.
+    pub(crate) fn try_clone(&self) -> Result<Self, AtomError> {
+        self.0.try_clone().map(Self)
+    }
+
     /// Consume one already-owned, symbol-kind-validated atom reference.
     #[must_use]
     pub(crate) const fn from_owned_atom(runtime: Runtime, atom: Atom) -> Self {
@@ -746,12 +751,47 @@ pub(crate) mod function_initialization;
 pub(crate) mod access;
 
 pub(crate) mod storage;
+pub(crate) use storage::SelectedMissingAppend;
 
 pub(crate) mod operations;
 
 mod ordinary_storage;
 
+pub(crate) mod property_ic;
+
+pub(crate) use ordinary_storage::LinkedNativeSelection;
+
 mod ordinary;
+pub(crate) use ordinary::OrdinaryRead;
 
 #[cfg(test)]
 mod ordinary_tests;
+
+pub(crate) use internal_methods::{OwnedProxyGetStep as ProxyGetStep, ProxyGetResume};
+
+pub(crate) use internal_methods::{ProxyCallResume, ProxyCallStep};
+
+pub(crate) use internal_methods::{ProxyOwnResume, ProxyOwnStep};
+
+pub(crate) use internal_methods::PreparedHas;
+
+pub(crate) use internal_methods::{ProxyBooleanKind, ProxyBooleanResume, ProxyBooleanStep};
+
+pub(crate) use internal_methods::{
+    ProxyDefineResume, ProxyDefineStep, ProxySetResume, ProxySetStep,
+};
+
+pub(crate) use ordinary::{SetResume, SetStep, set_completion};
+
+mod array_length;
+
+pub(crate) use array_length::ArrayLengthResume;
+pub(crate) use array_length::ArrayLengthStep;
+
+pub(crate) use internal_methods::{ProxyPrototypeKind, ProxyPrototypeResume, ProxyPrototypeStep};
+
+pub(crate) use internal_methods::{KeysResume, KeysStep};
+
+pub(crate) use internal_methods::{ProxyConstructResume, ProxyConstructStep};
+
+mod dense_mutation;

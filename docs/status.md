@@ -5,6 +5,12 @@ with QuickJS 2026-06-04. It is runnable on the command line and as the real
 Rust/WASM engine in the GitHub Pages playground, but it is not yet at Feature
 Parity.
 
+The [architecture guide](architecture.md) describes the current implementation.
+The primitive execution core is the only engine: explicit JS frames, one driver
+and owned domain continuations replace the retired dispatch/bridge paths. The
+validation baseline below is unchanged; the final architecture and measured
+results are in the [primitive VM overview](primitive-vm.md).
+
 ## Current baseline
 
 <!-- current-test262-metrics:start -->
@@ -994,7 +1000,3 @@ cargo test --locked --features test262-host --lib --bins
 TEST262_WORKERS=2 ./scripts/test262/test-test262.sh --full
 ./scripts/web/test-web-playground.sh
 ```
-
-Historical milestone gates, profiles, result vectors, baselines, and the former
-long-form ledgers are preserved in the release archive indexed under
-[`dev-support/test262/archive`](../dev-support/test262/archive/index.tsv).

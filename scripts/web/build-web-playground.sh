@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+vm_configuration=stack-vm
+vm_features=()
+[[ $# -eq 0 ]] || { echo 'usage: build-web-playground.sh' >&2; exit 2; }
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 wasm_bindgen_version="0.2.126"
 wasm_target="wasm32-unknown-unknown"
@@ -54,7 +58,7 @@ QUICKJS_OXIDE_COMMIT="${build_commit}" \
   --locked \
   --profile web \
   --target "${wasm_target}" \
-  --package "${wasm_package}"
+  --package "${wasm_package}" "${vm_features[@]}"
 
 rm -rf "${pages_dir}"
 mkdir -p "${pages_dir}/pkg"
@@ -142,4 +146,7 @@ test -f "${pages_dir}/${examples_asset}"
 test -f "${pages_dir}/${style_asset}"
 test -f "${pages_dir}/${worker_asset}"
 
-echo "Built GitHub Pages artifact at ${pages_dir}"
+# Keep test provenance outside the published product metadata and assets.
+printf 'vm_configuration=%s\nwasm_sha256=%s\n' "${vm_configuration}" "${wasm_sha256}" \
+  > "${repo_root}/target/web-playground-build.receipt"
+echo "Built GitHub Pages artifact at ${pages_dir} (${vm_configuration})"

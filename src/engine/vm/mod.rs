@@ -1,22 +1,3 @@
-use crate::engine::api::error::{Error, ErrorKind, NativeErrorKind};
-
-use crate::engine::code::bytecode::{
-    ApplyKind, ArgumentsKind, DefineMethodKind, DynamicEnvironmentSource, EvalVariableSource,
-    Instruction, IteratorCallKind, PrivateNameSource,
-};
-#[cfg(test)]
-use crate::engine::code::bytecode::{DetachedBytecode, TestConstant};
-use crate::engine::code::function::metadata::FunctionMetadata;
-use crate::engine::heap::ContextId;
-use crate::engine::object::ObjectRef;
-
-use crate::engine::value::bigint::{BigIntError, JsBigInt};
-use crate::engine::value::{JsString, Value};
-use num_bigint::BigInt;
-use num_traits::FromPrimitive;
-#[cfg(test)]
-use std::collections::VecDeque;
-
 #[cfg(test)]
 mod numeric_coercion_tests;
 #[cfg(test)]
@@ -32,37 +13,93 @@ pub(crate) mod for_in;
 
 pub(crate) mod generator;
 
+pub(crate) mod suspend;
+
 pub(crate) mod native_stack;
 
-pub(crate) mod host_bridge;
+mod array_driver;
+pub(crate) mod bindings;
+mod environment_bindings;
+
+mod environment_driver;
+pub(crate) mod eval_bindings;
+
+mod eval_driver;
+mod property_keys;
+mod pure_operations;
+
+mod with_driver;
+
+mod construct_driver;
+
+mod conversion_driver;
+
+mod driver;
+
+pub(crate) mod entry;
+
+pub(crate) use driver::{RootOperation, execute_root};
+
+mod execution;
+
+pub(crate) use execution::HostBoundaryGuard;
+
+mod frame;
+
+mod run;
+
+mod stack;
+
+mod root_call;
 
 pub(crate) mod exception;
 
 pub(crate) mod frames;
 
 pub(crate) mod call;
+pub(crate) mod closure;
 
 mod protocol;
-pub use protocol::*;
+pub(crate) use protocol::{CallInput, DirectEvalInvocation, TYPEOF_STATIC_ATOMS};
 
 mod completion;
-pub(crate) use completion::*;
+pub(crate) use completion::{
+    BytecodePc, Completion, DefineClassOutcome, ToPrimitiveHint, VmResume, VmSuspendKind,
+};
 
 mod numeric;
-use numeric::*;
-
-#[cfg(test)]
-mod detached;
-#[cfg(test)]
-use detached::*;
 
 mod activation;
-pub use activation::*;
-
-mod dispatch;
-mod frame_execution;
-mod numeric_execution;
-mod unwind;
+pub use activation::VmUnwindRegion;
 
 #[cfg(test)]
 mod published_execution_tests;
+
+mod arguments_driver;
+
+mod closure_driver;
+
+mod private_bindings;
+
+mod private_access;
+
+mod iterator_driver;
+mod iterator_support;
+
+mod apply_driver;
+
+mod frame_exit;
+
+mod frame_operations;
+
+mod property_driver;
+
+mod proxy_get_driver;
+
+mod property_write_driver;
+
+mod super_property_driver;
+
+mod predicate_driver;
+
+mod method_arguments;

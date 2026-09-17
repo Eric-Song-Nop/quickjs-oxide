@@ -590,6 +590,7 @@ impl RegExpFixture {
             constructor: self.constructor,
             string_iterator_prototype: self.string_iterator_prototype,
             object_shape: self.object_shape,
+            result_shapes: None,
         }
     }
 
@@ -796,7 +797,11 @@ fn regexp_intrinsics_reject_mismatched_constructor_prototype_and_shape() {
         else {
             panic!("fixture constructor must be a native function");
         };
-        data.target = NativeFunctionId::Date(DateNativeKind::Constructor);
+        *data = NativeFunctionData::new(
+            NativeFunctionId::Date(DateNativeKind::Constructor),
+            data.realm,
+            data.min_readable_args,
+        );
     }
     assert!(
         fixture
@@ -813,7 +818,11 @@ fn regexp_intrinsics_reject_mismatched_constructor_prototype_and_shape() {
         else {
             panic!("fixture constructor must be a native function");
         };
-        data.target = NativeFunctionId::RegExp(RegExpNativeKind::Constructor);
+        *data = NativeFunctionData::new(
+            NativeFunctionId::RegExp(RegExpNativeKind::Constructor),
+            data.realm,
+            data.min_readable_args,
+        );
     }
 
     {

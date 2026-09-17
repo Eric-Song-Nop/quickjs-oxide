@@ -4,12 +4,16 @@
 //! because it must infer the closure name and choose a data or accessor
 //! descriptor without exposing either decision to JavaScript code.
 
+pub(crate) mod element;
+
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
 
 use crate::engine::atom::{AtomSpelling, PropertyKeyKind};
 use crate::engine::code::bytecode::DefineMethodKind;
+#[cfg(test)]
 use crate::engine::heap::ContextId;
+#[cfg(test)]
 use crate::engine::object::operations::PropertyDefineOutcome;
 
 use crate::engine::object::{
@@ -18,6 +22,7 @@ use crate::engine::object::{
 use crate::engine::value::{JsString, Value};
 
 impl Runtime {
+    #[cfg(test)]
     pub(crate) fn define_object_literal_method(
         &self,
         realm: ContextId,
@@ -27,6 +32,22 @@ impl Runtime {
         kind: DefineMethodKind,
         enumerable: bool,
     ) -> Result<PropertyDefineOutcome, RuntimeError> {
+        let descriptor =
+            self.prepare_object_literal_method(object, key, function, kind, enumerable)?;
+        self.define_own_property_in_realm(Some(realm), object, key, &descriptor)
+    }
+
+    /// Naming and HomeObject publication use context-free own storage and do
+    /// not invoke Proxy traps. The final exotic definition may still coerce a
+    /// data value (Array length or TypedArray index) and is a separate request.
+    pub(crate) fn prepare_object_literal_method(
+        &self,
+        object: &ObjectRef,
+        key: &PropertyKey,
+        function: Value,
+        kind: DefineMethodKind,
+        enumerable: bool,
+    ) -> Result<OrdinaryPropertyDescriptor, RuntimeError> {
         let callable = self.callable_from_value(function)?;
         let name = self.object_literal_method_name(key, kind)?;
         let function = Value::Object(callable.as_object().clone());
@@ -60,7 +81,7 @@ impl Runtime {
             },
         };
 
-        self.define_own_property_in_realm(Some(realm), object, key, &descriptor)
+        Ok(descriptor)
     }
 
     fn object_literal_method_name(

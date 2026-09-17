@@ -77,11 +77,22 @@ impl From<JsStringError> for Error {
 
 #[cfg(test)]
 thread_local! {
+    static FAIL_NEXT_CONCAT_RESERVATION: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_REPEAT_RESERVATION: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_PAD_RESERVATION: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_TRIM_RESERVATION: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_CREATE_HTML_RESERVATION: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_REPLACEMENT_RESERVATION: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub fn fail_next_concat_reservation_for_test() {
+    FAIL_NEXT_CONCAT_RESERVATION.with(|armed| {
+        assert!(
+            !armed.replace(true),
+            "concat reservation failure was already armed"
+        );
+    });
 }
 
 #[cfg(test)]
@@ -135,8 +146,8 @@ pub fn fail_next_replacement_reservation_for_test() {
 }
 
 enum StringRepr {
-    Latin1(Box<[u8]>),
-    Utf16(Box<[u16]>),
+    Latin1(Vec<u8>),
+    Utf16(Vec<u16>),
     Rope(RopeRepr),
 }
 
@@ -375,12 +386,8 @@ impl CreateHtmlStringBuffer {
             return Err(error);
         }
         Ok(match self.storage {
-            CreateHtmlStorage::Latin1(units) => {
-                JsString(Rc::new(StringRepr::Latin1(units.into_boxed_slice())))
-            }
-            CreateHtmlStorage::Utf16(units) => {
-                JsString(Rc::new(StringRepr::Utf16(units.into_boxed_slice())))
-            }
+            CreateHtmlStorage::Latin1(units) => JsString(Rc::new(StringRepr::Latin1(units))),
+            CreateHtmlStorage::Utf16(units) => JsString(Rc::new(StringRepr::Utf16(units))),
         })
     }
 }
@@ -438,7 +445,7 @@ impl ReplacementStringBuffer {
                 return Err(JsStringError::OutOfMemory);
             }
             units
-                .try_reserve_exact(additional)
+                .try_reserve(additional)
                 .map_err(|_| JsStringError::OutOfMemory)?;
         }
         Ok(())
@@ -513,35 +520,35 @@ impl ReplacementStringBuffer {
         if additional == 0 {
             return;
         }
-        let requires_wide = value
-            .utf16_units()
-            .skip(start)
-            .take(additional)
-            .any(|unit| unit > u16::from(u8::MAX));
-
+        let flat = value.linearize();
+        let narrow = flat.flat_latin1().map(|units| &units[start..end]);
+        let wide = flat.flat_utf16().map(|units| &units[start..end]);
+        let requires_wide = wide.is_some_and(|units| units.iter().any(|&unit| unit > 255));
         let result = match &mut self.storage {
             ReplacementStorage::Latin1(units) if !requires_wide => {
                 Self::reserve_additional(units, additional).map(|()| {
-                    units.extend(
-                        value
-                            .utf16_units()
-                            .skip(start)
-                            .take(additional)
-                            .map(|unit| unit as u8),
-                    );
+                    if let Some(source) = narrow {
+                        units.extend_from_slice(source);
+                    } else {
+                        units.extend(wide.unwrap().iter().map(|&unit| unit as u8));
+                    }
                 })
             }
             ReplacementStorage::Latin1(_) => {
-                let Some(mut wide) = self.widen(new_len) else {
+                let Some(mut units) = self.widen(new_len) else {
                     return;
                 };
-                wide.extend(value.utf16_units().skip(start).take(additional));
-                self.storage = ReplacementStorage::Utf16(wide);
+                units.extend_from_slice(wide.unwrap());
+                self.storage = ReplacementStorage::Utf16(units);
                 Ok(())
             }
             ReplacementStorage::Utf16(units) => {
                 Self::reserve_additional(units, additional).map(|()| {
-                    units.extend(value.utf16_units().skip(start).take(additional));
+                    if let Some(source) = wide {
+                        units.extend_from_slice(source);
+                    } else {
+                        units.extend(narrow.unwrap().iter().copied().map(u16::from));
+                    }
                 })
             }
         };
@@ -555,12 +562,8 @@ impl ReplacementStringBuffer {
             return Err(error);
         }
         Ok(match self.storage {
-            ReplacementStorage::Latin1(units) => {
-                JsString(Rc::new(StringRepr::Latin1(units.into_boxed_slice())))
-            }
-            ReplacementStorage::Utf16(units) => {
-                JsString(Rc::new(StringRepr::Utf16(units.into_boxed_slice())))
-            }
+            ReplacementStorage::Latin1(units) => JsString(Rc::new(StringRepr::Latin1(units))),
+            ReplacementStorage::Utf16(units) => JsString(Rc::new(StringRepr::Utf16(units))),
         })
     }
 }
@@ -717,6 +720,38 @@ impl Iterator for Utf16Units {
         }
     }
 
+    fn nth(&mut self, mut n: usize) -> Option<Self::Item> {
+        while n > 0 {
+            if let Some((flat, index)) = &mut self.current_flat {
+                let skip = n.min(flat.len() - *index);
+                *index += skip;
+                self.remaining -= skip;
+                n -= skip;
+                if n == 0 {
+                    break;
+                }
+                self.current_flat = None;
+            }
+            let node = self.pop()?;
+            if node.len() <= n {
+                n -= node.len();
+                self.remaining -= node.len();
+                continue;
+            }
+            match node.0.as_ref() {
+                StringRepr::Latin1(_) | StringRepr::Utf16(_) => self.current_flat = Some((node, 0)),
+                StringRepr::Rope(rope) => match &*rope.state.borrow() {
+                    RopeState::Tree { left, right } => {
+                        self.push(right.clone());
+                        self.push(left.clone());
+                    }
+                    RopeState::Linearized { flat } => self.push(flat.clone()),
+                },
+            }
+        }
+        self.next()
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.remaining, Some(self.remaining))
     }
@@ -789,6 +824,22 @@ impl NativeErrorMessage {
 }
 
 impl JsString {
+    pub(crate) fn flat_latin1(&self) -> Option<&[u8]> {
+        if let StringRepr::Latin1(units) = self.0.as_ref() {
+            Some(units)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn flat_utf16(&self) -> Option<&[u16]> {
+        if let StringRepr::Utf16(units) = self.0.as_ref() {
+            Some(units)
+        } else {
+            None
+        }
+    }
+
     /// QuickJS reserves 30 bits for a string's UTF-16 code-unit length.
     pub const MAX_LEN: usize = (1 << 30) - 1;
     const ROPE_SHORT_LEN: usize = 512;
@@ -809,6 +860,11 @@ impl JsString {
     #[must_use]
     pub fn same_representation(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// A single decrement cannot destroy the string or any rope descendants.
+    pub(crate) fn release_keeps_storage_alive(&self) -> bool {
+        Rc::strong_count(&self.0) > 1
     }
 
     #[must_use]
@@ -940,8 +996,8 @@ impl JsString {
             .map(u8::try_from)
             .collect::<Result<Vec<_>, _>>();
         match latin1 {
-            Ok(latin1) => Self(Rc::new(StringRepr::Latin1(latin1.into_boxed_slice()))),
-            Err(_) => Self(Rc::new(StringRepr::Utf16(units.into_boxed_slice()))),
+            Ok(latin1) => Self(Rc::new(StringRepr::Latin1(latin1))),
+            Err(_) => Self(Rc::new(StringRepr::Utf16(units))),
         }
     }
 
@@ -949,7 +1005,7 @@ impl JsString {
     /// second time. Callers must have enforced [`Self::MAX_LEN`].
     pub fn from_owned_latin1(units: Vec<u8>) -> Self {
         debug_assert!(units.len() <= Self::MAX_LEN);
-        Self(Rc::new(StringRepr::Latin1(units.into_boxed_slice())))
+        Self(Rc::new(StringRepr::Latin1(units)))
     }
 
     /// Materialize QuickJS's `JS_AtomToString` result for one tagged integer
@@ -968,16 +1024,14 @@ impl JsString {
                 break;
             }
         }
-        Self(Rc::new(StringRepr::Latin1(
-            digits[start..].to_vec().into_boxed_slice(),
-        )))
+        Self(Rc::new(StringRepr::Latin1(digits[start..].to_vec())))
     }
 
     /// Adopt a checked wide result buffer without collecting its contents a
     /// second time. Callers must have enforced [`Self::MAX_LEN`].
     pub fn from_owned_utf16(units: Vec<u16>) -> Self {
         debug_assert!(units.len() <= Self::MAX_LEN);
-        Self(Rc::new(StringRepr::Utf16(units.into_boxed_slice())))
+        Self(Rc::new(StringRepr::Utf16(units)))
     }
 
     /// Build the compact one-code-unit form used by String exotic indices and
@@ -985,8 +1039,8 @@ impl JsString {
     #[must_use]
     pub fn from_code_unit(unit: u16) -> Self {
         match u8::try_from(unit) {
-            Ok(unit) => Self(Rc::new(StringRepr::Latin1(Box::new([unit])))),
-            Err(_) => Self(Rc::new(StringRepr::Utf16(Box::new([unit])))),
+            Ok(unit) => Self(Rc::new(StringRepr::Latin1(vec![unit]))),
+            Err(_) => Self(Rc::new(StringRepr::Utf16(vec![unit]))),
         }
     }
 
@@ -1220,7 +1274,7 @@ impl JsString {
                 let mut units = Vec::with_capacity(len);
                 units.extend_from_slice(left);
                 units.extend_from_slice(right);
-                Self(Rc::new(StringRepr::Latin1(units.into_boxed_slice())))
+                Self(Rc::new(StringRepr::Latin1(units)))
             }
             (
                 StringRepr::Latin1(_) | StringRepr::Utf16(_),
@@ -1231,7 +1285,7 @@ impl JsString {
                     .chain(right.utf16_units())
                     .collect::<Vec<_>>();
                 debug_assert_eq!(units.len(), len);
-                Self(Rc::new(StringRepr::Utf16(units.into_boxed_slice())))
+                Self(Rc::new(StringRepr::Utf16(units)))
             }
             (StringRepr::Rope(_), _) | (_, StringRepr::Rope(_)) => {
                 unreachable!("flat String concatenation received a rope")
@@ -1352,7 +1406,7 @@ impl JsString {
         }
         let flattened = if rope.is_wide {
             Self(Rc::new(StringRepr::Utf16(
-                self.utf16_units().collect::<Vec<_>>().into_boxed_slice(),
+                self.utf16_units().collect::<Vec<_>>(),
             )))
         } else {
             let units = self
@@ -1361,7 +1415,7 @@ impl JsString {
                     u8::try_from(unit).expect("a narrow String rope contained a wide code unit")
                 })
                 .collect::<Vec<_>>();
-            Self(Rc::new(StringRepr::Latin1(units.into_boxed_slice())))
+            Self(Rc::new(StringRepr::Latin1(units)))
         };
         *rope.state.borrow_mut() = RopeState::Linearized {
             flat: flattened.clone(),
@@ -1386,22 +1440,16 @@ impl JsString {
             return source;
         }
         match source.0.as_ref() {
-            StringRepr::Latin1(units) => Self(Rc::new(StringRepr::Latin1(
-                units[start..end].to_vec().into_boxed_slice(),
-            ))),
+            StringRepr::Latin1(units) => {
+                Self(Rc::new(StringRepr::Latin1(units[start..end].to_vec())))
+            }
             StringRepr::Utf16(units) => {
                 let selected = &units[start..end];
                 if selected.iter().all(|unit| *unit <= u16::from(u8::MAX)) {
-                    let narrow = selected
-                        .iter()
-                        .map(|unit| *unit as u8)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice();
+                    let narrow = selected.iter().map(|unit| *unit as u8).collect::<Vec<_>>();
                     Self(Rc::new(StringRepr::Latin1(narrow)))
                 } else {
-                    Self(Rc::new(StringRepr::Utf16(
-                        selected.to_vec().into_boxed_slice(),
-                    )))
+                    Self(Rc::new(StringRepr::Utf16(selected.to_vec())))
                 }
             }
             StringRepr::Rope(_) => unreachable!("linearized String remained a rope"),
@@ -1433,7 +1481,7 @@ impl JsString {
         fn grow_repetition<T: Copy>(
             source: &[T],
             output_len: usize,
-        ) -> Result<Box<[T]>, JsStringError> {
+        ) -> Result<Vec<T>, JsStringError> {
             // `string_buffer_init2` performs one exact fallible allocation.
             // Reserve the complete buffer up front so later doubling copies
             // cannot allocate and allocator failure remains catchable.
@@ -1447,14 +1495,14 @@ impl JsString {
                 .map_err(|_| JsStringError::OutOfMemory)?;
             if source.len() == 1 {
                 output.resize(output_len, source[0]);
-                return Ok(output.into_boxed_slice());
+                return Ok(output);
             }
             output.extend_from_slice(source);
             while output.len() < output_len {
                 let copied = output.len().min(output_len - output.len());
                 output.extend_from_within(..copied);
             }
-            Ok(output.into_boxed_slice())
+            Ok(output)
         }
 
         Ok(match source.0.as_ref() {
@@ -1577,11 +1625,11 @@ impl JsString {
         Ok(match output {
             PadBuffer::Latin1(units) => {
                 debug_assert_eq!(units.len(), target_len);
-                Self(Rc::new(StringRepr::Latin1(units.into_boxed_slice())))
+                Self(Rc::new(StringRepr::Latin1(units)))
             }
             PadBuffer::Utf16(units) => {
                 debug_assert_eq!(units.len(), target_len);
-                Self(Rc::new(StringRepr::Utf16(units.into_boxed_slice())))
+                Self(Rc::new(StringRepr::Utf16(units)))
             }
         })
     }
@@ -1638,24 +1686,18 @@ impl JsString {
             StringRepr::Latin1(units) => {
                 let mut selected = reserve_trim_buffer(selected_len)?;
                 selected.extend_from_slice(&units[start..end]);
-                Ok(Self(Rc::new(StringRepr::Latin1(
-                    selected.into_boxed_slice(),
-                ))))
+                Ok(Self(Rc::new(StringRepr::Latin1(selected))))
             }
             StringRepr::Utf16(units) => {
                 let range = &units[start..end];
                 if range.iter().all(|unit| *unit <= u16::from(u8::MAX)) {
                     let mut selected = reserve_trim_buffer(selected_len)?;
                     selected.extend(range.iter().map(|unit| *unit as u8));
-                    Ok(Self(Rc::new(StringRepr::Latin1(
-                        selected.into_boxed_slice(),
-                    ))))
+                    Ok(Self(Rc::new(StringRepr::Latin1(selected))))
                 } else {
                     let mut selected = reserve_trim_buffer(selected_len)?;
                     selected.extend_from_slice(range);
-                    Ok(Self(Rc::new(StringRepr::Utf16(
-                        selected.into_boxed_slice(),
-                    ))))
+                    Ok(Self(Rc::new(StringRepr::Utf16(selected))))
                 }
             }
             StringRepr::Rope(_) => unreachable!("linearized String remained a rope"),
@@ -1674,6 +1716,9 @@ impl JsString {
         if other.is_flat() {
             if other.is_empty() {
                 return Ok(self.clone());
+            }
+            if self.is_empty() && self.is_flat() {
+                return Ok(other.clone());
             }
             if other.len() <= Self::ROPE_SHORT_LEN {
                 if self.is_flat() {
@@ -1703,6 +1748,69 @@ impl JsString {
             }
         }
         Self::new_rope(self.clone(), other.clone())
+    }
+
+    /// Append to an exclusively owned compatible flat buffer. Shared strings
+    /// and ropes retain the ordinary concatenation representation rules. The
+    /// same short-flat thresholds apply even to an exclusively owned buffer.
+    ///
+    /// # Errors
+    /// Rejects lengths above `MAX_LEN` and reports reservation failure.
+    pub fn concat_owned(mut self, other: &Self) -> Result<Self, JsStringError> {
+        Self::checked_length(self.len(), other.len())?;
+        if other.is_empty() && other.is_flat() {
+            return Ok(self);
+        }
+        if self.is_empty() && self.is_flat() {
+            return Ok(other.clone());
+        }
+        if self.try_concat_in_place(other)? {
+            return Ok(self);
+        }
+        self.try_concat(other)
+    }
+
+    /// Append only if this flat buffer has one strong owner and no weak owners.
+    /// Reservation precedes every mutation: a failed allocation leaves the
+    /// original local binding intact. A declined append likewise changes nothing.
+    pub(crate) fn try_concat_in_place(&mut self, other: &Self) -> Result<bool, JsStringError> {
+        fn reserve<T>(buffer: &mut Vec<T>, additional: usize) -> Result<(), JsStringError> {
+            #[cfg(test)]
+            if FAIL_NEXT_CONCAT_RESERVATION.with(|armed| armed.replace(false)) {
+                return Err(JsStringError::OutOfMemory);
+            }
+            buffer
+                .try_reserve(additional)
+                .map_err(|_| JsStringError::OutOfMemory)
+        }
+        Self::checked_length(self.len(), other.len())?;
+        // QuickJS exposes rope/flat distinctions in host value printing. Keep
+        // its flat-concat admission even when we own spare buffer capacity.
+        if self.len() > Self::ROPE_SHORT2_LEN || other.len() > Self::ROPE_SHORT_LEN {
+            return Ok(false);
+        }
+
+        if let Some(repr) = Rc::get_mut(&mut self.0) {
+            match (repr, other.0.as_ref()) {
+                (StringRepr::Latin1(left), StringRepr::Latin1(right)) => {
+                    reserve(left, right.len())?;
+                    left.extend_from_slice(right);
+                    return Ok(true);
+                }
+                (StringRepr::Utf16(left), StringRepr::Utf16(right)) => {
+                    reserve(left, right.len())?;
+                    left.extend_from_slice(right);
+                    return Ok(true);
+                }
+                (StringRepr::Utf16(left), StringRepr::Latin1(right)) => {
+                    reserve(left, right.len())?;
+                    left.extend(right.iter().copied().map(u16::from));
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
     }
 
     /// Encode the byte slice exposed by QuickJS `JS_ToCStringLen2` when its
@@ -1975,10 +2083,9 @@ impl PrimitiveValue {
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::float_cmp)]
     pub fn number(value: f64) -> Self {
-        if value == f64::from(value as i32) && !is_negative_zero(value) {
-            Self::Int(value as i32)
-        } else {
-            Self::Float(value)
+        match super::number::operations::Number::compact(value) {
+            super::number::operations::Number::Int(value) => Self::Int(value),
+            super::number::operations::Number::Float(value) => Self::Float(value),
         }
     }
 
@@ -2142,6 +2249,24 @@ pub fn number_to_string(value: f64) -> String {
 }
 
 pub fn string_to_number(value: &JsString) -> f64 {
+    if let StringRepr::Latin1(bytes) = value.0.as_ref()
+        && bytes.is_ascii()
+    {
+        #[cfg(feature = "profiling")]
+        crate::engine::api::profiling::record_owned_execution_event("number_parse.ascii_borrowed");
+        // ASCII Latin-1 is already the parser's byte representation. Borrow it
+        // rather than allocate UTF-16 and then a second UTF-8 buffer. Neither
+        // the representation nor the parsed result is cached or changed.
+        let text = std::str::from_utf8(bytes).expect("ASCII is valid UTF-8");
+        let text = text.trim_matches(|character: char| is_ecmascript_whitespace(character as u16));
+        return parse_number_text(text);
+    }
+    #[cfg(feature = "profiling")]
+    crate::engine::api::profiling::record_owned_execution_event("number_parse.utf16_fallback");
+    string_to_number_utf16(value)
+}
+
+fn string_to_number_utf16(value: &JsString) -> f64 {
     let units = value.utf16_units().collect::<Vec<_>>();
     let mut start = 0;
     let mut end = units.len();
@@ -2158,7 +2283,16 @@ pub fn string_to_number(value: &JsString) -> f64 {
     let Ok(text) = String::from_utf16(&units[start..end]) else {
         return f64::NAN;
     };
-    match text.as_str() {
+    parse_number_text(&text)
+}
+
+/// Both storage paths share the complete Number grammar and rounding kernels.
+/// The caller removes only ECMAScript whitespace; this is not prefix parsing.
+fn parse_number_text(text: &str) -> f64 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    match text {
         "Infinity" | "+Infinity" => return f64::INFINITY,
         "-Infinity" => return f64::NEG_INFINITY,
         _ => {}
@@ -2173,7 +2307,7 @@ pub fn string_to_number(value: &JsString) -> f64 {
     if let Some(digits) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
         return parse_radix_number(digits, 2);
     }
-    if is_decimal_number_text(&text) {
+    if is_decimal_number_text(text) {
         text.parse::<f64>().unwrap_or(f64::NAN)
     } else {
         f64::NAN
@@ -2282,6 +2416,135 @@ mod tests {
     use crate::engine::api::error::{Error, ErrorKind, NativeErrorMessage};
     use crate::engine::value::bigint::JsBigInt;
 
+    #[test]
+    fn utf16_nth_skips_leaf_and_rope_ranges() {
+        let left = JsString::from_owned_latin1(vec![b'a'; 1024]);
+        let right = JsString::from_owned_utf16(vec![0x1234; 1024]);
+        let joined = left.try_concat(&right).unwrap();
+        assert!(matches!(joined.0.as_ref(), StringRepr::Rope(_)));
+        for source in [&left, &joined] {
+            let expected = source.utf16_units().collect::<Vec<_>>();
+            for skip in 0..=expected.len() + 1 {
+                let mut iter = source.utf16_units();
+                assert_eq!(iter.nth(skip), expected.get(skip).copied());
+                assert_eq!(
+                    iter.collect::<Vec<_>>(),
+                    expected.get(skip.saturating_add(1)..).unwrap_or(&[])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_concat_preserves_aliases_width_identity_and_rope_content() {
+        let empty = JsString::from_static("");
+        let narrow = JsString::from_owned_latin1(b"abc".to_vec());
+        assert!(Rc::ptr_eq(&empty.try_concat(&narrow).unwrap().0, &narrow.0));
+        assert!(Rc::ptr_eq(&narrow.try_concat(&empty).unwrap().0, &narrow.0));
+        let identity = Rc::as_ptr(&narrow.0);
+        let grown = narrow.concat_owned(&JsString::from_static("d")).unwrap();
+        assert_eq!(Rc::as_ptr(&grown.0), identity);
+        assert_eq!(grown.to_string(), "abcd");
+        let alias = grown.clone();
+        let copied = grown.concat_owned(&JsString::from_static("e")).unwrap();
+        assert_eq!(alias.to_string(), "abcd");
+        assert_eq!(copied.to_string(), "abcde");
+        assert!(!Rc::ptr_eq(&alias.0, &copied.0));
+        let wide = JsString::from_owned_utf16(vec![0xd800]);
+        let identity = Rc::as_ptr(&wide.0);
+        let wide = wide.concat_owned(&JsString::from_static("x")).unwrap();
+        assert_eq!(Rc::as_ptr(&wide.0), identity);
+        assert_eq!(wide.utf16_units().collect::<Vec<_>>(), vec![0xd800, 120]);
+        let wide = wide
+            .concat_owned(&JsString::from_owned_utf16(vec![0xdc00]))
+            .unwrap();
+        assert_eq!(Rc::as_ptr(&wide.0), identity);
+        let widened = JsString::from_static("a").concat_owned(&wide).unwrap();
+        assert_eq!(
+            widened.utf16_units().collect::<Vec<_>>(),
+            vec![97, 0xd800, 120, 0xdc00]
+        );
+        let weak_owner = JsString::from_owned_latin1(b"weak".to_vec());
+        let weak = Rc::downgrade(&weak_owner.0);
+        let identity = Rc::as_ptr(&weak_owner.0);
+        let weak_result = weak_owner
+            .concat_owned(&JsString::from_static("!"))
+            .unwrap();
+        assert_ne!(Rc::as_ptr(&weak_result.0), identity);
+        assert!(weak.upgrade().is_none());
+        let suffix = JsString::from_static("xy");
+        let mut owned = JsString::from_owned_latin1(b"start".to_vec());
+        let identity = Rc::as_ptr(&owned.0);
+        let mut reference = owned.clone();
+        // Release the temporary alias before beginning owned append.
+        reference = reference.try_concat(&suffix).unwrap();
+        owned = owned.concat_owned(&suffix).unwrap();
+        for _ in 0..100 {
+            owned = owned.concat_owned(&suffix).unwrap();
+            reference = reference.try_concat(&suffix).unwrap();
+        }
+        assert_eq!(Rc::as_ptr(&owned.0), identity);
+        assert!(owned.is_flat());
+        for _ in 0..8900 {
+            owned = owned.concat_owned(&suffix).unwrap();
+            reference = reference.try_concat(&suffix).unwrap();
+        }
+        assert_eq!(owned, reference);
+        assert_eq!(content_hash(&owned), content_hash(&reference));
+        assert!(!owned.is_flat());
+        assert!(!reference.is_flat());
+        let rope = reference.clone();
+        let appended = reference.concat_owned(&suffix).unwrap();
+        assert_eq!(appended, rope.try_concat(&suffix).unwrap());
+    }
+
+    #[test]
+    fn owned_concat_preserves_observable_flat_rope_thresholds() {
+        for (left_len, right_len, expected_in_place) in [
+            (600, 600, false),
+            (8192, 512, true),
+            (8193, 512, false),
+            (8192, 513, false),
+        ] {
+            let mut left = JsString::from_owned_latin1(vec![b'a'; left_len]);
+            let right = JsString::from_owned_latin1(vec![b'b'; right_len]);
+            let identity = Rc::as_ptr(&left.0);
+            assert_eq!(left.try_concat_in_place(&right).unwrap(), expected_in_place);
+            assert_eq!(Rc::as_ptr(&left.0), identity);
+            if expected_in_place {
+                assert!(left.is_flat());
+                assert_eq!(left.len(), left_len + right_len);
+            } else {
+                assert_eq!(left.len(), left_len);
+                let result = left.concat_owned(&right).unwrap();
+                assert!(!result.is_flat());
+                assert_eq!(result.len(), left_len + right_len);
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_to_string_adopts_ascii_without_widening() {
+        use crate::engine::value::Value;
+        for (value, expected) in [
+            (Value::Undefined, "undefined"),
+            (Value::Null, "null"),
+            (Value::Bool(true), "true"),
+            (Value::Bool(false), "false"),
+            (Value::Int(i32::MIN), "-2147483648"),
+            (Value::Float(-0.0), "0"),
+            (Value::Float(f64::NAN), "NaN"),
+            (Value::Float(f64::INFINITY), "Infinity"),
+            (Value::Float(f64::NEG_INFINITY), "-Infinity"),
+            (Value::Float(1e30), "1e+30"),
+            (Value::BigInt(JsBigInt::from(-123_i32)), "-123"),
+        ] {
+            let string = value.to_js_string().unwrap();
+            assert!(!string.is_wide());
+            assert_eq!(string.to_string(), expected);
+        }
+    }
+
     fn content_hash(value: &JsString) -> u64 {
         let mut state = DefaultHasher::new();
         value.hash(&mut state);
@@ -2291,9 +2554,7 @@ mod tests {
     #[test]
     fn flat_and_rope_key_hashing_agree_across_storage_widths() {
         let narrow = JsString::try_from_utf8(&"é".repeat(9000)).unwrap();
-        let wide = JsString(Rc::new(StringRepr::Utf16(
-            vec![0xe9; 9000].into_boxed_slice(),
-        )));
+        let wide = JsString(Rc::new(StringRepr::Utf16(vec![0xe9; 9000])));
         let left = JsString::try_from_utf8(&"é".repeat(8500)).unwrap();
         let right = JsString::try_from_utf8(&"é".repeat(500)).unwrap();
         let rope = left.try_concat(&right).unwrap();
@@ -2694,9 +2955,7 @@ mod tests {
             assert_eq!(format_read_only(units.clone()), expected, "{units:04x?}");
         }
 
-        let wide_ascii = JsString(Rc::new(StringRepr::Utf16(
-            vec![u16::from(b'A'); 70].into_boxed_slice(),
-        )));
+        let wide_ascii = JsString(Rc::new(StringRepr::Utf16(vec![u16::from(b'A'); 70])));
         let mut message = NativeErrorMessage::new();
         message.push_utf8("'");
         wide_ascii.push_atom_get_str_to(&mut message);
@@ -2764,8 +3023,7 @@ mod tests {
         let forced_wide = JsString(Rc::new(StringRepr::Utf16(
             [u16::from(b'a'), u16::from(b'b'), 0xd800, u16::from(b'c')]
                 .into_iter()
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+                .collect::<Vec<_>>(),
         )));
         let narrowed = forced_wide.sub_string(0, 2);
         assert!(matches!(narrowed.0.as_ref(), StringRepr::Latin1(_)));
@@ -3085,17 +3343,17 @@ mod tests {
         let empty = JsString::from_static("");
         let large_flat = JsString::try_from_utf8(&"q".repeat(8193)).unwrap();
         let empty_plus_flat = empty.try_concat(&large_flat).unwrap();
-        assert!(!empty_plus_flat.is_flat());
-        let empty_plus_rope = empty.try_concat(&empty_plus_flat).unwrap();
-        assert!(Rc::ptr_eq(&empty_plus_rope.0, &empty_plus_flat.0));
-        let rope_plus_empty = empty_plus_flat.try_concat(&empty).unwrap();
-        assert!(Rc::ptr_eq(&rope_plus_empty.0, &empty_plus_flat.0));
+        assert!(empty_plus_flat.is_flat());
+        assert!(Rc::ptr_eq(&empty_plus_flat.0, &large_flat.0));
+        let rope = large_flat.try_concat(&one).unwrap();
+        let empty_plus_rope = empty.try_concat(&rope).unwrap();
+        assert!(Rc::ptr_eq(&empty_plus_rope.0, &rope.0));
+        let rope_plus_empty = rope.try_concat(&empty).unwrap();
+        assert!(Rc::ptr_eq(&rope_plus_empty.0, &rope.0));
 
-        let cached_flat = empty_plus_flat.linearize();
+        let cached_flat = rope.linearize();
         assert!(cached_flat.is_flat());
-        let cached_concat = empty_plus_flat
-            .try_concat(&JsString::from_static("!"))
-            .unwrap();
+        let cached_concat = rope.try_concat(&JsString::from_static("!")).unwrap();
         assert!(!cached_concat.is_flat());
         assert_eq!(
             cached_concat.code_unit_at(cached_concat.len() - 1),
@@ -3178,6 +3436,10 @@ mod tests {
         assert_eq!(near_limit.len(), 536_936_448);
         assert!(matches!(
             near_limit.try_concat(&near_limit),
+            Err(JsStringError::TooLong)
+        ));
+        assert!(matches!(
+            near_limit.clone().concat_owned(&near_limit),
             Err(JsStringError::TooLong)
         ));
         let error = Error::from(JsStringError::TooLong);
@@ -3282,3 +3544,6 @@ mod tests {
         assert_eq!(one.type_of(), "bigint");
     }
 }
+
+#[cfg(test)]
+mod number_conversion_tests;

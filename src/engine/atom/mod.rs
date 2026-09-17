@@ -49,11 +49,19 @@ static NEXT_ATOM_TABLE_ID: AtomicU64 = AtomicU64::new(1);
 /// Copying a table-backed atom does *not* retain it; callers which create a new
 /// owning reference must call [`AtomTable::retain`], mirroring `QuickJS`'s
 /// `JS_DupAtom` contract.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Atom {
     raw: u32,
     generation: u32,
     table_id: u64,
+}
+
+impl std::hash::Hash for Atom {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Runtime-local maps have one domain. Equality still checks table_id;
+        // different domains may collide but can never compare equal.
+        state.write_u64((u64::from(self.generation) << 32) | u64::from(self.raw));
+    }
 }
 
 impl Atom {
@@ -418,6 +426,12 @@ impl AtomTable {
     #[must_use]
     pub fn immediate_integer_atom(text: &JsString) -> Option<Atom> {
         parse_canonical_u32_js_string(text).and_then(Atom::from_immediate_integer)
+    }
+
+    /// Recognize an array-index String without interning or allocating. Keep
+    /// the same spelling and Uint32 exclusion as `array_index`.
+    pub(crate) fn canonical_array_index(text: &JsString) -> Option<u32> {
+        parse_canonical_u32_js_string(text).filter(|value| *value != u32::MAX)
     }
 
     /// Intern a string property name and return one owning reference.
@@ -1346,3 +1360,5 @@ mod tests {
 }
 
 pub(crate) mod runtime;
+
+pub(crate) mod pinned;
