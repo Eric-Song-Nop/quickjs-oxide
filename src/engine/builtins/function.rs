@@ -6,8 +6,7 @@ use crate::engine::builtins::native::{DynamicFunctionKind, FunctionDebugPosition
 use crate::engine::code::function::metadata::FunctionKind;
 
 use crate::engine::heap::{ContextId, ObjectPayload};
-use crate::engine::object::CallableRef;
-use crate::engine::value::Value;
+use crate::engine::value::{JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
 
@@ -40,7 +39,9 @@ impl Runtime {
         // explicit part of QuickJS's `b->has_prototype` test.
         let sloppy_legacy_get = if arguments.actual_arg_count == 0 {
             match this_value {
-                Value::Object(object) => {
+                JsValue::Object(id) => {
+                    let object =
+                        crate::engine::object::ObjectRef::from_borrowed_handle(self.clone(), *id)?;
                     let state = self.0.state.borrow();
                     let object = state.heap.object(object.object_id())?;
                     match object.payload {
@@ -88,22 +89,23 @@ impl Runtime {
                         | ObjectPayload::AsyncGenerator(_) => false,
                     }
                 }
-                Value::Undefined
-                | Value::Null
-                | Value::Bool(_)
-                | Value::Int(_)
-                | Value::Float(_)
-                | Value::String(_)
-                | Value::BigInt(_)
-                | Value::Symbol(_) => false,
+                JsValue::Undefined
+                | JsValue::Null
+                | JsValue::Bool(_)
+                | JsValue::Int(_)
+                | JsValue::Float(_)
+                | JsValue::String(_)
+                | JsValue::BigInt(_)
+                | JsValue::ShortBigInt(_)
+                | JsValue::Symbol(_) => false,
             }
         } else {
             false
         };
         if sloppy_legacy_get {
-            return Ok(Completion::Return(Value::Undefined));
+            return Ok(Completion::Return(JsValue::Undefined));
         }
-        Ok(Completion::Throw(self.new_native_error(
+        Ok(Completion::Throw(self.new_native_error_jsvalue(
             realm,
             NativeErrorKind::Type,
             "invalid property access",
@@ -117,11 +119,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        dynamic::finish(
-            self,
-            realm,
-            dynamic::DynamicFunctionStep::start(self, realm, kind, &invocation, arguments)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            dynamic::finish(
+                self,
+                realm,
+                dynamic::DynamicFunctionStep::start(self, realm, kind, invocation, arguments)?,
+            )
+        })
     }
 
     pub(crate) fn call_function_prototype_apply(
@@ -130,17 +134,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        super::function::invoke::finish(
-            self,
-            realm,
-            super::function::invoke::InvokeStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            super::function::invoke::finish(
                 self,
                 realm,
-                super::function::invoke::InvokeKind::Apply,
-                &invocation,
-                arguments,
-            )?,
-        )
+                super::function::invoke::InvokeStep::start(
+                    self,
+                    realm,
+                    super::function::invoke::InvokeKind::Apply,
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_function_prototype_bind(
@@ -149,11 +155,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        bind::finish(
-            self,
-            realm,
-            bind::BindStep::start(self, realm, &invocation, arguments)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            bind::finish(
+                self,
+                realm,
+                bind::BindStep::start(self, realm, invocation, arguments)?,
+            )
+        })
     }
 
     pub(crate) fn call_function_prototype_to_string(
@@ -161,11 +169,13 @@ impl Runtime {
         realm: ContextId,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        text::finish(
-            self,
-            realm,
-            text::FunctionTextStep::start(self, realm, &invocation)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            text::finish(
+                self,
+                realm,
+                text::FunctionTextStep::start(self, realm, invocation)?,
+            )
+        })
     }
 
     pub(crate) fn call_function_prototype_file_name(
@@ -177,14 +187,15 @@ impl Runtime {
                 "Function.prototype.fileName getter received the wrong native invocation",
             ));
         };
-        let Value::Object(function) = this_value else {
-            return Ok(Completion::Return(Value::Undefined));
+        let JsValue::Object(id) = this_value else {
+            return Ok(Completion::Return(JsValue::Undefined));
         };
+        let function = crate::engine::object::ObjectRef::from_borrowed_handle(self.clone(), *id)?;
         let filename = {
             let state = self.0.state.borrow();
             let object = state.heap.object(function.object_id())?;
             let ObjectPayload::BytecodeFunction { bytecode, .. } = &object.payload else {
-                return Ok(Completion::Return(Value::Undefined));
+                return Ok(Completion::Return(JsValue::Undefined));
             };
             let bytecode = state.heap.function_bytecode(*bytecode)?;
             bytecode
@@ -193,9 +204,10 @@ impl Runtime {
                 .map(|debug| state.atoms.to_js_string(debug.filename))
                 .transpose()?
         };
-        Ok(Completion::Return(
-            filename.map_or(Value::Undefined, Value::String),
-        ))
+        Ok(Completion::Return(match filename {
+            Some(filename) => self.unroot_value(&Value::String(filename))?,
+            None => JsValue::Undefined,
+        }))
     }
 
     pub(crate) fn call_function_prototype_position(
@@ -208,14 +220,15 @@ impl Runtime {
                 "Function.prototype position getter received the wrong native invocation",
             ));
         };
-        let Value::Object(function) = this_value else {
-            return Ok(Completion::Return(Value::Undefined));
+        let JsValue::Object(id) = this_value else {
+            return Ok(Completion::Return(JsValue::Undefined));
         };
+        let function = crate::engine::object::ObjectRef::from_borrowed_handle(self.clone(), *id)?;
         let position = {
             let state = self.0.state.borrow();
             let object = state.heap.object(function.object_id())?;
             let ObjectPayload::BytecodeFunction { bytecode, .. } = &object.payload else {
-                return Ok(Completion::Return(Value::Undefined));
+                return Ok(Completion::Return(JsValue::Undefined));
             };
             let bytecode = state.heap.function_bytecode(*bytecode)?;
             bytecode
@@ -224,10 +237,10 @@ impl Runtime {
                 .map(|debug| debug.pc2line.as_ref().map(|table| table.lookup(None)))
         };
         let Some(position) = position else {
-            return Ok(Completion::Return(Value::Undefined));
+            return Ok(Completion::Return(JsValue::Undefined));
         };
         let Some(position) = position else {
-            return Ok(Completion::Return(Value::Int(0)));
+            return Ok(Completion::Return(JsValue::Int(0)));
         };
         let (line, column) = position.one_based().ok_or(RuntimeError::Invariant(
             "function definition position cannot be represented one-based",
@@ -239,7 +252,7 @@ impl Runtime {
         let selected = i32::try_from(selected).map_err(|_| {
             RuntimeError::Invariant("function definition position does not fit Int32")
         })?;
-        Ok(Completion::Return(Value::Int(selected)))
+        Ok(Completion::Return(JsValue::Int(selected)))
     }
 
     pub(crate) fn call_function_prototype_has_instance(
@@ -248,45 +261,35 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        instance::finish(
-            self,
-            realm,
-            instance::InstanceStep::native(self, realm, &invocation, arguments)?,
-        )
-    }
-    pub(crate) fn ordinary_is_instance_of(
-        &self,
-        realm: ContextId,
-        target: &CallableRef,
-        candidate: Value,
-    ) -> Result<Completion, RuntimeError> {
-        instance::finish(
-            self,
-            realm,
-            instance::InstanceStep::ordinary(self, realm, target, candidate)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            instance::finish(
+                self,
+                realm,
+                instance::InstanceStep::native(self, realm, invocation, arguments)?,
+            )
+        })
     }
 }
 
 pub(crate) fn bound_function_length(
-    value: &Value,
+    value: &JsValue,
     bound_argument_count: usize,
-) -> Result<Value, RuntimeError> {
+) -> Result<JsValue, RuntimeError> {
     let count = u32::try_from(bound_argument_count)
         .map_err(|_| RuntimeError::Invariant("bound argument count does not fit u32"))?;
     Ok(match value {
-        Value::Int(length) => {
+        JsValue::Int(length) => {
             let length = i64::from(*length);
             let count = i64::from(count);
             if length <= count {
-                Value::Int(0)
+                JsValue::Int(0)
             } else {
-                Value::Int(i32::try_from(length - count).map_err(|_| {
+                JsValue::Int(i32::try_from(length - count).map_err(|_| {
                     RuntimeError::Invariant("bound function integer length does not fit i32")
                 })?)
             }
         }
-        Value::Float(length) => {
+        JsValue::Float(length) => {
             let length = if length.is_nan() {
                 0.0
             } else {
@@ -297,14 +300,15 @@ pub(crate) fn bound_function_length(
                     length - f64::from(count)
                 }
             };
-            Value::number(length)
+            crate::engine::value::number::operations::Number::compact(length).into()
         }
-        Value::Undefined
-        | Value::Null
-        | Value::Bool(_)
-        | Value::BigInt(_)
-        | Value::String(_)
-        | Value::Symbol(_)
-        | Value::Object(_) => Value::Int(0),
+        JsValue::Undefined
+        | JsValue::Null
+        | JsValue::Bool(_)
+        | JsValue::BigInt(_)
+        | JsValue::ShortBigInt(_)
+        | JsValue::String(_)
+        | JsValue::Symbol(_)
+        | JsValue::Object(_) => JsValue::Int(0),
     })
 }

@@ -14,17 +14,19 @@ impl Runtime {
         realm: ContextId,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        operation::PromiseStep::convenience(
-            self,
-            realm,
-            PromiseNativeKind::WithResolvers,
-            &invocation,
-            &NativeArguments {
-                readable: Vec::new(),
-                actual_arg_count: 0,
-            },
-        )?
-        .finish(self, realm)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::PromiseStep::convenience(
+                self,
+                realm,
+                PromiseNativeKind::WithResolvers,
+                invocation,
+                &NativeArguments {
+                    readable: Vec::new(),
+                    actual_arg_count: 0,
+                },
+            )?
+            .finish(self, realm)
+        })
     }
 
     pub(crate) fn call_promise_try(
@@ -33,14 +35,16 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::PromiseStep::convenience(
-            self,
-            realm,
-            PromiseNativeKind::Try,
-            &invocation,
-            arguments,
-        )?
-        .finish(self, realm)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::PromiseStep::convenience(
+                self,
+                realm,
+                PromiseNativeKind::Try,
+                invocation,
+                arguments,
+            )?
+            .finish(self, realm)
+        })
     }
 
     pub(crate) fn call_promise_race(
@@ -49,31 +53,34 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::PromiseStep::aggregate(
-            self,
-            realm,
-            PromiseNativeKind::Race,
-            &invocation,
-            arguments,
-        )?
-        .finish(self, realm)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::PromiseStep::aggregate(
+                self,
+                realm,
+                PromiseNativeKind::Race,
+                invocation,
+                arguments,
+            )?
+            .finish(self, realm)
+        })
     }
 
     pub(crate) fn promise_callable(
         &self,
         realm: ContextId,
-        value: Value,
+        value: &JsValue,
     ) -> Result<NativeConversion<CallableRef>, RuntimeError> {
-        let Value::Object(object) = value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        let JsValue::Object(id) = value else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "not a function",
             )?));
         };
+        let object = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
         match self.as_callable(&object)? {
             Some(callable) => Ok(NativeConversion::Value(callable)),
-            None => Ok(NativeConversion::Throw(self.new_native_error(
+            None => Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "not a function",

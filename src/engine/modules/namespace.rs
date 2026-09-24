@@ -8,7 +8,7 @@
 
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
-use crate::engine::atom::PropertyKeyKind;
+use crate::engine::atom::{AtomIdx, PropertyKeyKind};
 
 use crate::engine::heap::{ObjectData, ObjectKind, PropertySlot};
 use crate::engine::object::{
@@ -25,8 +25,10 @@ impl Runtime {
         if !object.belongs_to(self) {
             return Err(RuntimeError::WrongRuntime("object"));
         }
-        Ok(self.0.state.borrow().heap.object(object.object_id())?.kind
-            == ObjectKind::ModuleNamespace)
+        Ok(matches!(
+            self.0.state.borrow().heap.object(object.object_id())?.kind,
+            ObjectKind::ModuleNamespace
+        ))
     }
 
     /// Allocate the null-prototype, already non-extensible namespace shell.
@@ -69,7 +71,7 @@ impl Runtime {
         let state = self.0.state.borrow();
         let object = state.heap.object(object.object_id())?;
         let shape = state.heap.shape(object.shape)?;
-        let Some(index) = shape.find(key.atom()) else {
+        let Some(index) = shape.find(AtomIdx::from_raw(key.atom().raw())) else {
             return Ok(false);
         };
         Ok(matches!(
@@ -96,8 +98,11 @@ impl Runtime {
             let object = state.heap.object(object.object_id())?;
             let mut atoms = Vec::new();
             for entry in state.heap.shape(object.shape)?.entries() {
-                if state.atoms.property_key_kind(entry.atom)? != PropertyKeyKind::Private {
-                    atoms.push(entry.atom);
+                // Public exit boundary: re-brand the stored unbranded index
+                // before handing the atom to `PropertyKey` construction.
+                let atom = state.atoms.brand(entry.atom)?;
+                if state.atoms.property_key_kind(atom)? != PropertyKeyKind::Private {
+                    atoms.push(atom);
                 }
             }
             atoms
@@ -112,6 +117,39 @@ impl Runtime {
     /// Implement the Module Namespace `[[DefineOwnProperty]]` compatibility
     /// rule for a live export property. `None` delegates to the ordinary path
     /// for non-namespace objects, missing keys, and `@@toStringTag`.
+    pub(crate) fn define_module_namespace_export_owned(
+        &self,
+        object: &ObjectRef,
+        key: &PropertyKey,
+        descriptor: &crate::engine::object::OwnedPropertyDescriptor,
+    ) -> Result<Option<bool>, RuntimeError> {
+        use crate::engine::object::property::CompletePropertyDescriptor;
+        if !self.module_namespace_export_slot(object, key)? {
+            return Ok(None);
+        }
+        // Preserve the unconditional TDZ read, including attribute-only definitions.
+        let current = self
+            .get_own_property_owned(object, key)?
+            .ok_or(RuntimeError::Invariant(
+                "module namespace export slot has no own descriptor",
+            ))?;
+        let CompletePropertyDescriptor::Data { value: current, .. } = current.record() else {
+            return Err(RuntimeError::Invariant(
+                "module namespace export slot is not a data descriptor",
+            ));
+        };
+        if descriptor.get.is_present()
+            || descriptor.set.is_present()
+            || matches!(descriptor.configurable, DescriptorField::Present(true))
+            || matches!(descriptor.enumerable, DescriptorField::Present(false))
+            || matches!(descriptor.writable, DescriptorField::Present(false))
+            || matches!(&descriptor.value, DescriptorField::Present(value) if !crate::engine::value::collection_key::same_value(&self.0.state.borrow().heap, &value.as_raw(), current))
+        {
+            return Ok(Some(false));
+        }
+        Ok(Some(true))
+    }
+
     pub(crate) fn define_module_namespace_export(
         &self,
         object: &ObjectRef,

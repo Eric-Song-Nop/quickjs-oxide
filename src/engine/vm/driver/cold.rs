@@ -314,7 +314,7 @@ pub(super) fn dispatch(
         } => get_element(&mut context, keep_receiver, keep_key)?,
         RunExit::ConvertPlus => convert(&mut context, false, false)?,
         RunExit::ConvertPropertyKey => convert(&mut context, false, true)?,
-        #[cfg(test)]
+        #[cfg(all(test, feature = "profiling"))]
         exit @ RunExit::ReleaseOperand { .. } => direct(&mut context, exit)?,
         RunExit::Complete => {
             if matches!(context.forwarded, Some(Completion::Throw(_))) {
@@ -332,9 +332,14 @@ pub(super) fn dispatch(
 }
 
 #[inline(never)]
-#[cfg(test)]
+#[cfg(all(test, feature = "profiling"))]
 fn direct(context: &mut Context<'_>, exit: RunExit) -> Result<Disposition, Error> {
-    if super::super::frame_operations::complete_owned_slot(context.execution, context.id, exit)? {
+    if super::super::frame_operations::complete_owned_slot(
+        context.runtime,
+        context.execution,
+        context.id,
+        exit,
+    )? {
         Ok(Disposition::Entered)
     } else {
         Err(Error::internal("direct cold operation was not completed"))
@@ -462,36 +467,24 @@ fn convert(
     let execution = &mut *context.execution;
     let id = context.id;
 
-    let mut invalid = false;
     if !context.conversion_prepared {
         let frame = execution.frames.current_mut(id)?;
         for offset in (0..=usize::from(addition)).rev() {
-            invalid |= runtime
-                .validate_value_domain(
-                    execution.slots.peek(&frame.window, offset)?,
-                    "conversion operand",
-                )
-                .is_err();
+            execution.slots.peek(&frame.window, offset)?;
         }
+        (*context.next_operation) = (*context.next_operation)
+            .checked_add(1)
+            .ok_or_else(|| Error::internal("conversion identity exhausted"))?;
     }
-    if invalid {
-        Ok(Disposition::Bridge)
-    } else {
-        if !context.conversion_prepared {
-            (*context.next_operation) = (*context.next_operation)
-                .checked_add(1)
-                .ok_or_else(|| Error::internal("conversion identity exhausted"))?;
-        }
-        *context.conversion = Some(crate::engine::vm::conversion_driver::ConversionTask::start(
-            runtime,
-            execution,
-            id,
-            *context.next_operation,
-            addition,
-            property_key,
-        )?);
-        Ok(Disposition::Entered)
-    }
+    *context.conversion = Some(crate::engine::vm::conversion_driver::ConversionTask::start(
+        runtime,
+        execution,
+        id,
+        *context.next_operation,
+        addition,
+        property_key,
+    )?);
+    Ok(Disposition::Entered)
 }
 
 #[inline(never)]
@@ -614,7 +607,7 @@ fn set_property(context: &mut Context<'_>, key: Option<u32>) -> Result<Dispositi
     let id = context.id;
 
     let frame = execution.frames.current_mut(id)?;
-    if key.is_none() && matches!(execution.slots.peek(&frame.window, 1)?, Value::Object(_)) {
+    if key.is_none() && matches!(execution.slots.peek(&frame.window, 1)?, JsValue::Object(_)) {
         (*context.next_operation) = (*context.next_operation)
             .checked_add(1)
             .ok_or_else(|| Error::internal("write conversion identity exhausted"))?;
@@ -671,8 +664,8 @@ fn get_element(
     let frame = execution.frames.current_mut(id)?;
     if !matches!(
         execution.slots.peek(&frame.window, 1)?,
-        Value::Null | Value::Undefined
-    ) && matches!(execution.slots.peek(&frame.window, 0)?, Value::Object(_))
+        JsValue::Null | JsValue::Undefined
+    ) && matches!(execution.slots.peek(&frame.window, 0)?, JsValue::Object(_))
     {
         (*context.next_operation) = (*context.next_operation)
             .checked_add(1)

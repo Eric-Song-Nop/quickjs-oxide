@@ -18,7 +18,7 @@ use crate::engine::heap::{
 use crate::engine::object::{
     DescriptorField, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, WellKnownSymbol,
 };
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::call::{NativeArguments, NativeInvocation, NativeInvokeOutcome};
 use crate::engine::vm::suspend::{self, EncodedVmActivation, VmActivationResume, VmRunOutcome};
 use crate::engine::vm::{Completion, VmResume, VmSuspendKind};
@@ -147,9 +147,12 @@ impl Runtime {
     pub(super) fn allocate_generator_object(
         &self,
         prototype: &ObjectRef,
-        activation: EncodedVmActivation,
+        mut activation: EncodedVmActivation,
     ) -> Result<ObjectRef, RuntimeError> {
-        let atoms = activation.atoms();
+        let atoms = {
+            let state = self.0.state.borrow();
+            activation.atoms(&state.atoms)?
+        };
         let mut state = self.0.state.borrow_mut();
         let shape = state.get_or_create_shape(Some(prototype.object_id()), &[])?;
         let mut retained_atoms = Vec::with_capacity(atoms.len());
@@ -158,6 +161,7 @@ impl Runtime {
                 state.release_atoms(retained_atoms)?;
                 let cleanup = state.heap.release_shape(shape)?;
                 state.apply_cleanup(cleanup)?;
+                activation.release_conversion_edges(self);
                 return Err(error.into());
             }
             retained_atoms.push(atom);
@@ -172,11 +176,15 @@ impl Runtime {
                 state.release_atoms(retained_atoms)?;
                 let cleanup = state.heap.release_shape(shape)?;
                 state.apply_cleanup(cleanup)?;
+                activation.release_conversion_edges(self);
                 return Err(error.into());
             }
         };
         let cleanup = state.heap.release_shape(shape)?;
         state.apply_cleanup(cleanup)?;
+        // The generator object retained its own activation edges, so the
+        // caller-owned conversion edges move to the owner and can drop.
+        activation.release_conversion_edges(self);
         drop(state);
         drop(activation);
         Ok(ObjectRef::from_owned_handle(self.clone(), object))
@@ -191,9 +199,12 @@ impl Runtime {
     ) -> Result<Completion, RuntimeError> {
         match self.call_generator_prototype_resume_raw(realm, kind, invocation, arguments)? {
             NativeInvokeOutcome::Completion(completion) => Ok(completion),
-            NativeInvokeOutcome::IteratorNextRaw { value, done } => Ok(Completion::Return(
-                Value::Object(self.new_iterator_result(realm, value, done)?),
-            )),
+            NativeInvokeOutcome::IteratorNextRaw { value, done } => {
+                let result = self.new_iterator_result_jsvalue(realm, value, done)?;
+                Ok(Completion::Return(
+                    self.into_jsvalue(Value::Object(result))?,
+                ))
+            }
         }
     }
 
@@ -216,26 +227,32 @@ impl Runtime {
         arguments: &NativeArguments,
     ) -> Result<GeneratorStep, RuntimeError> {
         let NativeInvocation::Call { this_value } = invocation else {
+            invocation.release(self)?;
             return Err(RuntimeError::Invariant(
                 "Generator resume did not receive an iterator-next invocation",
             ));
         };
-        let argument = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "Generator resume has no readable argument slot",
-            ))?;
-        let Value::Object(generator) = this_value else {
+        let argument = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "Generator resume has no readable argument slot",
+        ));
+        let argument = match argument {
+            Ok(argument) => argument,
+            Err(error) => {
+                self.release_jsvalue(this_value)?;
+                return Err(error);
+            }
+        };
+        let JsValue::Object(generator) = this_value else {
+            self.release_jsvalue(this_value)?;
             return Ok(GeneratorStep::Complete(NativeInvokeOutcome::Completion(
-                Completion::Throw(self.new_native_error(
+                Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "not a generator",
                 )?),
             )));
         };
+        let generator = ObjectRef::from_owned_handle(self.clone(), generator);
         let snapshot = {
             let state = self.0.state.borrow();
             if !matches!(
@@ -249,7 +266,7 @@ impl Runtime {
         };
         let Some((previous_state, activation)) = snapshot else {
             return Ok(GeneratorStep::Complete(NativeInvokeOutcome::Completion(
-                Completion::Throw(self.new_native_error(
+                Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "not a generator",
@@ -264,7 +281,12 @@ impl Runtime {
                     ));
                 }
                 return Ok(GeneratorStep::Complete(Self::completed_generator_outcome(
-                    kind, argument,
+                    kind,
+                    if kind == GeneratorResumeKind::Next {
+                        JsValue::Undefined
+                    } else {
+                        self.dup_jsvalue(argument)?
+                    },
                 )));
             }
             GeneratorState::Executing => {
@@ -274,7 +296,7 @@ impl Runtime {
                     ));
                 }
                 return Ok(GeneratorStep::Complete(NativeInvokeOutcome::Completion(
-                    Completion::Throw(self.new_native_error(
+                    Completion::Throw(self.new_native_error_jsvalue(
                         realm,
                         NativeErrorKind::Type,
                         "cannot invoke a running generator",
@@ -334,7 +356,8 @@ impl Runtime {
             self.complete_executing_generator(&generator)?;
             drop(rooted);
             return Ok(GeneratorStep::Complete(Self::completed_generator_outcome(
-                kind, argument,
+                kind,
+                self.dup_jsvalue(argument)?,
             )));
         }
 
@@ -342,9 +365,9 @@ impl Runtime {
             GeneratorState::SuspendedStart => VmActivationResume::Initial,
             GeneratorState::SuspendedYield | GeneratorState::SuspendedYieldStar => {
                 VmActivationResume::Generator(match kind {
-                    GeneratorResumeKind::Next => VmResume::Next(argument),
-                    GeneratorResumeKind::Return => VmResume::Return(argument),
-                    GeneratorResumeKind::Throw => VmResume::Throw(argument),
+                    GeneratorResumeKind::Next => VmResume::Next(self.dup_jsvalue(argument)?),
+                    GeneratorResumeKind::Return => VmResume::Return(self.dup_jsvalue(argument)?),
+                    GeneratorResumeKind::Throw => VmResume::Throw(self.dup_jsvalue(argument)?),
                 })
             }
             GeneratorState::Executing | GeneratorState::Completed => unreachable!(),
@@ -379,7 +402,7 @@ impl Runtime {
             }
             VmRunOutcome::Suspend {
                 value: yielded,
-                activation,
+                mut activation,
             } => {
                 let state = match activation.kind {
                     VmSuspendKind::Yield => GeneratorState::SuspendedYield,
@@ -394,14 +417,14 @@ impl Runtime {
                     }
                 };
                 if state == GeneratorState::SuspendedYieldStar
-                    && !matches!(yielded, Value::Object(_))
+                    && !matches!(yielded, JsValue::Object(_))
                 {
                     self.complete_executing_generator(generator)?;
                     return Err(RuntimeError::Invariant(
                         "yield* suspension did not retain an iterator-result object",
                     ));
                 }
-                if let Err(error) = self.store_generator_suspension(generator, &activation) {
+                if let Err(error) = self.store_generator_suspension(generator, &mut activation) {
                     let _ = self.complete_executing_generator(generator);
                     return Err(error);
                 }
@@ -429,11 +452,11 @@ impl Runtime {
 
     fn completed_generator_outcome(
         kind: GeneratorResumeKind,
-        argument: Value,
+        argument: JsValue,
     ) -> NativeInvokeOutcome {
         match kind {
             GeneratorResumeKind::Next => NativeInvokeOutcome::IteratorNextRaw {
-                value: Value::Undefined,
+                value: JsValue::Undefined,
                 done: true,
             },
             GeneratorResumeKind::Return => NativeInvokeOutcome::IteratorNextRaw {
@@ -449,7 +472,7 @@ impl Runtime {
     fn store_generator_suspension(
         &self,
         generator: &ObjectRef,
-        activation: &EncodedVmActivation,
+        activation: &mut EncodedVmActivation,
     ) -> Result<(), RuntimeError> {
         let generator_state = match activation.kind {
             VmSuspendKind::Yield => GeneratorState::SuspendedYield,
@@ -461,12 +484,16 @@ impl Runtime {
                 ));
             }
         };
-        let atoms = activation.atoms();
+        let atoms = {
+            let state = self.0.state.borrow();
+            activation.atoms(&state.atoms)?
+        };
         let mut state = self.0.state.borrow_mut();
         let mut retained_atoms = Vec::with_capacity(atoms.len());
         for atom in atoms {
             if let Err(error) = state.atoms.retain(atom) {
                 state.release_atoms(retained_atoms)?;
+                activation.release_conversion_edges(self);
                 return Err(error.into());
             }
             retained_atoms.push(atom);
@@ -477,8 +504,12 @@ impl Runtime {
             activation.data.clone(),
         ) {
             state.release_atoms(retained_atoms)?;
+            activation.release_conversion_edges(self);
             return Err(error.into());
         }
+        // The heap record retained its own activation edges, so the
+        // caller-owned conversion edges can drop.
+        activation.release_conversion_edges(self);
         Ok(())
     }
 
@@ -777,7 +808,7 @@ mod tests {
                 .unwrap(),
             Value::Bool(true)
         );
-        context.eval("__gcGenerator = undefined").unwrap();
+        drop(context.eval("__gcGenerator = undefined").unwrap());
         drop(generator);
         assert!(runtime.run_gc().unwrap().cleanup.finalized_objects >= 1);
         assert_eq!(runtime.heap_counts().zombies, 0);
@@ -959,12 +990,15 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            runtime
-                .call_internal(context.realm, &callable, Value::Undefined, &[])
-                .unwrap(),
-            Completion::Throw(marker)
-        );
+        let thrown = match runtime
+            .call_internal(context.realm, &callable, Value::Undefined, &[])
+            .unwrap()
+        {
+            Completion::Throw(value) => value,
+            other => panic!("expected generator creation to throw, got {other:?}"),
+        };
+        assert_eq!(runtime.root_value(&thrown).unwrap(), marker);
+        runtime.release_jsvalue(thrown).unwrap();
         assert_eq!(context.eval("__order").unwrap(), Value::Int(1));
         assert!(runtime.0.state.borrow().active_frames.is_empty());
     }

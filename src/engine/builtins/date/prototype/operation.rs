@@ -1,5 +1,5 @@
 //! Date prototype operations retain the specified pre-coercion fields or re-read setYear state.
-use super::{date_argument, date_input_fields};
+use super::date_input_fields;
 use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     builtins::{
@@ -8,7 +8,7 @@ use crate::engine::{
     },
     heap::ContextId,
     object::{CallableRef, ObjectRef, PropertyKey},
-    value::{JsString, Value, conversion::NativeConversion},
+    value::{JsString, JsValue, conversion::NativeConversion},
     vm::{
         Completion, ToPrimitiveHint,
         call::{NativeArguments, NativeInvocation},
@@ -17,11 +17,11 @@ use crate::engine::{
 pub(crate) enum DatePrototypeStep {
     Complete(Completion),
     Number {
-        value: Value,
+        value: JsValue,
         resume: DatePrototypeResume,
     },
     Primitive {
-        value: Value,
+        value: JsValue,
         hint: ToPrimitiveHint,
         resume: DatePrototypeResume,
     },
@@ -36,7 +36,7 @@ pub(crate) enum DatePrototypeStep {
     },
     Call {
         callable: CallableRef,
-        receiver: Value,
+        receiver: JsValue,
     },
 }
 enum Phase {
@@ -68,9 +68,21 @@ pub(crate) struct DatePrototypeResumeState {
     realm: ContextId,
     object: ObjectRef,
     phase: Phase,
-    arguments: std::vec::IntoIter<Value>,
+    arguments: std::collections::VecDeque<JsValue>,
+    reply: JsValue,
     converted: usize,
     actual: usize,
+}
+impl Drop for DatePrototypeResumeState {
+    fn drop(&mut self) {
+        for value in self.arguments.drain(..) {
+            let _ = self.object.runtime().release_jsvalue(value);
+        }
+        let _ = self
+            .object
+            .runtime()
+            .release_jsvalue(std::mem::replace(&mut self.reply, JsValue::Undefined));
+    }
 }
 impl DatePrototypeStep {
     pub(crate) fn start(
@@ -86,29 +98,47 @@ impl DatePrototypeStep {
             ));
         };
         if kind == DateNativeKind::ToPrimitive {
-            let Value::Object(object) = this_value else {
+            let JsValue::Object(id) = this_value else {
                 return Ok(Self::Complete(Completion::Throw(
-                    runtime.new_native_error(realm, NativeErrorKind::Type, "not an object")?,
+                    runtime.new_native_error_jsvalue(
+                        realm,
+                        NativeErrorKind::Type,
+                        "not an object",
+                    )?,
                 )));
             };
-            let hint = match date_argument(arguments, 0)? {
-                Value::String(value)
-                    if value == &JsString::from_static("number")
-                        || value == &JsString::from_static("integer") =>
-                {
-                    ToPrimitiveHint::Number
+            let object = ObjectRef::from_borrowed_handle(runtime.clone(), *id)?;
+            let hint = match arguments.readable.first() {
+                Some(JsValue::String(id)) => {
+                    let state = runtime.0.state.borrow();
+                    let value = state.heap.string(*id)?;
+                    if *value == JsString::from_static("number")
+                        || *value == JsString::from_static("integer")
+                    {
+                        Some(ToPrimitiveHint::Number)
+                    } else if *value == JsString::from_static("string")
+                        || *value == JsString::from_static("default")
+                    {
+                        Some(ToPrimitiveHint::String)
+                    } else {
+                        None
+                    }
                 }
-                Value::String(value)
-                    if value == &JsString::from_static("string")
-                        || value == &JsString::from_static("default") =>
-                {
-                    ToPrimitiveHint::String
+                Some(_) => None,
+                None => {
+                    return Err(RuntimeError::Invariant(
+                        "Date native argument vector was not padded to readable arity",
+                    ));
                 }
-                _ => {
-                    return Ok(Self::Complete(Completion::Throw(
-                        runtime.new_native_error(realm, NativeErrorKind::Type, "invalid hint")?,
-                    )));
-                }
+            };
+            let Some(hint) = hint else {
+                return Ok(Self::Complete(Completion::Throw(
+                    runtime.new_native_error_jsvalue(
+                        realm,
+                        NativeErrorKind::Type,
+                        "invalid hint",
+                    )?,
+                )));
             };
             return Ok(Self::OrdinaryPrimitive {
                 object: object.clone(),
@@ -116,28 +146,32 @@ impl DatePrototypeStep {
             });
         }
         if kind == DateNativeKind::ToJson {
-            let object = match runtime.native_to_object(realm, this_value.clone())? {
-                NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => {
-                    return Ok(Self::Complete(Completion::Throw(value)));
-                }
-            };
+            let object =
+                match runtime.native_to_object_jsvalue(realm, runtime.dup_jsvalue(this_value)?)? {
+                    NativeConversion::Value(value) => value,
+                    NativeConversion::Throw(value) => {
+                        return Ok(Self::Complete(Completion::Throw(value)));
+                    }
+                };
             return Ok(Self::Primitive {
-                value: Value::Object(object.clone()),
+                value: JsValue::Object(object.clone().into_handle()),
                 hint: ToPrimitiveHint::Number,
                 resume: DatePrototypeResume(Box::new(DatePrototypeResumeState {
                     realm,
                     object,
                     phase: Phase::JsonPrimitive,
-                    arguments: Vec::new().into_iter(),
+                    arguments: std::collections::VecDeque::new(),
+                    reply: JsValue::Undefined,
                     converted: 0,
                     actual: 0,
                 })),
             });
         }
-        let (object, value) = match runtime.date_this_time_value(realm, this_value)? {
+        let (object, value) = match runtime.date_this_time_value_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
+            NativeConversion::Throw(value) => {
+                return Ok(Self::Complete(Completion::Throw(value)));
+            }
         };
         let (phase, count) = match kind {
             DateNativeKind::SetTime => (Phase::Time, 1),
@@ -166,25 +200,32 @@ impl DatePrototypeStep {
                 ));
             }
         };
-        DatePrototypeResume(Box::new(DatePrototypeResumeState {
+        let mut resume = DatePrototypeResume(Box::new(DatePrototypeResumeState {
             realm,
             object: object.clone(),
             phase,
-            arguments: arguments
-                .readable
-                .get(..count)
-                .ok_or(RuntimeError::Invariant("Date setter argv was not padded"))?
-                .to_vec()
-                .into_iter(),
+            arguments: std::collections::VecDeque::new(),
+            reply: JsValue::Undefined,
             converted: 0,
             actual: arguments.actual_arg_count,
-        }))
-        .next(runtime)
+        }));
+        resume
+            .arguments
+            .try_reserve(count)
+            .map_err(|_| RuntimeError::Invariant("Date setter argv allocation failed"))?;
+        for value in arguments
+            .readable
+            .get(..count)
+            .ok_or(RuntimeError::Invariant("Date setter argv was not padded"))?
+        {
+            resume.arguments.push_back(runtime.dup_jsvalue(value)?);
+        }
+        resume.next(runtime)
     }
 }
 impl DatePrototypeResume {
     fn next(mut self, runtime: &Runtime) -> Result<DatePrototypeStep, RuntimeError> {
-        if let Some(value) = self.0.arguments.next() {
+        if let Some(value) = self.0.arguments.pop_front() {
             return Ok(DatePrototypeStep::Number {
                 value,
                 resume: self,
@@ -203,7 +244,7 @@ impl DatePrototypeResume {
         };
         if !had_fields {
             return Ok(DatePrototypeStep::Complete(Completion::Return(
-                Value::number(f64::NAN),
+                crate::engine::value::number::operations::Number::compact(f64::NAN).into(),
             )));
         }
         let value = if all_finite && self.0.actual > 0 {
@@ -264,10 +305,14 @@ impl DatePrototypeResume {
                 return Ok(DatePrototypeStep::Complete(Completion::Throw(value)));
             }
         };
+        let previous = std::mem::replace(&mut self.reply, value);
+        runtime.release_jsvalue(previous)?;
         match self.0.phase {
             Phase::JsonPrimitive => {
-                if value.as_number().is_some_and(|value| !value.is_finite()) {
-                    return Ok(DatePrototypeStep::Complete(Completion::Return(Value::Null)));
+                if matches!(self.reply, JsValue::Float(value) if !value.is_finite()) {
+                    return Ok(DatePrototypeStep::Complete(Completion::Return(
+                        JsValue::Null,
+                    )));
                 }
                 self.0.phase = Phase::JsonMethod;
                 Ok(DatePrototypeStep::Read {
@@ -279,13 +324,13 @@ impl DatePrototypeResume {
                 })
             }
             Phase::JsonMethod => {
-                let callable = match value {
-                    Value::Object(object) => runtime.as_callable(&object)?,
+                let callable = match &self.reply {
+                    JsValue::Object(id) => runtime.as_callable_object(*id)?,
                     _ => None,
                 };
                 let Some(callable) = callable else {
                     return Ok(DatePrototypeStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             "object needs toISOString method",
@@ -294,7 +339,7 @@ impl DatePrototypeResume {
                 };
                 Ok(DatePrototypeStep::Call {
                     callable,
-                    receiver: Value::Object(self.0.object),
+                    receiver: JsValue::Object(self.0.object.clone().into_handle()),
                 })
             }
             _ => Err(RuntimeError::Invariant(
@@ -312,13 +357,13 @@ pub(crate) fn finish(
         step = match step {
             DatePrototypeStep::Complete(result) => return Ok(result),
             DatePrototypeStep::Number { value, resume } => {
-                resume.number(runtime, runtime.native_to_number(realm, &value)?)?
+                resume.number(runtime, runtime.native_to_number_jsvalue(realm, value)?)?
             }
             DatePrototypeStep::Primitive {
                 value,
                 hint,
                 resume,
-            } => resume.resume(runtime, runtime.to_primitive(realm, value, hint)?)?,
+            } => resume.resume(runtime, runtime.to_primitive_jsvalue(realm, value, hint)?)?,
             DatePrototypeStep::OrdinaryPrimitive { object, hint } => {
                 return runtime.ordinary_to_primitive(realm, &object, hint);
             }
@@ -331,7 +376,7 @@ pub(crate) fn finish(
                 runtime.get_property_in_realm(realm, &object, &key)?,
             )?,
             DatePrototypeStep::Call { callable, receiver } => {
-                return runtime.call_internal(realm, &callable, receiver, &[]);
+                return runtime.call_internal_jsvalue(realm, &callable, receiver, Vec::new());
             }
         };
     }

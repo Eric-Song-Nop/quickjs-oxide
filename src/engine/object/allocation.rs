@@ -1,6 +1,6 @@
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
-use crate::engine::atom::Atom;
+use crate::engine::atom::{Atom, AtomIdx};
 
 use crate::engine::builtins::native::{NativeFunctionId, PrimitiveKind};
 use crate::engine::code::function::metadata::{
@@ -17,7 +17,7 @@ use crate::engine::object::{
     CallableRef, DescriptorField, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey,
 };
 use crate::engine::realm::bindings::GlobalBindingCreationMode;
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use std::collections::HashMap;
 
 impl Runtime {
@@ -73,7 +73,7 @@ impl Runtime {
         }
         let length = self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Length)?;
         let entries = [ShapeEntry {
-            atom: length.atom(),
+            atom: AtomIdx::from_raw(length.atom().raw()),
             flags: PropertyFlags::data(true, false, false),
         }];
         let mut state = self.0.state.borrow_mut();
@@ -116,16 +116,20 @@ impl Runtime {
             return Err(RuntimeError::WrongRuntime("Array"));
         }
         self.validate_value_domain(&value, "Array element")?;
-        let raw = self.raw_property_value(&value)?;
+        let converted = self.raw_property_value(&value)?;
+        let raw = converted.raw();
+        // Clone duplicates only the handle; the guard keeps the producer edge
+        // accountable through every store-or-decline path below.
         let mut state = self.0.state.borrow_mut();
         let retained_atoms = state.retain_raw_value_atoms(std::iter::once(&raw))?;
-        match state
+        let appended = state
             .heap
-            .append_fresh_array_dense_value(array.object_id(), raw)
-        {
+            .append_fresh_array_dense_value(array.object_id(), raw);
+        match appended {
             Ok(()) => Ok(()),
             Err(error) => {
-                state.release_atoms(retained_atoms)?;
+                let released = state.release_atoms(retained_atoms);
+                released?;
                 Err(error.into())
             }
         }
@@ -147,6 +151,63 @@ impl Runtime {
             self.append_fresh_array_value(&array, value)?;
         }
         Ok(array)
+    }
+
+    /// Internal-value form of [`Runtime::new_array_from_values`]: consumes the
+    /// values' edges after each dense store has retained its own copy.
+    pub(crate) fn new_array_from_values_jsvalue(
+        &self,
+        realm: ContextId,
+        values: Vec<crate::engine::value::JsValue>,
+    ) -> Result<ObjectRef, RuntimeError> {
+        let mut values = values.into_iter();
+        let result = (|| {
+            let array = self.new_array(realm)?;
+            for value in values.by_ref() {
+                self.append_fresh_array_value_jsvalue(&array, value)?;
+            }
+            Ok(array)
+        })();
+        // Allocation or publication may fail before the suffix was consumed.
+        // These owners never entered the Array and must all be surrendered.
+        let mut cleanup = Ok(());
+        for value in values {
+            let released = self.release_jsvalue(value);
+            if cleanup.is_ok() {
+                cleanup = released;
+            }
+        }
+        cleanup?;
+        result
+    }
+
+    /// Adopt an internal element's heap/atom edge directly into dense storage.
+    /// Both success and failure consume the producer owner; a failed transaction
+    /// returns its unchanged raw owner for release outside the state borrow.
+    pub(crate) fn append_fresh_array_value_jsvalue(
+        &self,
+        array: &ObjectRef,
+        value: crate::engine::value::JsValue,
+    ) -> Result<(), RuntimeError> {
+        if !array.belongs_to(self) {
+            self.release_jsvalue(value)?;
+            return Err(RuntimeError::WrongRuntime("Array"));
+        }
+        let appended = self
+            .0
+            .state
+            .borrow_mut()
+            .heap
+            .append_fresh_array_dense_value_owned(array.object_id(), value.into_raw());
+        match appended {
+            Ok(()) => Ok(()),
+            Err((error, raw)) => {
+                self.release_jsvalue(
+                    crate::engine::value::JsValue::from_raw(raw).expect("internal Array element"),
+                )?;
+                Err(error.into())
+            }
+        }
     }
 
     pub(crate) fn new_string_iterator(
@@ -183,42 +244,50 @@ impl Runtime {
         Ok(ObjectRef::from_owned_handle(self.clone(), object))
     }
 
-    pub(crate) fn new_iterator_result(
+    /// A fresh result object copies the internal value handle into its data
+    /// slot; the consumed producer edge is released on every exit.
+    pub(crate) fn new_iterator_result_jsvalue(
         &self,
         realm: ContextId,
-        value: Value,
+        value: crate::engine::value::JsValue,
         done: bool,
     ) -> Result<ObjectRef, RuntimeError> {
-        #[cfg(test)]
-        {
-            let mut state = self.0.state.borrow_mut();
-            state.iterator_result_allocations = state
-                .iterator_result_allocations
-                .checked_add(1)
-                .expect("iterator-result allocation counter overflow");
-        }
-        let prototype_id = self.0.state.borrow().heap.context(realm)?.object_prototype;
-        let prototype = ObjectRef::from_borrowed_handle(self.clone(), prototype_id)?;
-        let result = self.new_object(Some(&prototype))?;
-        for (name, value) in [("value", value), ("done", Value::Bool(done))] {
-            let key = self.intern_property_key(name)?;
-            if !self.define_own_property(
-                &result,
-                &key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(true),
-                    enumerable: DescriptorField::Present(true),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )? {
-                return Err(RuntimeError::Invariant(
-                    "iterator result property definition was rejected",
-                ));
+        let outcome = (|| {
+            #[cfg(test)]
+            {
+                let mut state = self.0.state.borrow_mut();
+                state.iterator_result_allocations = state
+                    .iterator_result_allocations
+                    .checked_add(1)
+                    .expect("iterator-result allocation counter overflow");
             }
+            let prototype_id = self.0.state.borrow().heap.context(realm)?.object_prototype;
+            let prototype = ObjectRef::from_borrowed_handle(self.clone(), prototype_id)?;
+            let result = self.new_object(Some(&prototype))?;
+            for (name, stored) in [
+                ("value", &value),
+                ("done", &crate::engine::value::JsValue::Bool(done)),
+            ] {
+                let key = self.intern_property_key(name)?;
+                match self.define_selected_set_data(&result, &key, stored, false)? {
+                    crate::engine::object::operations::PropertyDefineOutcome::Defined(true) => {}
+                    _ => {
+                        return Err(RuntimeError::Invariant(
+                            "iterator result property definition was rejected",
+                        ));
+                    }
+                }
+            }
+            Ok(result)
+        })();
+        let released = self.release_jsvalue(value);
+        match outcome {
+            Ok(value) => {
+                released?;
+                Ok(value)
+            }
+            Err(error) => Err(error),
         }
-        Ok(result)
     }
 
     pub(crate) fn new_primitive_object(
@@ -228,6 +297,97 @@ impl Runtime {
         value: Value,
     ) -> Result<ObjectRef, RuntimeError> {
         self.new_primitive_object_with_string_length(prototype, kind, value, false)
+    }
+
+    /// Internal-value form of [`Runtime::new_primitive_object`]: consumes the
+    /// wrapper payload's edges after the wrapper has retained its own copies.
+    pub(crate) fn new_primitive_object_jsvalue(
+        &self,
+        prototype: &ObjectRef,
+        kind: PrimitiveKind,
+        value: JsValue,
+    ) -> Result<ObjectRef, RuntimeError> {
+        self.new_primitive_object_jsvalue_with_string_length(prototype, kind, value, false)
+    }
+
+    fn new_primitive_object_jsvalue_with_string_length(
+        &self,
+        prototype: &ObjectRef,
+        kind: PrimitiveKind,
+        mut value: JsValue,
+        length_configurable: bool,
+    ) -> Result<ObjectRef, RuntimeError> {
+        let result = (|| {
+            let _operation = self.operation();
+            if !prototype.belongs_to(self) {
+                return Err(RuntimeError::WrongRuntime("primitive prototype"));
+            }
+            // ToObject linearizes a rope before selecting its stored primitive.
+            // Keep flat inputs' exact ID; only a genuinely new flat representation
+            // receives a new arena node. Never replace a shared input node's payload.
+            let string_length = if let (PrimitiveKind::String, JsValue::String(id)) = (kind, &value)
+            {
+                let string = self.0.state.borrow().heap.string(*id)?.clone();
+                let flat = string.linearize();
+                let length = flat.len();
+                if !string.same_representation(&flat) {
+                    let normalized = self.into_jsvalue(Value::String(flat))?;
+                    let previous = std::mem::replace(&mut value, normalized);
+                    self.release_jsvalue(previous)?;
+                }
+                Some(length)
+            } else {
+                None
+            };
+            let (data, payload_atom) = {
+                let state = self.0.state.borrow();
+                match (kind, &value) {
+                    (PrimitiveKind::Number, JsValue::Int(value)) => {
+                        (PrimitiveObjectData::Number(f64::from(*value)), None)
+                    }
+                    (PrimitiveKind::Number, JsValue::Float(value)) => {
+                        (PrimitiveObjectData::Number(*value), None)
+                    }
+                    (PrimitiveKind::String, JsValue::String(id)) => {
+                        (PrimitiveObjectData::String(*id), None)
+                    }
+                    (PrimitiveKind::Boolean, JsValue::Bool(value)) => {
+                        (PrimitiveObjectData::Boolean(*value), None)
+                    }
+                    (PrimitiveKind::Symbol, JsValue::Symbol(index)) => {
+                        let atom = state.atoms.brand(*index)?;
+                        (PrimitiveObjectData::Symbol(atom), Some(atom))
+                    }
+                    (PrimitiveKind::BigInt, JsValue::ShortBigInt(value)) => {
+                        (PrimitiveObjectData::ShortBigInt(*value), None)
+                    }
+                    (PrimitiveKind::BigInt, JsValue::BigInt(id)) => {
+                        (PrimitiveObjectData::BigInt(*id), None)
+                    }
+                    _ => {
+                        return Err(RuntimeError::Invariant(
+                            "primitive wrapper class or payload is not implemented yet",
+                        ));
+                    }
+                }
+            };
+            // allocate_object retains payload edges transactionally via object_edges.
+            self.allocate_primitive_wrapper(
+                prototype,
+                data,
+                payload_atom,
+                string_length,
+                length_configurable,
+            )
+        })();
+        let released = self.release_jsvalue(value);
+        match result {
+            Err(error) => Err(error),
+            Ok(object) => {
+                released?;
+                Ok(object)
+            }
+        }
     }
 
     pub(crate) fn new_string_object(
@@ -264,38 +424,23 @@ impl Runtime {
             (_, value) => value,
         };
         self.validate_value_domain(&value, "primitive wrapper payload")?;
-        let string_length = match &value {
-            Value::String(value) if kind == PrimitiveKind::String => Some(value.len()),
-            _ => None,
-        };
-        // Match by reference so a unique local Symbol root remains alive
-        // until the wrapper has retained its own atom edge.
-        let (data, payload_atom) = match (kind, &value) {
-            (PrimitiveKind::Number, Value::Int(value)) => {
-                (PrimitiveObjectData::Number(f64::from(*value)), None)
-            }
-            (PrimitiveKind::Number, Value::Float(value)) => {
-                (PrimitiveObjectData::Number(*value), None)
-            }
-            (PrimitiveKind::String, Value::String(value)) => {
-                (PrimitiveObjectData::String(value.clone()), None)
-            }
-            (PrimitiveKind::Boolean, Value::Bool(value)) => {
-                (PrimitiveObjectData::Boolean(*value), None)
-            }
-            (PrimitiveKind::Symbol, Value::Symbol(value)) => {
-                let atom = value.atom();
-                (PrimitiveObjectData::Symbol(atom), Some(atom))
-            }
-            (PrimitiveKind::BigInt, Value::BigInt(value)) => {
-                (PrimitiveObjectData::BigInt(value.clone()), None)
-            }
-            _ => {
-                return Err(RuntimeError::Invariant(
-                    "primitive wrapper class or payload is not implemented yet",
-                ));
-            }
-        };
+        let value = self.into_jsvalue(value)?;
+        self.new_primitive_object_jsvalue_with_string_length(
+            prototype,
+            kind,
+            value,
+            string_length_configurable,
+        )
+    }
+
+    fn allocate_primitive_wrapper(
+        &self,
+        prototype: &ObjectRef,
+        data: PrimitiveObjectData,
+        payload_atom: Option<Atom>,
+        string_length: Option<usize>,
+        string_length_configurable: bool,
+    ) -> Result<ObjectRef, RuntimeError> {
         let mut state = self.0.state.borrow_mut();
         let shape = state.get_or_create_shape(Some(prototype.object_id()), &[])?;
         if let Some(atom) = payload_atom
@@ -320,10 +465,14 @@ impl Runtime {
                     return Err(error.into());
                 }
             };
-        let cleanup = state.heap.release_shape(shape)?;
-        state.apply_cleanup(cleanup)?;
+        let cleanup = state
+            .heap
+            .release_shape(shape)
+            .map_err(RuntimeError::from)
+            .and_then(|cleanup| state.apply_cleanup(cleanup));
         drop(state);
         let object = ObjectRef::from_owned_handle(self.clone(), object);
+        cleanup?;
         if let Some(length) = string_length {
             let length = i32::try_from(length)
                 .map(Value::Int)
@@ -457,35 +606,49 @@ impl Runtime {
         &self,
         realm: ContextId,
         target: &CallableRef,
-        this_value: &Value,
-        arguments: &[Value],
+        this_value: &JsValue,
+        arguments: &[JsValue],
     ) -> Result<CallableRef, RuntimeError> {
         let _operation = self.operation();
         if !target.belongs_to(self) {
             return Err(RuntimeError::WrongRuntime("bound function target"));
         }
-        self.validate_value_domain(this_value, "bound this value")?;
-        for argument in arguments {
-            self.validate_value_domain(argument, "bound function argument")?;
-        }
-
-        let raw_this = self.raw_property_value(this_value)?;
-        let raw_arguments = arguments
-            .iter()
-            .map(|argument| self.raw_property_value(argument))
-            .collect::<Result<Vec<_>, _>>()?;
+        // The object transaction retains each borrowed input edge exactly once.
+        let raw_this = this_value.as_raw();
+        let raw_arguments = arguments.iter().map(JsValue::as_raw).collect::<Vec<_>>();
         let is_constructor = self.is_constructor(target.as_object())?;
 
         let mut state = self.0.state.borrow_mut();
-        let function_prototype = state.heap.context(realm)?.function_prototype;
-        let shape = state.get_or_create_shape(Some(function_prototype), &[])?;
+        let shape = {
+            let created = match state
+                .heap
+                .context(realm)
+                .map(|context| context.function_prototype)
+                .map_err(RuntimeError::from)
+            {
+                Ok(prototype) => state.get_or_create_shape(Some(prototype), &[]),
+                Err(error) => Err(error),
+            };
+            match created {
+                Ok(shape) => shape,
+                Err(error) => {
+                    drop(state);
+                    return Err(error);
+                }
+            }
+        };
         let retained_atoms = match state
             .retain_raw_value_atoms(std::iter::once(&raw_this).chain(raw_arguments.iter()))
         {
             Ok(atoms) => atoms,
             Err(error) => {
-                let cleanup = state.heap.release_shape(shape)?;
-                state.apply_cleanup(cleanup)?;
+                let applied = state
+                    .heap
+                    .release_shape(shape)
+                    .map_err(RuntimeError::from)
+                    .and_then(|cleanup| state.apply_cleanup(cleanup));
+                drop(state);
+                applied?;
                 return Err(error);
             }
         };
@@ -499,15 +662,27 @@ impl Runtime {
         )) {
             Ok(object) => object,
             Err(error) => {
-                state.release_atoms(retained_atoms)?;
-                let cleanup = state.heap.release_shape(shape)?;
-                state.apply_cleanup(cleanup)?;
+                let released = state.release_atoms(retained_atoms);
+                let applied = state
+                    .heap
+                    .release_shape(shape)
+                    .map_err(RuntimeError::from)
+                    .and_then(|cleanup| state.apply_cleanup(cleanup));
+                drop(state);
+                released?;
+                applied?;
                 return Err(error.into());
             }
         };
-        let cleanup = state.heap.release_shape(shape)?;
-        state.apply_cleanup(cleanup)?;
+        let finalized = state
+            .heap
+            .release_shape(shape)
+            .map_err(RuntimeError::from)
+            .and_then(|cleanup| state.apply_cleanup(cleanup));
         drop(state);
+        // The bound function retained its own copy edges; the guards balance
+        // the boundary conversions' producer edges.
+        finalized?;
         Ok(CallableRef::from_validated_object(
             ObjectRef::from_owned_handle(self.clone(), object),
         ))
@@ -602,10 +777,51 @@ impl Runtime {
     /// handle failures remain explicit errors.
     pub fn as_callable(&self, object: &ObjectRef) -> Result<Option<CallableRef>, RuntimeError> {
         let _operation = self.operation();
-        if !self.object_has_call_capability(object)? {
+        // A public root may belong to another runtime whose arena assigned a
+        // numerically equal handle; promoting it here would manufacture a
+        // callable for an unrelated local object. Reject foreign roots before
+        // the id is interpreted in this runtime's heap.
+        if !object.belongs_to(self) {
+            return Err(RuntimeError::WrongRuntime("object"));
+        }
+        self.as_callable_object_after_operation(object.object_id())
+    }
+
+    /// Handle form of [`Runtime::as_callable`]; borrows the object's edge.
+    pub(crate) fn as_callable_object(
+        &self,
+        object: crate::engine::heap::ObjectId,
+    ) -> Result<Option<CallableRef>, RuntimeError> {
+        let _operation = self.operation();
+        self.as_callable_object_after_operation(object)
+    }
+
+    fn as_callable_object_after_operation(
+        &self,
+        object: crate::engine::heap::ObjectId,
+    ) -> Result<Option<CallableRef>, RuntimeError> {
+        if !self.object_id_has_call_capability(object)? {
             return Ok(None);
         }
-        Ok(Some(CallableRef::from_validated_object(object.clone())))
+        Ok(Some(CallableRef::from_validated_object(
+            ObjectRef::from_borrowed_handle(self.clone(), object)?,
+        )))
+    }
+
+    fn object_id_has_call_capability(
+        &self,
+        object: crate::engine::heap::ObjectId,
+    ) -> Result<bool, RuntimeError> {
+        Ok(matches!(
+            self.0.state.borrow().heap.object(object)?.payload,
+            crate::engine::heap::ObjectPayload::NativeFunction { .. }
+                | crate::engine::heap::ObjectPayload::BoundFunction { .. }
+                | crate::engine::heap::ObjectPayload::BytecodeFunction { .. }
+                | crate::engine::heap::ObjectPayload::Proxy(crate::engine::heap::ProxyData {
+                    is_callable: true,
+                    ..
+                })
+        ))
     }
 
     /// The inner error returns the unchanged non-callable owner so callers can
@@ -804,6 +1020,54 @@ mod owned_callable_tests {
     use crate::engine::vm::call::DirectCallTarget;
 
     #[test]
+    fn internal_array_adopts_edges_and_releases_rejected_input() {
+        use crate::engine::value::JsValue;
+        let runtime = Runtime::new();
+        let context = runtime.new_context();
+        let string = runtime
+            .into_jsvalue(Value::String(JsString::from_static("owned")))
+            .unwrap();
+        let JsValue::String(string_id) = &string else {
+            unreachable!()
+        };
+        let string_id = *string_id;
+        let before = runtime.heap_counts().string_nodes;
+        let array = runtime
+            .new_array_from_values_jsvalue(context.realm, vec![string])
+            .unwrap();
+        assert_eq!(runtime.heap_counts().string_nodes, before);
+        {
+            let state = runtime.0.state.borrow();
+            let stored = state
+                .heap
+                .object(array.object_id())
+                .unwrap()
+                .dense_array_value(0)
+                .unwrap();
+            assert!(matches!(stored, RawValue::String(id) if *id == string_id));
+        }
+        drop(array);
+        runtime.run_gc().unwrap();
+        assert!(runtime.0.state.borrow().heap.string(string_id).is_err());
+
+        let object = runtime.new_object(None).unwrap();
+        let rejected = runtime
+            .into_jsvalue(Value::String(JsString::from_static("rejected")))
+            .unwrap();
+        let JsValue::String(rejected_id) = &rejected else {
+            unreachable!()
+        };
+        let rejected_id = *rejected_id;
+        assert!(
+            runtime
+                .append_fresh_array_value_jsvalue(&object, rejected)
+                .is_err()
+        );
+        runtime.run_gc().unwrap();
+        assert!(runtime.0.state.borrow().heap.string(rejected_id).is_err());
+    }
+
+    #[test]
     fn owned_and_borrowed_callable_promotion_share_payload_rules() {
         let runtime = Runtime::new();
         let mut context = runtime.new_context();
@@ -871,6 +1135,37 @@ mod owned_callable_tests {
         assert!(matches!(
             runtime.direct_call_target_from_value(value).unwrap(),
             DirectCallTarget::Callable(_)
+        ));
+    }
+
+    #[test]
+    fn public_callable_promotion_rejects_foreign_matching_handles() {
+        let runtime = Runtime::new();
+        let foreign = Runtime::new();
+        let mut local_context = runtime.new_context();
+        let mut foreign_context = foreign.new_context();
+        let Value::Object(local) = local_context.eval("(function(){return 1})").unwrap() else {
+            panic!("local function");
+        };
+        let Value::Object(other) = foreign_context.eval("(function(){return 1})").unwrap() else {
+            panic!("foreign function");
+        };
+        assert_eq!(local.object_id(), other.object_id());
+        assert!(matches!(
+            runtime.as_callable(&other),
+            Err(RuntimeError::WrongRuntime("object"))
+        ));
+        assert!(
+            runtime
+                .as_callable(&local)
+                .unwrap()
+                .unwrap()
+                .belongs_to(&runtime)
+        );
+        let plain = foreign.new_object(None).unwrap();
+        assert!(matches!(
+            runtime.as_callable(&plain),
+            Err(RuntimeError::WrongRuntime("object"))
         ));
     }
 

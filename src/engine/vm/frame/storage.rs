@@ -173,6 +173,10 @@ impl CallStorage {
         }
     }
     pub(in crate::engine::vm) fn recycle(&mut self, mut cold: ColdFrame) {
+        cold.release_normalized_this();
+        cold.release_eval_arguments();
+        cold.release_resume_throw();
+        cold.release_constructor_return();
         let mut flags = std::mem::take(&mut cold.reusable_captured_locals);
         flags.clear();
 
@@ -187,7 +191,6 @@ impl CallStorage {
             rare.eval_arguments = None;
             rare.constructor_return = None;
             rare.conversion = None;
-            rare.normalized_this = None;
         }
 
         cold.window.0 = None;
@@ -211,6 +214,7 @@ impl CallStorage {
 mod tests {
     use crate::engine::api::profiling::CostProfile;
     use crate::engine::api::{Runtime, Value};
+    use crate::engine::value::JsValue;
 
     #[test]
     fn narrow_header_reuses_body_allocation_without_retaining_previous_owners() {
@@ -232,6 +236,7 @@ mod tests {
         let mut slots = SlotStore::new(16);
         let window = slots
             .push_frame(
+                &runtime,
                 &executable.frame_layout(),
                 FrameStorage {
                     original_arguments: Vec::new(),
@@ -244,15 +249,10 @@ mod tests {
         let function = runtime.new_object(None).unwrap();
         let id = function.object_id();
         cold.function = function.into();
-        cold.input = CallInput {
-            this_value: Value::Undefined,
-            new_target: Value::Undefined,
-            callee_global: None,
-        }
-        .into();
+        cold.input = CallInput::new(&runtime, JsValue::Undefined, JsValue::Undefined, None).into();
         cold.executable = executable.into();
         cold.window = window.into();
-        slots.clear_frame(cold.window.take()).unwrap();
+        slots.clear_frame(&runtime, cold.window.take()).unwrap();
         storage.recycle(cold);
         assert!(runtime.0.state.borrow().heap.object(id).is_err());
         let cached = &storage.empty_frames[0];
@@ -267,9 +267,13 @@ mod tests {
     fn repeated_calls_reuse_empty_buffers_at_stable_depth() {
         let runtime = Runtime::new();
         let mut context = runtime.new_context();
-        context
-            .eval("function inner(a,b){var c=a+b;return c} function outer(a){return inner(a,1)}")
-            .unwrap();
+        drop(
+            context
+                .eval(
+                    "function inner(a,b){var c=a+b;return c} function outer(a){return inner(a,1)}",
+                )
+                .unwrap(),
+        );
         let profile = CostProfile::start();
         assert_eq!(
             context
@@ -316,9 +320,11 @@ mod tests {
     fn repeated_deep_calls_reuse_the_peak_cold_capacity() {
         let runtime = Runtime::new();
         let mut context = runtime.new_context();
-        context
-            .eval("function descend(n){var marker=n;if(n)return descend(n-1);return marker}")
-            .unwrap();
+        drop(
+            context
+                .eval("function descend(n){var marker=n;if(n)return descend(n-1);return marker}")
+                .unwrap(),
+        );
         let profile = CostProfile::start();
         assert_eq!(
             context
@@ -335,7 +341,7 @@ mod tests {
     fn repeated_try_finally_calls_reuse_unwind_region_capacity() {
         let runtime = Runtime::new();
         let mut context = runtime.new_context();
-        context.eval("function guarded(n){try {if(n%2)throw n;return n;}catch(e){return e;}finally{n++;}}").unwrap();
+        drop(context.eval("function guarded(n){try {if(n%2)throw n;return n;}catch(e){return e;}finally{n++;}}").unwrap());
         let profile = CostProfile::start();
         assert_eq!(
             context
@@ -426,7 +432,7 @@ impl CallStorage {
 mod lazy_tests {
     use super::*;
     use crate::engine::api::Runtime;
-    use crate::engine::value::Value;
+    use crate::engine::value::{JsValue, Value};
     use crate::engine::vm::CallInput;
 
     #[test]
@@ -468,12 +474,7 @@ mod lazy_tests {
         let mut storage = CallStorage::default();
         storage.reserve().unwrap();
         let (mut cold, _) = storage.vacant(context.realm);
-        cold.input = CallInput {
-            this_value: Value::Undefined,
-            new_target: Value::Undefined,
-            callee_global: None,
-        }
-        .into();
+        cold.input = CallInput::new(&runtime, JsValue::Undefined, JsValue::Undefined, None).into();
         assert!(cold.rare.get().is_none());
         assert!(cold.input.callee_global.is_none());
         let expected = runtime.global_object_for_realm(context.realm).unwrap();

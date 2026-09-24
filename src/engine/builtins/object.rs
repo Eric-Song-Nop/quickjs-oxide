@@ -12,11 +12,10 @@ use crate::engine::builtins::native::{
 use crate::engine::heap::{ContextId, ObjectPayload, PrimitiveObjectData};
 use crate::engine::object::operations::{ArrayOwnKey, InternalDefineResult};
 use crate::engine::object::{
-    AccessorValue, CompleteOrdinaryPropertyDescriptor, DescriptorField, ObjectRef,
-    OrdinaryPropertyDescriptor, PropertyKey, SymbolRef,
+    AccessorValue, DescriptorField, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, SymbolRef,
 };
 use crate::engine::value::conversion::NativeConversion;
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
 
@@ -33,9 +32,9 @@ pub(super) mod string;
 mod tests;
 
 pub(crate) enum ObjectIteratorStep {
-    Yield(Value),
+    Yield(JsValue),
     Done,
-    Throw(Value),
+    Throw(JsValue),
 }
 
 impl Runtime {
@@ -66,18 +65,20 @@ impl Runtime {
         arguments: &NativeArguments,
         element_limit: u64,
     ) -> Result<Completion, RuntimeError> {
-        iteration::finish(
-            self,
-            realm,
-            iteration::IterationStep::start_with_limit(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            iteration::finish(
                 self,
                 realm,
-                iteration::IterationKind::Group,
-                &invocation,
-                arguments,
-                element_limit,
-            )?,
-        )
+                iteration::IterationStep::start_with_limit(
+                    self,
+                    realm,
+                    iteration::IterationKind::Group,
+                    invocation,
+                    arguments,
+                    element_limit,
+                )?,
+            )
+        })
     }
 
     /// QuickJS `js_object_fromEntries`.
@@ -94,17 +95,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        iteration::finish(
-            self,
-            realm,
-            iteration::IterationStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            iteration::finish(
                 self,
                 realm,
-                iteration::IterationKind::Entries,
-                &invocation,
-                arguments,
-            )?,
-        )
+                iteration::IterationStep::start(
+                    self,
+                    realm,
+                    iteration::IterationKind::Entries,
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     /// QuickJS `js_object_hasOwn`.
@@ -119,17 +122,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        predicate::finish(
-            self,
-            realm,
-            predicate::PredicateStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            predicate::finish(
                 self,
                 realm,
-                predicate::PredicateKind::HasOwn,
-                &invocation,
-                arguments,
-            )?,
-        )
+                predicate::PredicateStep::start(
+                    self,
+                    realm,
+                    predicate::PredicateKind::HasOwn,
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn initialize_object_prototype_intrinsics(
@@ -407,10 +412,11 @@ impl Runtime {
         // fallback and before reading @@toStringTag. That unwraps every Proxy
         // layer and makes revocation observable even when the handler would
         // otherwise provide a custom tag.
-        let is_array = match self.internal_is_array(realm, &Value::Object(object.clone()))? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(NativeConversion::Throw(value)),
-        };
+        let is_array =
+            match self.internal_is_array_jsvalue(realm, &JsValue::Object(object.object_id()))? {
+                NativeConversion::Value(value) => value,
+                NativeConversion::Throw(value) => return Ok(NativeConversion::Throw(value)),
+            };
         let default_tag = if is_array {
             JsString::from_static("Array")
         } else {
@@ -438,7 +444,7 @@ impl Runtime {
                 // BigInt-wrapper case. Their standard tags come exclusively
                 // from inherited configurable @@toStringTag properties.
                 ObjectPayload::Primitive(
-                    PrimitiveObjectData::Symbol(_) | PrimitiveObjectData::BigInt(_),
+                    PrimitiveObjectData::Symbol(_) | PrimitiveObjectData::BigInt(_) | PrimitiveObjectData::ShortBigInt(_),
                 ) => JsString::from_static("Object"),
                 ObjectPayload::Array { .. } => JsString::from_static("Array"),
                 ObjectPayload::Arguments { .. } => JsString::from_static("Arguments"),
@@ -485,16 +491,18 @@ impl Runtime {
         realm: ContextId,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        string::finish(
-            self,
-            realm,
-            string::ObjectStringStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            string::finish(
                 self,
                 realm,
-                string::ObjectStringKind::Tag,
-                &invocation,
-            )?,
-        )
+                string::ObjectStringStep::start(
+                    self,
+                    realm,
+                    string::ObjectStringKind::Tag,
+                    invocation,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_object_prototype_to_locale_string(
@@ -502,16 +510,18 @@ impl Runtime {
         realm: ContextId,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        string::finish(
-            self,
-            realm,
-            string::ObjectStringStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            string::finish(
                 self,
                 realm,
-                string::ObjectStringKind::Locale,
-                &invocation,
-            )?,
-        )
+                string::ObjectStringStep::start(
+                    self,
+                    realm,
+                    string::ObjectStringKind::Locale,
+                    invocation,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_object_prototype_value_of(
@@ -525,41 +535,48 @@ impl Runtime {
             ));
         };
         match this_value {
-            value @ Value::Object(_) => Ok(Completion::Return(value)),
-            Value::Undefined | Value::Null => Ok(Completion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Type,
-                "cannot convert to object",
-            )?)),
-            value @ Value::Bool(_) => {
+            value @ JsValue::Object(_) => Ok(Completion::Return(value)),
+            JsValue::Undefined | JsValue::Null => {
+                Ok(Completion::Throw(self.new_native_error_jsvalue(
+                    realm,
+                    NativeErrorKind::Type,
+                    "cannot convert to object",
+                )?))
+            }
+            value @ JsValue::Bool(_) => {
                 let prototype =
                     self.primitive_prototype_for_realm(realm, PrimitiveKind::Boolean)?;
-                Ok(Completion::Return(Value::Object(
-                    self.new_primitive_object(&prototype, PrimitiveKind::Boolean, value)?,
+                Ok(Completion::Return(JsValue::Object(
+                    self.new_primitive_object_jsvalue(&prototype, PrimitiveKind::Boolean, value)?
+                        .into_handle(),
                 )))
             }
-            value @ (Value::Int(_) | Value::Float(_)) => {
+            value @ (JsValue::Int(_) | JsValue::Float(_)) => {
                 let prototype = self.primitive_prototype_for_realm(realm, PrimitiveKind::Number)?;
-                Ok(Completion::Return(Value::Object(
-                    self.new_primitive_object(&prototype, PrimitiveKind::Number, value)?,
+                Ok(Completion::Return(JsValue::Object(
+                    self.new_primitive_object_jsvalue(&prototype, PrimitiveKind::Number, value)?
+                        .into_handle(),
                 )))
             }
-            value @ Value::String(_) => {
+            value @ JsValue::String(_) => {
                 let prototype = self.primitive_prototype_for_realm(realm, PrimitiveKind::String)?;
-                Ok(Completion::Return(Value::Object(
-                    self.new_primitive_object(&prototype, PrimitiveKind::String, value)?,
+                Ok(Completion::Return(JsValue::Object(
+                    self.new_primitive_object_jsvalue(&prototype, PrimitiveKind::String, value)?
+                        .into_handle(),
                 )))
             }
-            value @ Value::BigInt(_) => {
+            value @ (JsValue::BigInt(_) | JsValue::ShortBigInt(_)) => {
                 let prototype = self.primitive_prototype_for_realm(realm, PrimitiveKind::BigInt)?;
-                Ok(Completion::Return(Value::Object(
-                    self.new_primitive_object(&prototype, PrimitiveKind::BigInt, value)?,
+                Ok(Completion::Return(JsValue::Object(
+                    self.new_primitive_object_jsvalue(&prototype, PrimitiveKind::BigInt, value)?
+                        .into_handle(),
                 )))
             }
-            value @ Value::Symbol(_) => {
+            value @ JsValue::Symbol(_) => {
                 let prototype = self.primitive_prototype_for_realm(realm, PrimitiveKind::Symbol)?;
-                Ok(Completion::Return(Value::Object(
-                    self.new_primitive_object(&prototype, PrimitiveKind::Symbol, value)?,
+                Ok(Completion::Return(JsValue::Object(
+                    self.new_primitive_object_jsvalue(&prototype, PrimitiveKind::Symbol, value)?
+                        .into_handle(),
                 )))
             }
         }
@@ -571,11 +588,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        constructor::finish(
-            self,
-            realm,
-            constructor::ObjectConstructorStep::start(self, realm, &invocation, arguments)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            constructor::finish(
+                self,
+                realm,
+                constructor::ObjectConstructorStep::start(self, realm, invocation, arguments)?,
+            )
+        })
     }
 
     pub(crate) fn call_object_create(
@@ -584,11 +603,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object definitions did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         definitions::finish(
             self,
             realm,
@@ -607,11 +628,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object.getPrototypeOf did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         prototype::finish(
             self,
             realm,
@@ -629,14 +652,14 @@ impl Runtime {
         realm: ContextId,
         object: &ObjectRef,
         result: NativeConversion<bool>,
-    ) -> Result<Option<Value>, RuntimeError> {
+    ) -> Result<Option<JsValue>, RuntimeError> {
         match result {
             NativeConversion::Value(true) => return Ok(None),
             NativeConversion::Throw(value) => return Ok(Some(value)),
             NativeConversion::Value(false) => {}
         }
         if self.is_proxy_object(object)? {
-            return Ok(Some(self.new_native_error(
+            return Ok(Some(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "proxy: bad prototype",
@@ -654,7 +677,7 @@ impl Runtime {
         } else {
             "circular prototype chain"
         };
-        Ok(Some(self.new_native_error(
+        Ok(Some(self.new_native_error_jsvalue(
             realm,
             NativeErrorKind::Type,
             message,
@@ -667,11 +690,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object.setPrototypeOf did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         prototype::finish(
             self,
             realm,
@@ -689,7 +714,7 @@ impl Runtime {
         realm: ContextId,
         object: &ObjectRef,
         key: &PropertyKey,
-    ) -> Result<Value, RuntimeError> {
+    ) -> Result<JsValue, RuntimeError> {
         if let ArrayOwnKey::Index(index) = self.array_own_key(object, key)? {
             let (length, writable) = self.array_length_state(object)?;
             if index >= length && !writable {
@@ -697,7 +722,11 @@ impl Runtime {
                     self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Length)?;
                 let error =
                     self.native_atom_error(ErrorKind::Type, "'", &length, "' is read-only")?;
-                return self.new_native_error_from_error(realm, NativeErrorKind::Type, &error);
+                return self.new_native_error_from_error_jsvalue(
+                    realm,
+                    NativeErrorKind::Type,
+                    &error,
+                );
             }
         }
         let message = if !self.has_own_property(object, key)? && !self.is_extensible(object)? {
@@ -705,7 +734,7 @@ impl Runtime {
         } else {
             "property is not configurable"
         };
-        self.new_native_error(realm, NativeErrorKind::Type, message)
+        self.new_native_error_jsvalue(realm, NativeErrorKind::Type, message)
     }
 
     fn finish_define_property_or_throw(
@@ -713,11 +742,11 @@ impl Runtime {
         realm: ContextId,
         key: &PropertyKey,
         result: NativeConversion<InternalDefineResult>,
-    ) -> Result<Option<Value>, RuntimeError> {
+    ) -> Result<Option<JsValue>, RuntimeError> {
         match result {
             NativeConversion::Value(InternalDefineResult::Defined) => Ok(None),
             NativeConversion::Value(InternalDefineResult::RejectedProxyTrap) => self
-                .new_native_error(
+                .new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "proxy: defineProperty exception",
@@ -736,11 +765,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object property method did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         property::finish(
             self,
             realm,
@@ -759,11 +790,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object definitions did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         definitions::finish(
             self,
             realm,
@@ -783,11 +816,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object enumeration did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         property::finish(
             self,
             realm,
@@ -807,11 +842,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object enumeration did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         property::finish(
             self,
             realm,
@@ -828,24 +865,24 @@ impl Runtime {
         &self,
         array: &ObjectRef,
         index: u32,
-        value: Value,
+        value: JsValue,
         rejection: &'static str,
     ) -> Result<(), RuntimeError> {
-        let key = self.intern_property_key(&index.to_string())?;
-        if !self.define_own_property(
-            array,
-            &key,
-            &OrdinaryPropertyDescriptor {
-                value: DescriptorField::Present(value),
-                writable: DescriptorField::Present(true),
-                enumerable: DescriptorField::Present(true),
-                configurable: DescriptorField::Present(true),
-                ..OrdinaryPropertyDescriptor::new()
-            },
-        )? {
-            return Err(RuntimeError::Invariant(rejection));
+        let outcome = (|| {
+            let key = self.property_key_for_index(u64::from(index))?;
+            self.define_selected_set_data(array, &key, &value, false)
+        })();
+        self.release_jsvalue(value)?;
+        match outcome? {
+            crate::engine::object::operations::PropertyDefineOutcome::Defined(true) => Ok(()),
+            crate::engine::object::operations::PropertyDefineOutcome::Defined(false) => {
+                Err(RuntimeError::Invariant(rejection))
+            }
+            crate::engine::object::operations::PropertyDefineOutcome::Throw(value) => {
+                self.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant(rejection))
+            }
         }
-        Ok(())
     }
 
     pub(crate) fn call_object_extensibility(
@@ -855,11 +892,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object extensibility method did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         let kind = match kind {
             ObjectExtensibilityKind::IsExtensible => property::PropertyKind::ObjectExtensible,
             ObjectExtensibilityKind::PreventExtensions => property::PropertyKind::ObjectPrevent,
@@ -887,70 +926,86 @@ impl Runtime {
         &self,
         object: &ObjectRef,
         key: &PropertyKey,
-        value: Value,
+        value: JsValue,
         rejection: &'static str,
     ) -> Result<(), RuntimeError> {
-        if !self.define_own_property(
-            object,
-            key,
-            &OrdinaryPropertyDescriptor {
-                value: DescriptorField::Present(value),
-                writable: DescriptorField::Present(true),
-                enumerable: DescriptorField::Present(true),
-                configurable: DescriptorField::Present(true),
-                ..OrdinaryPropertyDescriptor::new()
-            },
-        )? {
-            return Err(RuntimeError::Invariant(rejection));
+        let outcome = self.define_selected_set_data(object, key, &value, false);
+        self.release_jsvalue(value)?;
+        match outcome? {
+            crate::engine::object::operations::PropertyDefineOutcome::Defined(true) => Ok(()),
+            crate::engine::object::operations::PropertyDefineOutcome::Defined(false) => {
+                Err(RuntimeError::Invariant(rejection))
+            }
+            crate::engine::object::operations::PropertyDefineOutcome::Throw(value) => {
+                self.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant(rejection))
+            }
         }
-        Ok(())
     }
 
     fn complete_descriptor_to_object(
         &self,
         realm: ContextId,
-        descriptor: CompleteOrdinaryPropertyDescriptor,
+        descriptor: crate::engine::object::OwnedCompletePropertyDescriptor,
     ) -> Result<ObjectRef, RuntimeError> {
+        use crate::engine::object::property::CompletePropertyDescriptor;
         let object = self.new_ordinary_object_in_realm(realm)?;
-        let mut fields = Vec::with_capacity(4);
-        match descriptor {
-            CompleteOrdinaryPropertyDescriptor::Data {
+        // The reply owner keeps all borrowed field handles live while stores retain them.
+        let fields = match descriptor.record() {
+            CompletePropertyDescriptor::Data {
                 value,
                 writable,
                 enumerable,
                 configurable,
-            } => {
-                fields.push(("value", value));
-                fields.push(("writable", Value::Bool(writable)));
-                fields.push(("enumerable", Value::Bool(enumerable)));
-                fields.push(("configurable", Value::Bool(configurable)));
-            }
-            CompleteOrdinaryPropertyDescriptor::Accessor {
+            } => [
+                (
+                    "value",
+                    JsValue::from_raw(value.clone())
+                        .expect("descriptor contains initialized values"),
+                ),
+                ("writable", JsValue::Bool(*writable)),
+                ("enumerable", JsValue::Bool(*enumerable)),
+                ("configurable", JsValue::Bool(*configurable)),
+            ],
+            CompletePropertyDescriptor::Accessor {
                 get,
                 set,
                 enumerable,
                 configurable,
-            } => {
-                fields.push((
+            } => [
+                (
                     "get",
-                    get.map_or(Value::Undefined, |value| Value::Object(value.into_object())),
-                ));
-                fields.push((
+                    get.as_ref().map_or(JsValue::Undefined, |value| {
+                        JsValue::from_raw(value.clone())
+                            .expect("descriptor contains initialized values")
+                    }),
+                ),
+                (
                     "set",
-                    set.map_or(Value::Undefined, |value| Value::Object(value.into_object())),
-                ));
-                fields.push(("enumerable", Value::Bool(enumerable)));
-                fields.push(("configurable", Value::Bool(configurable)));
-            }
-        }
+                    set.as_ref().map_or(JsValue::Undefined, |value| {
+                        JsValue::from_raw(value.clone())
+                            .expect("descriptor contains initialized values")
+                    }),
+                ),
+                ("enumerable", JsValue::Bool(*enumerable)),
+                ("configurable", JsValue::Bool(*configurable)),
+            ],
+        };
         for (name, value) in fields {
             let key = self.intern_property_key(name)?;
-            self.define_fresh_object_descriptor_property(
-                &object,
-                &key,
-                value,
-                "fresh property descriptor object rejected a field",
-            )?;
+            if !match self.define_selected_set_data(&object, &key, &value, false)? {
+                crate::engine::object::operations::PropertyDefineOutcome::Defined(defined) => {
+                    defined
+                }
+                crate::engine::object::operations::PropertyDefineOutcome::Throw(value) => {
+                    self.release_jsvalue(value)?;
+                    false
+                }
+            } {
+                return Err(RuntimeError::Invariant(
+                    "fresh property descriptor object rejected a field",
+                ));
+            }
         }
         Ok(object)
     }
@@ -961,11 +1016,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object property method did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         property::finish(
             self,
             realm,
@@ -1003,11 +1060,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object enumeration did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         property::finish(
             self,
             realm,
@@ -1025,11 +1084,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object.is did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         let left = arguments
             .readable
             .first()
@@ -1038,7 +1099,12 @@ impl Runtime {
             .readable
             .get(1)
             .ok_or(RuntimeError::Invariant("Object.is rhs argv was not padded"))?;
-        Ok(Completion::Return(Value::Bool(left.same_value(right))))
+        let equal = crate::engine::value::collection_key::same_value(
+            &self.0.state.borrow().heap,
+            &left.as_raw(),
+            &right.as_raw(),
+        );
+        Ok(Completion::Return(JsValue::Bool(equal)))
     }
 
     pub(crate) fn call_object_assign(
@@ -1047,11 +1113,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object.assign did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         property::finish(
             self,
             realm,
@@ -1066,11 +1134,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Object integrity method did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         property::finish(
             self,
             realm,
@@ -1089,17 +1159,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        predicate::finish(
-            self,
-            realm,
-            predicate::PredicateStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            predicate::finish(
                 self,
                 realm,
-                predicate::PredicateKind::PrototypeHasOwn,
-                &invocation,
-                arguments,
-            )?,
-        )
+                predicate::PredicateStep::start(
+                    self,
+                    realm,
+                    predicate::PredicateKind::PrototypeHasOwn,
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_object_prototype_property_is_enumerable(
@@ -1108,17 +1180,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        predicate::finish(
-            self,
-            realm,
-            predicate::PredicateStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            predicate::finish(
                 self,
                 realm,
-                predicate::PredicateKind::Enumerable,
-                &invocation,
-                arguments,
-            )?,
-        )
+                predicate::PredicateStep::start(
+                    self,
+                    realm,
+                    predicate::PredicateKind::Enumerable,
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_object_prototype_is_prototype_of(
@@ -1127,17 +1201,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        prototype::finish(
-            self,
-            realm,
-            prototype::BuiltinPrototypeStep::start_invocation(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            prototype::finish(
                 self,
                 realm,
-                prototype::BuiltinPrototypeKind::IsPrototype,
-                &invocation,
-                arguments,
-            )?,
-        )
+                prototype::BuiltinPrototypeStep::start_invocation(
+                    self,
+                    realm,
+                    prototype::BuiltinPrototypeKind::IsPrototype,
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_object_prototype_proto_getter(
@@ -1145,20 +1221,22 @@ impl Runtime {
         realm: ContextId,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        prototype::finish(
-            self,
-            realm,
-            prototype::BuiltinPrototypeStep::start_invocation(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            prototype::finish(
                 self,
                 realm,
-                prototype::BuiltinPrototypeKind::Getter,
-                &invocation,
-                &NativeArguments {
-                    actual_arg_count: 0,
-                    readable: Vec::new(),
-                },
-            )?,
-        )
+                prototype::BuiltinPrototypeStep::start_invocation(
+                    self,
+                    realm,
+                    prototype::BuiltinPrototypeKind::Getter,
+                    invocation,
+                    &NativeArguments {
+                        actual_arg_count: 0,
+                        readable: Vec::new(),
+                    },
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_object_prototype_proto_setter(
@@ -1167,17 +1245,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        prototype::finish(
-            self,
-            realm,
-            prototype::BuiltinPrototypeStep::start_invocation(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            prototype::finish(
                 self,
                 realm,
-                prototype::BuiltinPrototypeKind::Setter,
-                &invocation,
-                arguments,
-            )?,
-        )
+                prototype::BuiltinPrototypeStep::start_invocation(
+                    self,
+                    realm,
+                    prototype::BuiltinPrototypeKind::Setter,
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_object_prototype_define_accessor(
@@ -1187,17 +1267,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        predicate::finish(
-            self,
-            realm,
-            predicate::PredicateStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            predicate::finish(
                 self,
                 realm,
-                predicate::PredicateKind::Define(kind),
-                &invocation,
-                arguments,
-            )?,
-        )
+                predicate::PredicateStep::start(
+                    self,
+                    realm,
+                    predicate::PredicateKind::Define(kind),
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_object_prototype_lookup_accessor(
@@ -1207,17 +1289,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        predicate::finish(
-            self,
-            realm,
-            predicate::PredicateStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            predicate::finish(
                 self,
                 realm,
-                predicate::PredicateKind::Lookup(kind),
-                &invocation,
-                arguments,
-            )?,
-        )
+                predicate::PredicateStep::start(
+                    self,
+                    realm,
+                    predicate::PredicateKind::Lookup(kind),
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 }
 

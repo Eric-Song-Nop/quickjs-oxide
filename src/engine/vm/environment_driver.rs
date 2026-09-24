@@ -3,11 +3,14 @@ use super::driver::CallStep;
 use super::environment_bindings::operation::EnvironmentStep;
 use super::frame::ReturnValue;
 use super::{
-    Completion, exception::runtime_error_to_vm_error, execution::RunningExecution, frame::FrameId,
+    Completion,
+    exception::{heap_error_to_vm_error, runtime_error_to_vm_error},
+    execution::RunningExecution,
+    frame::FrameId,
 };
 use crate::engine::api::{error::Error, runtime::Runtime};
 use crate::engine::code::bytecode::{DynamicEnvironmentSource, EvalVariableSource};
-use crate::engine::value::{Value, conversion::NativeConversion};
+use crate::engine::value::{JsValue, Value, conversion::NativeConversion};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WriteTarget {
@@ -70,7 +73,7 @@ pub(super) fn try_global_own_read(
     executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
     roots: &super::closure::ClosureSlots,
     index: u16,
-) -> Result<Option<Value>, Error> {
+) -> Result<Option<JsValue>, Error> {
     use crate::engine::code::function::metadata::ClosureVariableName;
     let Some(descriptor) = executable.closure_variables.get(usize::from(index)) else {
         return Ok(None);
@@ -132,7 +135,7 @@ pub(super) fn step(
                 } else {
                     execution
                         .slots
-                        .push(&mut frame.window, Value::Bool(false))?;
+                        .push(&mut frame.window, JsValue::Bool(false))?;
                 }
             }
             Operation::GlobalReference(index) => {
@@ -144,9 +147,15 @@ pub(super) fn step(
                     &frame.cold.closure_slots,
                     index,
                 )? {
-                    GlobalReference::Lexical(object) => execution
-                        .slots
-                        .push(&mut frame.window, Value::Object(object))?,
+                    GlobalReference::Lexical(object) => {
+                        let id = object.object_id();
+                        runtime
+                            .retain_object_handle(id)
+                            .map_err(heap_error_to_vm_error)?;
+                        execution
+                            .slots
+                            .push(&mut frame.window, JsValue::Object(id))?
+                    }
                     GlobalReference::Object { object, key } => {
                         query = Some((
                             EnvironmentStep::reference(realm, object, key),
@@ -194,8 +203,14 @@ pub(super) fn step(
                         &frame.cold.closure_slots,
                     )?,
                     WriteTarget::Reference => match execution.slots.peek(&frame.window, 1)? {
-                        Value::Object(object) if object.belongs_to(runtime) => object.clone(),
-                        Value::Undefined if strict => {
+                        JsValue::Object(object) => {
+                            crate::engine::object::ObjectRef::from_borrowed_handle(
+                                runtime.clone(),
+                                *object,
+                            )
+                            .map_err(heap_error_to_vm_error)?
+                        }
+                        JsValue::Undefined if strict => {
                             return Err(runtime
                                 .native_atom_error(
                                     crate::engine::api::ErrorKind::Reference,
@@ -205,7 +220,7 @@ pub(super) fn step(
                                 )
                                 .map_err(runtime_error_to_vm_error)?);
                         }
-                        Value::Undefined => runtime
+                        JsValue::Undefined => runtime
                             .global_object_for_realm(realm)
                             .map_err(runtime_error_to_vm_error)?,
                         _ => return Err(Error::internal("invalid dynamic reference base")),
@@ -213,7 +228,10 @@ pub(super) fn step(
                 };
                 let value = execution.slots.pop(&mut frame.window)?;
                 if matches!(source, WriteTarget::Reference) {
-                    execution.slots.pop(&mut frame.window)?;
+                    let base = execution.slots.pop(&mut frame.window)?;
+                    runtime
+                        .release_jsvalue(base)
+                        .map_err(runtime_error_to_vm_error)?;
                 }
                 let step = if check_presence {
                     EnvironmentStep::put(
@@ -232,7 +250,7 @@ pub(super) fn step(
 
             Operation::Define { source, name } => {
                 use crate::engine::object::{
-                    DescriptorField, OrdinaryPropertyDescriptor, operations::PropertyDefineOutcome,
+                    OwnedPropertyDescriptor, operations::PropertyDefineOutcome,
                 };
                 let object = super::environment_bindings::eval_variable_object(
                     runtime,
@@ -257,21 +275,11 @@ pub(super) fn step(
                 }
                 let key = linked_key(runtime, &frame.executable, name)?;
                 let value = execution.slots.pop(&mut frame.window)?;
-                match runtime
-                    .define_own_property_in_realm(
-                        Some(realm),
-                        &object,
-                        &key,
-                        &OrdinaryPropertyDescriptor {
-                            value: DescriptorField::Present(value),
-                            writable: DescriptorField::Present(true),
-                            enumerable: DescriptorField::Present(true),
-                            configurable: DescriptorField::Present(true),
-                            ..OrdinaryPropertyDescriptor::new()
-                        },
-                    )
-                    .map_err(runtime_error_to_vm_error)?
-                {
+                let descriptor = OwnedPropertyDescriptor::data(runtime, value);
+                let defined = runtime
+                    .define_owned_property_in_realm(Some(realm), &object, &key, &descriptor)
+                    .map_err(runtime_error_to_vm_error)?;
+                match defined {
                     PropertyDefineOutcome::Defined(true) => {}
                     PropertyDefineOutcome::Defined(false) => {
                         return Err(Error::new(
@@ -317,9 +325,15 @@ pub(super) fn step(
                 } else {
                     let object = match op {
                         Operation::ReadReference { name, .. } => {
-                            let object = match execution.slots.peek(&frame.window, 0)? {
-                                Value::Object(object) => object,
-                                Value::Undefined => {
+                            match execution.slots.peek(&frame.window, 0)? {
+                                JsValue::Object(object) => {
+                                    crate::engine::object::ObjectRef::from_borrowed_handle(
+                                        runtime.clone(),
+                                        *object,
+                                    )
+                                    .map_err(heap_error_to_vm_error)?
+                                }
+                                JsValue::Undefined => {
                                     let key = linked_key(runtime, &frame.executable, name)?;
                                     return Err(runtime
                                         .native_atom_error(
@@ -331,13 +345,7 @@ pub(super) fn step(
                                         .map_err(runtime_error_to_vm_error)?);
                                 }
                                 _ => return Err(Error::internal("invalid dynamic reference base")),
-                            };
-                            if !object.belongs_to(runtime) {
-                                return Err(Error::internal(
-                                    "dynamic reference base belongs to another runtime",
-                                ));
                             }
-                            object.clone()
                         }
                         Operation::Object(source) | Operation::Get { source, .. } => {
                             super::environment_bindings::dynamic_object(
@@ -351,7 +359,11 @@ pub(super) fn step(
                         _ => unreachable!(),
                     };
                     if matches!(op, Operation::Object(_)) {
-                        BindingRead::Value(Value::Object(object))
+                        let id = object.object_id();
+                        runtime
+                            .retain_object_handle(id)
+                            .map_err(heap_error_to_vm_error)?;
+                        BindingRead::Value(JsValue::Object(id))
                     } else {
                         read_binding(runtime, &frame.executable, &object, op)?
                     }
@@ -374,19 +386,27 @@ pub(super) fn step(
                 }
                 values.reverse();
                 let array = runtime
-                    .new_array_from_values(realm, values)
+                    .new_array_from_values_jsvalue(realm, values)
                     .map_err(runtime_error_to_vm_error)?;
+                let id = array.object_id();
+                runtime
+                    .retain_object_handle(id)
+                    .map_err(heap_error_to_vm_error)?;
                 execution
                     .slots
-                    .push(&mut frame.window, Value::Object(array))?;
+                    .push(&mut frame.window, JsValue::Object(id))?;
             }
             Operation::CreateObject => {
                 let object = runtime
                     .new_ordinary_object_in_realm(realm)
                     .map_err(runtime_error_to_vm_error)?;
+                let id = object.object_id();
+                runtime
+                    .retain_object_handle(id)
+                    .map_err(heap_error_to_vm_error)?;
                 execution
                     .slots
-                    .push(&mut frame.window, Value::Object(object))?;
+                    .push(&mut frame.window, JsValue::Object(id))?;
             }
             Operation::CreateVariable => {
                 if frame
@@ -403,19 +423,29 @@ pub(super) fn step(
                 let object = runtime
                     .new_object(None)
                     .map_err(runtime_error_to_vm_error)?;
+                let id = object.object_id();
+                runtime
+                    .retain_object_handle(id)
+                    .map_err(heap_error_to_vm_error)?;
                 execution
                     .slots
-                    .push(&mut frame.window, Value::Object(object))?;
+                    .push(&mut frame.window, JsValue::Object(id))?;
             }
             Operation::ToObject => {
                 let value = execution.slots.pop(&mut frame.window)?;
                 match runtime
-                    .native_to_object(realm, value)
+                    .native_to_object_jsvalue(realm, value)
                     .map_err(runtime_error_to_vm_error)?
                 {
-                    NativeConversion::Value(object) => execution
-                        .slots
-                        .push(&mut frame.window, Value::Object(object))?,
+                    NativeConversion::Value(object) => {
+                        let id = object.object_id();
+                        runtime
+                            .retain_object_handle(id)
+                            .map_err(heap_error_to_vm_error)?;
+                        execution
+                            .slots
+                            .push(&mut frame.window, JsValue::Object(id))?
+                    }
                     NativeConversion::Throw(value) => {
                         return Ok(CallStep::Complete(Completion::Throw(value)));
                     }
@@ -470,7 +500,7 @@ pub(super) fn step(
             };
             Ok(CallStep::Complete(Completion::Throw(
                 runtime
-                    .new_native_error_from_error(realm, kind, &error)
+                    .new_native_error_from_error_jsvalue(realm, kind, &error)
                     .map_err(runtime_error_to_vm_error)?,
             )))
         }
@@ -478,10 +508,10 @@ pub(super) fn step(
 }
 
 enum BindingRead {
-    Value(Value),
+    Value(JsValue),
     Getter {
         getter: crate::engine::object::CallableRef,
-        receiver: Value,
+        receiver: JsValue,
     },
     Query(EnvironmentStep),
 }
@@ -533,7 +563,13 @@ fn read_binding(
                     "lexical reference lost its data descriptor",
                 ));
             };
-            return Ok(BindingRead::Value(value));
+            // The descriptor root transfers into the internal value without a
+            // retain/release pair.
+            return Ok(BindingRead::Value(
+                runtime
+                    .into_jsvalue(value)
+                    .map_err(runtime_error_to_vm_error)?,
+            ));
         }
     }
     Ok(BindingRead::Query(EnvironmentStep::get(
@@ -598,13 +634,23 @@ pub(super) fn prepare_environment_read(
         .map_err(runtime_error_to_vm_error)?
     {
         Some(CompleteOrdinaryPropertyDescriptor::Data { value, .. }) => {
-            Ok(OrdinaryRead::Complete(Some(value)))
+            Ok(OrdinaryRead::Complete(Some(
+                // The descriptor root transfers without a retain/release pair.
+                runtime
+                    .into_jsvalue(value)
+                    .map_err(runtime_error_to_vm_error)?,
+            )))
         }
         Some(CompleteOrdinaryPropertyDescriptor::Accessor {
             get: Some(getter), ..
-        }) => Ok(OrdinaryRead::Call { getter, receiver }),
+        }) => Ok(OrdinaryRead::Call {
+            getter,
+            receiver: runtime
+                .into_jsvalue(receiver)
+                .map_err(runtime_error_to_vm_error)?,
+        }),
         Some(CompleteOrdinaryPropertyDescriptor::Accessor { get: None, .. }) => {
-            Ok(OrdinaryRead::Complete(Some(Value::Undefined)))
+            Ok(OrdinaryRead::Complete(Some(JsValue::Undefined)))
         }
         None => match runtime
             .get_prototype_of(object)
@@ -654,8 +700,10 @@ fn read_global_binding(
         .raw_var_ref_value(&root)
         .map_err(runtime_error_to_vm_error)?;
     if !matches!(value, RawValue::Uninitialized) {
+        let value = JsValue::from_raw(value)
+            .ok_or_else(|| Error::internal("global cell held an internal value sentinel"))?;
         return runtime
-            .root_raw_value(&value)
+            .dup_jsvalue(&value)
             .map(BindingRead::Value)
             .map_err(runtime_error_to_vm_error);
     }
@@ -684,11 +732,12 @@ fn read_global_binding(
                 "' is not defined",
             )
             .map_err(runtime_error_to_vm_error)?),
-        OrdinaryRead::Complete(None) => Ok(BindingRead::Value(Value::Undefined)),
+        OrdinaryRead::Complete(None) => Ok(BindingRead::Value(JsValue::Undefined)),
         OrdinaryRead::Call { getter, receiver } => Ok(BindingRead::Getter { getter, receiver }),
         OrdinaryRead::Special {
             object, receiver, ..
         } => Ok(BindingRead::Query(EnvironmentStep::read(
+            runtime,
             executable.realm,
             object,
             key,
@@ -738,7 +787,10 @@ mod tests {
                 .unwrap();
             let _costs = profile.snapshot();
             assert!(
-                matches!(completion, Completion::Return(Value::Int(42))),
+                matches!(
+                    completion,
+                    Completion::Return(crate::engine::value::JsValue::Int(42))
+                ),
                 "{source}: {completion:?}"
             );
             assert!(runtime.0.state.borrow().active_frames.is_empty());

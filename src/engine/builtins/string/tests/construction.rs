@@ -1,3 +1,4 @@
+use crate::engine::atom::AtomIdx;
 use crate::engine::builtins::ErrorKind;
 use crate::engine::heap::{AutoInitProperty, PropertySlot};
 use crate::engine::object::shape::PropertyFlags;
@@ -24,7 +25,8 @@ fn string_constructor_statics_remain_typed_autoinit_entries() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(string_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert_eq!(
             shape.entries()[slot_index].flags,
             PropertyFlags::data(true, false, true),
@@ -61,17 +63,15 @@ fn string_raw_latched_overflow_preserves_pinned_observable_order() {
     else {
         panic!("String.raw overflow fixture was not an object");
     };
+    let arguments = NativeArguments {
+        actual_arg_count: 1,
+        readable: vec![js(&runtime, Value::Object(cooked))],
+    };
     let completion = runtime
-        .call_string_raw_with_limit(
-            context.realm,
-            &NativeArguments {
-                actual_arg_count: 1,
-                readable: vec![Value::Object(cooked)],
-            },
-            1,
-        )
+        .call_string_raw_with_limit(context.realm, &arguments, 1)
         .unwrap();
-    assert!(matches!(completion, Completion::Throw(Value::Int(77))));
+    release_arguments(&runtime, arguments);
+    assert!(matches!(completion, Completion::Throw(JsValue::Int(77))));
     assert_eq!(
         context.eval("stringRawOverflowLog").unwrap(),
         Value::String(JsString::from_static("g1")),
@@ -94,16 +94,17 @@ fn string_raw_latched_overflow_preserves_pinned_observable_order() {
             r#"(function(){var value=Object();value.toString=function(){stringRawOverflowLog+="s";return "x"};return value})()"#,
         )
         .unwrap();
+    let arguments = NativeArguments {
+        actual_arg_count: 2,
+        readable: vec![
+            js(&runtime, Value::Object(cooked)),
+            js(&runtime, substitution),
+        ],
+    };
     let error = runtime
-        .call_string_raw_with_limit(
-            context.realm,
-            &NativeArguments {
-                actual_arg_count: 2,
-                readable: vec![Value::Object(cooked), substitution],
-            },
-            1,
-        )
+        .call_string_raw_with_limit(context.realm, &arguments, 1)
         .unwrap_err();
+    release_arguments(&runtime, arguments);
     assert!(matches!(
         error,
         RuntimeError::Engine(ref error)

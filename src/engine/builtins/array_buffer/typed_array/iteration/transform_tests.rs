@@ -585,13 +585,15 @@ fn map_filter_species_and_hidden_arrays_keep_quickjs_realms() {
             filterSource)"#,
         "caller filter species source",
     );
-    caller
-        .call(
-            &filter,
-            Value::Object(filter_source),
-            &[Value::Object(identity.as_object().clone())],
-        )
-        .expect("cross-realm filter");
+    drop(
+        caller
+            .call(
+                &filter,
+                Value::Object(filter_source),
+                &[Value::Object(identity.as_object().clone())],
+            )
+            .expect("cross-realm filter"),
+    );
     let captured = eval_object(
         &mut caller,
         "capturedFilterValues",
@@ -639,9 +641,11 @@ fn pending_map_element_owns_source_target_callback_and_conversion_input() {
     });
     let arguments = NativeArguments {
         actual_arg_count: 1,
-        readable: vec![callback],
+        readable: vec![runtime.into_jsvalue(callback).unwrap()],
     };
-    let invocation = NativeInvocation::Call { this_value: source };
+    let invocation = NativeInvocation::Call {
+        this_value: runtime.into_jsvalue(source).unwrap(),
+    };
     let TypedIterationStep::Species { mut resume } = TypedIterationStep::start(
         &runtime,
         context.realm,
@@ -655,8 +659,15 @@ fn pending_map_element_owns_source_target_callback_and_conversion_input() {
     drop(resume.take_species_source());
     let _ = resume.take_species_element();
     let _ = resume.take_species_length();
-    drop(invocation);
-    drop(arguments);
+    {
+        let NativeInvocation::Call { this_value } = invocation else {
+            unreachable!()
+        };
+        runtime.release_jsvalue(this_value).unwrap();
+        for value in arguments.readable {
+            runtime.release_jsvalue(value).unwrap();
+        }
+    }
     let Value::Object(mapped) = mapped else {
         unreachable!()
     };
@@ -667,12 +678,19 @@ fn pending_map_element_owns_source_target_callback_and_conversion_input() {
         panic!("expected callback")
     };
     drop(resume.take_call_target());
-    drop(resume.take_call_receiver());
-    drop(resume.take_call_arguments());
+    runtime
+        .release_jsvalue(resume.take_call_receiver())
+        .unwrap();
+    for value in resume.take_call_arguments() {
+        runtime.release_jsvalue(value).unwrap();
+    }
     let conversion = runtime.new_object(None).unwrap();
     let conversion_id = conversion.object_id();
     let step = resume
-        .resume(&runtime, Completion::Return(Value::Object(conversion)))
+        .resume(
+            &runtime,
+            Completion::Return(runtime.into_jsvalue(Value::Object(conversion)).unwrap()),
+        )
         .unwrap();
     assert!(matches!(step, TypedIterationStep::Element { .. }));
     runtime.run_gc().unwrap();

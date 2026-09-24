@@ -93,21 +93,23 @@ fn string_pad_small_limit_preserves_filler_order_and_range_error_kind() {
             })()"#,
         )
         .unwrap();
+    let arguments = NativeArguments {
+        actual_arg_count: 2,
+        readable: vec![JsValue::Int(4), runtime.into_jsvalue(filler).unwrap()],
+    };
     let completion = runtime
         .call_string_prototype_pad_with_limit(
             context.realm,
             StringPadKind::End,
             NativeInvocation::Call {
-                this_value: Value::String(JsString::from_static("a")),
+                this_value: js(&runtime, Value::String(JsString::from_static("a"))),
             },
-            &NativeArguments {
-                actual_arg_count: 2,
-                readable: vec![Value::Int(4), filler],
-            },
+            &arguments,
             3,
         )
         .unwrap();
-    let Completion::Throw(Value::Object(error)) = completion else {
+    release_arguments(&runtime, arguments);
+    let Value::Object(error) = thrown(&runtime, completion) else {
         panic!("small String pad limit did not throw an Error object");
     };
     for (name, expected) in [("name", "RangeError"), ("message", "invalid string length")] {
@@ -125,41 +127,50 @@ fn string_pad_small_limit_preserves_filler_order_and_range_error_kind() {
         "pad checked its output bound before converting the filler",
     );
 
+    let arguments = NativeArguments {
+        actual_arg_count: 2,
+        readable: vec![
+            JsValue::Int(4),
+            js(&runtime, Value::String(JsString::from_static(""))),
+        ],
+    };
+    let completion = runtime
+        .call_string_prototype_pad_with_limit(
+            context.realm,
+            StringPadKind::Start,
+            NativeInvocation::Call {
+                this_value: js(&runtime, Value::String(JsString::from_static("a"))),
+            },
+            &arguments,
+            3,
+        )
+        .unwrap();
+    release_arguments(&runtime, arguments);
     assert_eq!(
-        runtime
-            .call_string_prototype_pad_with_limit(
-                context.realm,
-                StringPadKind::Start,
-                NativeInvocation::Call {
-                    this_value: Value::String(JsString::from_static("a")),
-                },
-                &NativeArguments {
-                    actual_arg_count: 2,
-                    readable: vec![Value::Int(4), Value::String(JsString::from_static(""))],
-                },
-                3,
-            )
-            .unwrap(),
-        Completion::Return(Value::String(JsString::from_static("a"))),
+        returned(&runtime, completion),
+        Value::String(JsString::from_static("a")),
         "empty filler must bypass even an otherwise invalid output length",
     );
 
+    let arguments = NativeArguments {
+        actual_arg_count: 1,
+        readable: vec![JsValue::Int(3)],
+    };
+    let completion = runtime
+        .call_string_prototype_pad_with_limit(
+            context.realm,
+            StringPadKind::End,
+            NativeInvocation::Call {
+                this_value: js(&runtime, Value::String(JsString::from_static("a"))),
+            },
+            &arguments,
+            3,
+        )
+        .unwrap();
+    release_arguments(&runtime, arguments);
     assert_eq!(
-        runtime
-            .call_string_prototype_pad_with_limit(
-                context.realm,
-                StringPadKind::End,
-                NativeInvocation::Call {
-                    this_value: Value::String(JsString::from_static("a")),
-                },
-                &NativeArguments {
-                    actual_arg_count: 1,
-                    readable: vec![Value::Int(3)],
-                },
-                3,
-            )
-            .unwrap(),
-        Completion::Return(Value::String(JsString::from_static("a  "))),
+        returned(&runtime, completion),
+        Value::String(JsString::from_static("a  ")),
         "the length-one native ABI read a nonexistent filler argument",
     );
 }
@@ -186,9 +197,10 @@ fn string_pad_reservation_oom_uses_defining_realm_and_runtime_recovers() {
     };
     assert_ne!(defining_internal_error, caller_internal_error);
 
-    caller
-        .eval(
-            r#"globalThis.padReservationLog="";
+    drop(
+        caller
+            .eval(
+                r#"globalThis.padReservationLog="";
                 globalThis.padReservationReceiver=Object();
                 padReservationReceiver[Symbol.toPrimitive]=function(hint){
                     padReservationLog+="receiver:"+hint+";";return "xy"
@@ -201,8 +213,9 @@ fn string_pad_reservation_oom_uses_defining_realm_and_runtime_recovers() {
                 padReservationFiller[Symbol.toPrimitive]=function(hint){
                     padReservationLog+="filler:"+hint+";";return "z"
                 };"#,
-        )
-        .unwrap();
+            )
+            .unwrap(),
+    );
     let receiver = caller.eval("padReservationReceiver").unwrap();
     let target = caller.eval("padReservationTarget").unwrap();
     let filler = caller.eval("padReservationFiller").unwrap();

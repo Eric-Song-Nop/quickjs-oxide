@@ -1,23 +1,36 @@
 use crate::engine::api::error::Error;
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
-use crate::engine::value::Value;
+use crate::engine::value::{JsValue, Value};
 
 impl Runtime {
-    pub(crate) fn set_pending_exception(&self, value: Value) -> Result<(), RuntimeError> {
+    /// Move one owned internal edge into the pending-exception slot.
+    pub(crate) fn set_pending_exception_jsvalue(&self, value: JsValue) -> Result<(), RuntimeError> {
         let _operation = self.operation();
-        self.validate_value_domain(&value, "exception value")?;
-        let raw = self.raw_property_value(&value)?;
-        {
-            let mut state = self.0.state.borrow_mut();
-            state.retain_raw_root(&raw)?;
-            if let Some(previous) = state.pending_exception.replace(raw) {
-                state.release_owned_raw_root(previous)?;
-            }
+        let mut state = self.0.state.borrow_mut();
+        if let Some(previous) = state.pending_exception.replace(value.into_raw()) {
+            state.release_owned_raw_root(previous)?;
         }
-        // `raw` now owns its own retained occurrence.
-        drop(value);
         Ok(())
+    }
+
+    pub(crate) fn set_pending_exception(&self, value: Value) -> Result<(), RuntimeError> {
+        self.validate_value_domain(&value, "exception value")?;
+        self.set_pending_exception_jsvalue(self.into_jsvalue(value)?)
+    }
+
+    pub(crate) fn take_pending_exception_jsvalue(&self) -> Result<Option<JsValue>, RuntimeError> {
+        let _operation = self.operation();
+        self.0
+            .state
+            .borrow_mut()
+            .pending_exception
+            .take()
+            .map(|raw| {
+                JsValue::from_raw(raw)
+                    .ok_or(RuntimeError::Invariant("pending exception is not a value"))
+            })
+            .transpose()
     }
 
     pub(crate) fn take_pending_exception(&self) -> Result<Option<Value>, RuntimeError> {
@@ -39,6 +52,14 @@ pub(in crate::engine::vm) fn runtime_error_to_vm_error(error: RuntimeError) -> E
         RuntimeError::Engine(error) => error,
         error => Error::internal(error.to_string()),
     }
+}
+
+/// Heap retain/release failures at trusted VM sites carry the same internal
+/// diagnostic policy as every other runtime failure.
+pub(in crate::engine::vm) fn heap_error_to_vm_error(
+    error: crate::engine::heap::HeapError,
+) -> Error {
+    runtime_error_to_vm_error(RuntimeError::from(error))
 }
 
 /// Materialize published binding diagnostics outside the resident driver frame.
@@ -82,7 +103,7 @@ pub(super) fn binding_error(
         .native_atom_error(kind, prefix, &key, suffix)
         .map_err(runtime_error_to_vm_error)?;
     let value = runtime
-        .new_native_error_from_error(frame.executable.realm, native, &error)
+        .new_native_error_from_error_jsvalue(frame.executable.realm, native, &error)
         .map_err(runtime_error_to_vm_error)?;
     #[cfg(feature = "profiling")]
     crate::engine::api::profiling::record_owned_instruction(execution.slots.depth(&frame.window));

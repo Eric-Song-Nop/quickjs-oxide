@@ -6,11 +6,14 @@ use crate::engine::{
         rooted::FunctionBytecodeRef,
         runtime::{OrdinaryAuthentication, PublishedFunctionSnapshot},
     },
-    heap::{FunctionBytecodeId, ObjectPayload, VarRefId},
+    heap::{FunctionBytecodeId, ObjectId, ObjectPayload, VarRefId},
     object::ObjectRef,
-    value::Value,
+    value::JsValue,
     vm::closure::ClosureSlots,
 };
+
+#[cfg(test)]
+use crate::engine::value::Value;
 
 // Only this module can authenticate or construct this witness.
 pub(in crate::engine::vm) struct OrdinaryCall {
@@ -21,16 +24,17 @@ pub(in crate::engine::vm) struct OrdinaryCall {
 // Selection may read metadata but does not publish a frame or consume operands.
 // Any malformed metadata error is returned only after the original domain check.
 pub(in crate::engine::vm) struct OrdinarySelection<'a> {
-    function: &'a ObjectRef,
+    function: ObjectId,
     bytecode: FunctionBytecodeId,
     authentication: Option<OrdinaryAuthentication>,
     closure: std::cell::Ref<'a, std::rc::Rc<[VarRefId]>>,
 }
 // Only DirectSelection can create this proof: payload metadata and borrowed
-// owner originate from the same heap lookup. Promotion cannot accept a caller's
+// slot/owner originate from the same heap lookup. Promotion cannot accept a caller's
 // detached metadata or an unrelated object.
 pub(in crate::engine::vm) struct NativeSelection<'a> {
-    function: &'a ObjectRef,
+    runtime: &'a Runtime,
+    function: ObjectId,
     target: crate::engine::builtins::native::NativeFunctionId,
     defining_realm: crate::engine::heap::ContextId,
     min_readable_args: u8,
@@ -40,13 +44,15 @@ impl<'a> NativeSelection<'a> {
     pub(in crate::engine::vm) fn into_parts(
         self,
     ) -> (
-        &'a ObjectRef,
+        &'a Runtime,
+        ObjectId,
         crate::engine::builtins::native::NativeFunctionId,
         crate::engine::heap::ContextId,
         u8,
         crate::engine::builtins::continuation::NativeOperation,
     ) {
         (
+            self.runtime,
             self.function,
             self.target,
             self.defining_realm,
@@ -65,6 +71,7 @@ pub(in crate::engine::vm) enum DirectSelection<'a> {
 impl<'a> DirectSelection<'a> {
     /// One payload inspection for ordinary, native and general callees. Any
     /// metadata error is held by the caller until operand domains are checked.
+    #[cfg(test)]
     pub(in crate::engine::vm) fn select(
         runtime: &'a Runtime,
         value: &'a Value,
@@ -81,13 +88,25 @@ impl<'a> DirectSelection<'a> {
         if !function.belongs_to(runtime) {
             return Ok(Self::General);
         }
+        Self::select_id(runtime, function.object_id())
+    }
+    pub(in crate::engine::vm) fn select_jsvalue(
+        runtime: &'a Runtime,
+        value: &'a JsValue,
+    ) -> Result<Self, RuntimeError> {
+        let JsValue::Object(function) = value else {
+            return Ok(Self::General);
+        };
+        Self::select_id(runtime, *function)
+    }
+    fn select_id(runtime: &'a Runtime, function: ObjectId) -> Result<Self, RuntimeError> {
         let mut selected_bytecode = None;
         let mut selected_authentication = None;
         let mut native = None;
         let mut failure = None;
         let closure = std::cell::Ref::filter_map(runtime.0.state.borrow(), |state| {
             let selected = (|| {
-                let object = state.heap.object(function.object_id())?;
+                let object = state.heap.object(function)?;
                 if let ObjectPayload::NativeFunction { data, .. } = &object.payload {
                     // Unregistered native kinds retain the checked general
                     // entry, including its original preparation/error order.
@@ -97,6 +116,7 @@ impl<'a> DirectSelection<'a> {
                         ))?;
                         state.heap.context(defining_realm)?;
                         native = Some(NativeSelection {
+                            runtime,
                             function,
                             target: data.target,
                             defining_realm,
@@ -194,8 +214,8 @@ impl OrdinaryCall {
     pub(in crate::engine::vm) fn prepare_callback(
         self,
         storage: &mut crate::engine::vm::frame::CallStorage,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: crate::engine::value::JsValue,
+        arguments: Vec<crate::engine::value::JsValue>,
         caller_realm: crate::engine::heap::ContextId,
         return_to: crate::engine::vm::frame::ReturnTarget,
     ) -> Result<crate::engine::vm::frame::FrameEntry, Error> {
@@ -204,6 +224,7 @@ impl OrdinaryCall {
             stack::FrameStorage,
         };
         storage.reserve()?;
+        let callback_runtime = self.function.runtime().clone();
         let (flags, flag_bytes) = if self.executable.has_captured_locals {
             storage.capture_flags(self.executable.local_definitions.len())?
         } else {
@@ -216,11 +237,12 @@ impl OrdinaryCall {
             function: self.function.into(),
             closure_slots: self.closure,
             reusable_captured_locals: flags,
-            input: crate::engine::vm::CallInput {
-                this_value: receiver,
-                new_target: Value::Undefined,
-                callee_global: None,
-            }
+            input: crate::engine::vm::CallInput::new(
+                &callback_runtime,
+                receiver,
+                crate::engine::value::JsValue::Undefined,
+                None,
+            )
             .into(),
         });
         #[cfg(feature = "profiling")]
@@ -231,7 +253,7 @@ impl OrdinaryCall {
         crate::engine::api::profiling::record_owned_call_storage(
             frame_bytes,
             flag_bytes,
-            arguments.capacity() * size_of::<Value>(),
+            arguments.capacity() * size_of::<JsValue>(),
         );
         #[cfg(not(feature = "profiling"))]
         let _ = (frame_bytes, flag_bytes);
@@ -254,7 +276,7 @@ impl OrdinaryCall {
 
     pub(in crate::engine::vm) fn install(
         self,
-        _runtime: &Runtime,
+        runtime: &Runtime,
         execution: &mut crate::engine::vm::execution::RunningExecution,
         parent: crate::engine::vm::frame::FrameId,
         count: usize,
@@ -271,9 +293,12 @@ impl OrdinaryCall {
             .checked_add(1)
             .ok_or_else(|| Error::internal("call resume PC overflow"))?;
         let receiver = if method {
-            crate::engine::vm::stack::copy_value(execution.slots.peek(&frame.window, count + 1)?)?
+            crate::engine::vm::stack::copy_value(
+                runtime,
+                execution.slots.peek(&frame.window, count + 1)?,
+            )?
         } else {
-            Value::Undefined
+            crate::engine::value::JsValue::Undefined
         };
         let (flags, flag_bytes) = if self.executable.has_captured_locals {
             execution
@@ -286,6 +311,7 @@ impl OrdinaryCall {
         let mut prepared = prepared;
         let frame = prepared.current_mut(parent)?;
         let window = execution.slots.push_ordinary_frame(
+            runtime,
             &self.executable.frame_layout(),
             &mut frame.window,
             count,
@@ -306,11 +332,12 @@ impl OrdinaryCall {
         cold.function = self.function.into();
         cold.closure_slots = self.closure;
         cold.reusable_captured_locals = flags;
-        cold.input = crate::engine::vm::CallInput {
-            this_value: receiver,
-            new_target: Value::Undefined,
-            callee_global: None,
-        }
+        cold.input = crate::engine::vm::CallInput::new(
+            runtime,
+            receiver,
+            crate::engine::value::JsValue::Undefined,
+            None,
+        )
         .into();
         cold.executable = self.executable.into();
         cold.window = window.into();
@@ -343,7 +370,7 @@ impl OrdinarySelection<'_> {
         // shared environment and owner, after ending the read-only heap borrow.
         let closure = std::rc::Rc::clone(&self.closure);
         drop(self.closure);
-        let function = self.function.clone();
+        let function = ObjectRef::from_borrowed_handle(runtime.clone(), self.function)?;
         let executable = if let Some(facts) = self.authentication {
             #[cfg(feature = "profiling")]
             crate::engine::api::profiling::record_owned_execution_event(

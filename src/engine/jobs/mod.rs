@@ -18,7 +18,9 @@ use crate::engine::heap::{
 use crate::engine::modules::ModuleLoader;
 use crate::engine::object::ObjectRef;
 
-use crate::engine::value::{JsString, Value};
+#[cfg(test)]
+use crate::engine::value::Value;
+use crate::engine::value::{JsString, JsValue};
 use crate::engine::vm::Completion;
 use std::collections::VecDeque;
 
@@ -303,7 +305,7 @@ impl RuntimeState {
         match root {
             PendingJobRoot::Context(context) => self.heap.retain_context(context)?,
             PendingJobRoot::Object(object) => self.heap.retain_object(object)?,
-            PendingJobRoot::Value(value) => self.retain_raw_root(value)?,
+            PendingJobRoot::Value(value) => self.retain_raw_root(value.clone())?,
         }
         Ok(())
     }
@@ -323,8 +325,16 @@ impl RuntimeState {
                     let cleanup = self.heap.release_object(*object)?;
                     self.apply_cleanup(cleanup)?;
                 }
-                RawValue::Symbol(atom) => {
-                    self.atoms.release(*atom)?;
+                RawValue::Symbol(index) => {
+                    self.atoms.release_index(*index)?;
+                }
+                RawValue::String(id) => {
+                    let cleanup = self.heap.release_string(*id)?;
+                    self.apply_cleanup(cleanup)?;
+                }
+                RawValue::BigInt(id) => {
+                    let cleanup = self.heap.release_bigint(*id)?;
+                    self.apply_cleanup(cleanup)?;
                 }
                 RawValue::Private(_) => {
                     return Err(RuntimeError::Invariant(
@@ -336,8 +346,7 @@ impl RuntimeState {
                 | RawValue::Bool(_)
                 | RawValue::Int(_)
                 | RawValue::Float(_)
-                | RawValue::BigInt(_)
-                | RawValue::String(_) => {}
+                | RawValue::ShortBigInt(_) => {}
                 RawValue::Uninitialized | RawValue::Exception => {
                     return Err(RuntimeError::Invariant(
                         "internal value sentinel occupied a pending job root",
@@ -467,11 +476,11 @@ impl Runtime {
             .execute_pending_job_record(job.record())
             .and_then(|completion| match completion {
                 Completion::Return(value) => {
-                    drop(value);
+                    self.release_jsvalue(value)?;
                     Ok(false)
                 }
                 Completion::Throw(value) => {
-                    self.set_pending_exception(value)?;
+                    self.set_pending_exception_jsvalue(value)?;
                     Ok(true)
                 }
             });
@@ -548,14 +557,14 @@ impl Runtime {
         let callback = self.as_callable(&callback)?.ok_or(RuntimeError::Invariant(
             "FinalizationRegistry job callback lost its callable brand",
         ))?;
-        let held_value = self.root_raw_value(held_value)?;
-
-        crate::engine::vm::entry::call(
-            self,
+        let held_value = JsValue::from_raw(held_value.clone()).ok_or(RuntimeError::Invariant(
+            "FinalizationRegistry held value contains a private sentinel",
+        ))?;
+        self.call_internal_jsvalue(
             realm,
             &callback,
-            Value::Undefined,
-            std::slice::from_ref(&held_value),
+            JsValue::Undefined,
+            vec![self.dup_jsvalue(&held_value)?],
         )
     }
 

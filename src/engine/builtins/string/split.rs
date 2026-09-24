@@ -3,7 +3,7 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
     object::{ObjectRef, PropertyKey, WellKnownSymbol},
-    value::{JsString, Value, conversion::NativeConversion},
+    value::{JsString, JsValue, conversion::NativeConversion},
     vm::{
         Completion, ToPrimitiveHint,
         call::{DirectCallTarget, NativeArguments, NativeInvocation},
@@ -30,11 +30,26 @@ impl std::ops::DerefMut for StringSplitResume {
 const _: () = assert!(std::mem::size_of::<StringSplitResume>() <= 8);
 pub(crate) struct StringSplitResumeState {
     step_pending: StringSplitStepPending,
+    runtime: Runtime,
     realm: ContextId,
-    receiver: Value,
-    separator: Value,
-    limit: Value,
+    receiver: JsValue,
+    separator: JsValue,
+    limit: JsValue,
     phase: SplitPhase,
+}
+impl Drop for StringSplitResumeState {
+    /// Release the internal edges still owned when the request is abandoned.
+    /// Drained fields are `Undefined` here; releases are defer-safe.
+    fn drop(&mut self) {
+        for value in [
+            std::mem::replace(&mut self.receiver, JsValue::Undefined),
+            std::mem::replace(&mut self.separator, JsValue::Undefined),
+            std::mem::replace(&mut self.limit, JsValue::Undefined),
+        ] {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        self.step_pending.release_owned(&self.runtime);
+    }
 }
 enum SplitPhase {
     Method,
@@ -62,66 +77,74 @@ impl StringSplitStep {
                 "String split did not receive a generic invocation",
             ));
         };
-        if matches!(this_value, Value::Undefined | Value::Null) {
+        if matches!(this_value, JsValue::Undefined | JsValue::Null) {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(
+                runtime.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "cannot convert to object",
                 )?,
             )));
         }
-        let separator = arguments
-            .readable
-            .first()
-            .ok_or(RuntimeError::Invariant(
-                "String split separator argv was not padded",
-            ))?
-            .clone();
-        let limit = arguments
-            .readable
-            .get(1)
-            .ok_or(RuntimeError::Invariant(
-                "String split limit argv was not padded",
-            ))?
-            .clone();
-        let resume = StringSplitResume(Box::new(StringSplitResumeState {
+        let mut resume = StringSplitResume(Box::new(StringSplitResumeState {
             step_pending: StringSplitStepPending::default(),
+            runtime: runtime.clone(),
             realm,
-            receiver: this_value.clone(),
-            separator,
-            limit,
+            receiver: runtime.dup_jsvalue(this_value)?,
+            separator: JsValue::Undefined,
+            limit: JsValue::Undefined,
             phase: SplitPhase::Method,
         }));
-        if let Value::Object(object) = &resume.separator {
+        resume.0.separator = runtime.dup_jsvalue(arguments.readable.first().ok_or(
+            RuntimeError::Invariant("String split separator argv was not padded"),
+        )?)?;
+        resume.0.limit = runtime.dup_jsvalue(arguments.readable.get(1).ok_or(
+            RuntimeError::Invariant("String split limit argv was not padded"),
+        )?)?;
+        if let JsValue::Object(id) = &resume.separator {
+            let object = ObjectRef::from_borrowed_handle(runtime.clone(), *id)?;
             Ok(Self::make_read(
-                object.clone(),
+                object,
                 PropertyKey::from(runtime.well_known_symbol(WellKnownSymbol::Split)),
                 resume,
             ))
         } else {
-            Ok(resume.source())
+            resume.source(runtime)
         }
     }
 }
 impl StringSplitResume {
-    fn source(mut self) -> StringSplitStep {
-        StringSplitStep::make_primitive(self.0.receiver.clone(), ToPrimitiveHint::String, {
-            let updated_0 = SplitPhase::Source;
-            self.0.phase = updated_0;
-            self
-        })
+    fn source(mut self, runtime: &Runtime) -> Result<StringSplitStep, RuntimeError> {
+        Ok(StringSplitStep::make_primitive(
+            runtime.dup_jsvalue(&self.0.receiver)?,
+            ToPrimitiveHint::String,
+            {
+                let updated_0 = SplitPhase::Source;
+                self.0.phase = updated_0;
+                self
+            },
+        ))
     }
-    fn separator(mut self, source: JsString, result: ObjectRef, limit: u32) -> StringSplitStep {
-        StringSplitStep::make_primitive(self.0.separator.clone(), ToPrimitiveHint::String, {
-            let updated_0 = SplitPhase::Separator {
-                source,
-                result,
-                limit,
-            };
-            self.0.phase = updated_0;
-            self
-        })
+    fn separator(
+        mut self,
+        runtime: &Runtime,
+        source: JsString,
+        result: ObjectRef,
+        limit: u32,
+    ) -> Result<StringSplitStep, RuntimeError> {
+        Ok(StringSplitStep::make_primitive(
+            runtime.dup_jsvalue(&self.0.separator)?,
+            ToPrimitiveHint::String,
+            {
+                let updated_0 = SplitPhase::Separator {
+                    source,
+                    result,
+                    limit,
+                };
+                self.0.phase = updated_0;
+                self
+            },
+        ))
     }
     pub(crate) fn resume(
         mut self,
@@ -135,35 +158,59 @@ impl StringSplitResume {
             }
         };
         let realm = self.0.realm;
-        match self.0.phase {
+        let phase = std::mem::replace(&mut self.0.phase, SplitPhase::Method);
+        match phase {
             SplitPhase::Method => {
-                if matches!(value, Value::Undefined | Value::Null) {
-                    return Ok(self.source());
+                if matches!(value, JsValue::Undefined | JsValue::Null) {
+                    return self.source(runtime);
                 }
-                let callable = match value {
-                    Value::Object(object) => runtime.as_callable(&object)?,
-                    _ => None,
+                let callable = match &value {
+                    JsValue::Object(id) => ObjectRef::from_borrowed_handle(runtime.clone(), *id)
+                        .map_err(RuntimeError::from)
+                        .and_then(|object| runtime.as_callable(&object)),
+                    _ => Ok(None),
                 };
+                runtime.release_jsvalue(value)?;
+                let callable = callable?;
                 let Some(callable) = callable else {
                     return Ok(StringSplitStep::Complete(Completion::Throw(
-                        runtime.new_native_error(realm, NativeErrorKind::Type, "not a function")?,
+                        runtime.new_native_error_jsvalue(
+                            realm,
+                            NativeErrorKind::Type,
+                            "not a function",
+                        )?,
                     )));
                 };
                 let mut arguments = Vec::new();
                 if arguments.try_reserve_exact(2).is_err() {
                     return Ok(StringSplitStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             realm,
                             NativeErrorKind::Internal,
                             "out of memory",
                         )?,
                     )));
                 }
-                arguments.push(self.0.receiver.clone());
-                arguments.push(self.0.limit.clone());
+                self.0.step_pending.arguments = Some(arguments);
+                let receiver_argument = runtime.dup_jsvalue(&self.0.receiver)?;
+                self.0
+                    .step_pending
+                    .arguments
+                    .as_mut()
+                    .unwrap()
+                    .push(receiver_argument);
+                let limit_argument = runtime.dup_jsvalue(&self.0.limit)?;
+                self.0
+                    .step_pending
+                    .arguments
+                    .as_mut()
+                    .unwrap()
+                    .push(limit_argument);
+                let receiver = runtime.dup_jsvalue(&self.0.separator)?;
+                let arguments = self.0.step_pending.arguments.take().unwrap();
                 Ok(StringSplitStep::make_call(
                     DirectCallTarget::Callable(callable),
-                    self.0.separator.clone(),
+                    receiver,
                     arguments,
                     {
                         let updated_0 = SplitPhase::Called;
@@ -174,23 +221,26 @@ impl StringSplitResume {
             }
             SplitPhase::Called => Ok(StringSplitStep::Complete(Completion::Return(value))),
             SplitPhase::Source => {
-                if matches!(value, Value::Object(_)) {
+                if matches!(value, JsValue::Object(_)) {
+                    runtime.release_jsvalue(value)?;
                     return Err(RuntimeError::Invariant(
                         "String split source conversion returned an object",
                     ));
                 }
-                let source = match runtime.native_to_js_string(realm, &value)? {
+                let converted = runtime.string_from_primitive_jsvalue(realm, &value);
+                runtime.release_jsvalue(value)?;
+                let source = match converted? {
                     NativeConversion::Value(value) => value.linearize(),
                     NativeConversion::Throw(value) => {
                         return Ok(StringSplitStep::Complete(Completion::Throw(value)));
                     }
                 };
                 let result = runtime.new_array(realm)?;
-                if matches!(self.0.limit, Value::Undefined) {
-                    Ok(self.separator(source, result, u32::MAX))
+                if matches!(self.0.limit, JsValue::Undefined) {
+                    self.separator(runtime, source, result, u32::MAX)
                 } else {
                     Ok(StringSplitStep::make_primitive(
-                        self.0.limit.clone(),
+                        runtime.dup_jsvalue(&self.0.limit)?,
                         ToPrimitiveHint::Number,
                         {
                             let updated_0 = SplitPhase::Limit { source, result };
@@ -201,35 +251,41 @@ impl StringSplitResume {
                 }
             }
             SplitPhase::Limit { source, result } => {
-                if matches!(value, Value::Object(_)) {
+                if matches!(value, JsValue::Object(_)) {
+                    runtime.release_jsvalue(value)?;
                     return Err(RuntimeError::Invariant(
                         "String split limit conversion returned an object",
                     ));
                 }
-                let limit = match runtime.native_to_number(realm, &value)? {
+                let converted = runtime.number_from_primitive_jsvalue(realm, &value);
+                runtime.release_jsvalue(value)?;
+                let limit = match converted? {
                     NativeConversion::Value(value) => Runtime::to_uint32_number(value),
                     NativeConversion::Throw(value) => {
                         return Ok(StringSplitStep::Complete(Completion::Throw(value)));
                     }
                 };
-                Ok({
+                {
                     let updated_0 = SplitPhase::Called;
                     self.0.phase = updated_0;
                     self
                 }
-                .separator(source, result, limit))
+                .separator(runtime, source, result, limit)
             }
             SplitPhase::Separator {
                 source,
                 result,
                 limit,
             } => {
-                if matches!(value, Value::Object(_)) {
+                if matches!(value, JsValue::Object(_)) {
+                    runtime.release_jsvalue(value)?;
                     return Err(RuntimeError::Invariant(
                         "String split separator conversion returned an object",
                     ));
                 }
-                let separator = match runtime.native_to_js_string(realm, &value)? {
+                let converted = runtime.string_from_primitive_jsvalue(realm, &value);
+                runtime.release_jsvalue(value)?;
+                let separator = match converted? {
                     NativeConversion::Value(value) => value.linearize(),
                     NativeConversion::Throw(value) => {
                         return Ok(StringSplitStep::Complete(Completion::Throw(value)));
@@ -260,15 +316,20 @@ pub(super) fn finish(
                 let key = resume.take_read_key();
                 resume.resume(
                     runtime,
-                    runtime.get_property_in_realm(realm, &object, &key)?,
+                    runtime.internal_get_jsvalue(
+                        realm,
+                        &object,
+                        &key,
+                        JsValue::Object(object.clone().into_handle()),
+                    )?,
                 )?
             }
             StringSplitStep::Primitive { mut resume } => {
                 let value = resume.take_primitive_value();
                 let hint = resume.take_primitive_hint();
                 {
-                    let result = if matches!(value, Value::Object(_)) {
-                        runtime.to_primitive(realm, value, hint)?
+                    let result = if matches!(value, JsValue::Object(_)) {
+                        runtime.to_primitive_jsvalue(realm, value, hint)?
                     } else {
                         Completion::Return(value)
                     };
@@ -281,13 +342,17 @@ pub(super) fn finish(
                 let arguments = resume.take_call_arguments();
                 {
                     let DirectCallTarget::Callable(callable) = target else {
+                        runtime.release_jsvalue(receiver)?;
+                        for value in arguments {
+                            runtime.release_jsvalue(value)?;
+                        }
                         return Err(RuntimeError::Invariant(
                             "String split requested an invalid call target",
                         ));
                     };
                     resume.resume(
                         runtime,
-                        runtime.call_internal(realm, &callable, receiver, &arguments)?,
+                        runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?,
                     )?
                 }
             }
@@ -299,11 +364,29 @@ pub(super) fn finish(
 pub(crate) struct StringSplitStepPending {
     object: Option<ObjectRef>,
     key: Option<PropertyKey>,
-    value: Option<Value>,
+    value: Option<JsValue>,
     hint: Option<ToPrimitiveHint>,
     target: Option<DirectCallTarget>,
-    receiver: Option<Value>,
-    arguments: Option<Vec<Value>>,
+    receiver: Option<JsValue>,
+    arguments: Option<Vec<JsValue>>,
+}
+impl StringSplitStepPending {
+    /// Release every edge that was not consumed by a completed step.
+    fn release_owned(&mut self, runtime: &Runtime) {
+        let _ = self.object.take();
+        let _ = self.key.take();
+        let _ = self.hint.take();
+        let _ = self.target.take();
+        for value in [self.value.take(), self.receiver.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = runtime.release_jsvalue(value);
+        }
+        for value in self.arguments.take().into_iter().flatten() {
+            let _ = runtime.release_jsvalue(value);
+        }
+    }
 }
 impl StringSplitStep {
     pub(crate) fn make_read(
@@ -316,7 +399,7 @@ impl StringSplitStep {
         Self::Read { resume }
     }
     pub(crate) fn make_primitive(
-        value: Value,
+        value: JsValue,
         hint: ToPrimitiveHint,
         mut resume: StringSplitResume,
     ) -> Self {
@@ -326,8 +409,8 @@ impl StringSplitStep {
     }
     pub(crate) fn make_call(
         target: DirectCallTarget,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: StringSplitResume,
     ) -> Self {
         resume.0.step_pending.target = Some(target);
@@ -352,7 +435,7 @@ impl StringSplitResume {
             .expect("StringSplitStep::Read lost key")
     }
 
-    pub(crate) fn take_primitive_value(&mut self) -> Value {
+    pub(crate) fn take_primitive_value(&mut self) -> JsValue {
         self.0
             .step_pending
             .value
@@ -374,14 +457,14 @@ impl StringSplitResume {
             .take()
             .expect("StringSplitStep::Call lost target")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .step_pending
             .receiver
             .take()
             .expect("StringSplitStep::Call lost receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .step_pending
             .arguments

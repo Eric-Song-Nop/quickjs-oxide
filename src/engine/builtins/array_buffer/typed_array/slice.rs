@@ -13,13 +13,15 @@ use crate::engine::{
     builtins::native::TypedArrayElementKind,
     heap::ContextId,
     object::ObjectRef,
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{
         Completion, ToPrimitiveHint,
         call::{NativeArguments, NativeInvocation},
     },
 };
 
+#[cfg(test)]
+use crate::engine::value::Value;
 #[cfg(test)]
 mod tests;
 
@@ -57,7 +59,9 @@ impl Runtime {
             };
             match self.typed_array_validated_length(realm, &target)? {
                 NativeConversion::Value(_) => {}
-                NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+                NativeConversion::Throw(value) => {
+                    return Ok(Completion::Throw(value));
+                }
             }
 
             let start = u64::try_from(start)
@@ -75,10 +79,17 @@ impl Runtime {
                 } else {
                     for index in 0..live_count {
                         let value = self
-                            .typed_array_read_index(&source, start + index)?
-                            .unwrap_or(Value::Undefined);
-                        match self.typed_array_set_index(realm, &target, index, &value)? {
-                            NativeConversion::Value(()) => {}
+                            .typed_array_read_index_jsvalue(&source, start + index)?
+                            .unwrap_or(JsValue::Undefined);
+                        match super::write::TypedWriteStep::set(
+                            self,
+                            target.clone(),
+                            Some(index),
+                            value,
+                        )?
+                        .finish_sync(self, realm)?
+                        {
+                            NativeConversion::Value(_) => {}
                             NativeConversion::Throw(value) => {
                                 return Ok(Completion::Throw(value));
                             }
@@ -87,7 +98,7 @@ impl Runtime {
                 }
             }
         }
-        Ok(Completion::Return(Value::Object(target)))
+        Ok(Completion::Return(JsValue::Object(target.into_handle())))
     }
 
     pub(crate) fn call_typed_array_subarray(
@@ -189,9 +200,18 @@ pub(crate) struct TypedSliceResumeState {
     length: i64,
     kind: TypedSliceKind,
     phase: Phase,
+    end: JsValue,
+}
+impl Drop for TypedSliceResumeState {
+    fn drop(&mut self) {
+        let _ = self
+            .source
+            .runtime()
+            .release_jsvalue(std::mem::replace(&mut self.end, JsValue::Undefined));
+    }
 }
 enum Phase {
-    Start(Value),
+    Start,
     End { start: i64, offset: u64 },
     Species { start: i64, count: u64 },
 }
@@ -208,9 +228,11 @@ impl TypedSliceStep {
                 "TypedArray slice received a constructor invocation",
             ));
         };
-        let source = match runtime.require_typed_array(realm, this_value.clone())? {
+        let source = match runtime.require_typed_array_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
+            NativeConversion::Throw(value) => {
+                return Ok(Self::Complete(Completion::Throw(value)));
+            }
         };
         let length = match kind {
             TypedSliceKind::Slice => match runtime.typed_array_validated_length(realm, &source)? {
@@ -223,30 +245,22 @@ impl TypedSliceStep {
         };
         // A branded view's raw metadata is immutable; its backing state is reread after every conversion.
         runtime.typed_array_snapshot(&source)?;
-        let end = arguments
-            .readable
-            .get(1)
-            .ok_or(RuntimeError::Invariant(
-                "TypedArray slice end argv was not padded",
-            ))?
-            .clone();
-        Ok(Self::request_primitive(
-            arguments
-                .readable
-                .first()
-                .ok_or(RuntimeError::Invariant(
-                    "TypedArray slice start argv was not padded",
-                ))?
-                .clone(),
-            TypedSliceResume(Box::new(TypedSliceResumeState {
-                pending_effect: TypedSliceStepPending::default(),
-                realm,
-                source,
-                length,
-                kind,
-                phase: Phase::Start(end),
-            })),
-        ))
+        let mut resume = TypedSliceResume(Box::new(TypedSliceResumeState {
+            pending_effect: TypedSliceStepPending::new(runtime),
+            realm,
+            source,
+            length,
+            kind,
+            phase: Phase::Start,
+            end: JsValue::Undefined,
+        }));
+        resume.0.end = runtime.dup_jsvalue(arguments.readable.get(1).ok_or(
+            RuntimeError::Invariant("TypedArray slice end argv was not padded"),
+        )?)?;
+        let value = runtime.dup_jsvalue(arguments.readable.first().ok_or(
+            RuntimeError::Invariant("TypedArray slice start argv was not padded"),
+        )?)?;
+        Ok(Self::request_primitive(value, resume))
     }
 }
 impl TypedSliceResume {
@@ -261,11 +275,10 @@ impl TypedSliceResume {
                 return Ok(TypedSliceStep::Complete(Completion::Throw(value)));
             }
         };
-        let index = match runtime.native_to_int64_clamp(
+        let index = match super::super::slice::primitive_clamp(
+            runtime,
             self.0.realm,
-            &value,
-            0,
-            self.0.length,
+            value,
             self.0.length,
         )? {
             NativeConversion::Value(value) => value,
@@ -274,7 +287,7 @@ impl TypedSliceResume {
             }
         };
         match self.0.phase {
-            Phase::Start(end) => {
+            Phase::Start => {
                 let offset = if matches!(self.0.kind, TypedSliceKind::Subarray) {
                     let snapshot = runtime.typed_array_snapshot(&self.0.source)?;
                     u64::from(snapshot.byte_offset)
@@ -296,6 +309,7 @@ impl TypedSliceResume {
                 } else {
                     0
                 };
+                let end = std::mem::replace(&mut self.0.end, JsValue::Undefined);
                 let next = {
                     let updated_0 = Phase::End {
                         start: index,
@@ -304,7 +318,7 @@ impl TypedSliceResume {
                     self.0.phase = updated_0;
                     self
                 };
-                if matches!(end, Value::Undefined) {
+                if matches!(end, JsValue::Undefined) {
                     let length = next.length;
                     return next.select(runtime, index, offset, length, true);
                 }
@@ -369,10 +383,14 @@ impl TypedSliceResume {
             ));
         };
         Ok(TypedSliceStep::Complete(match self.0.kind {
-            TypedSliceKind::Slice => {
-                runtime.finish_typed_slice(self.0.realm, self.0.source, target, start, count)?
-            }
-            TypedSliceKind::Subarray => Completion::Return(Value::Object(target)),
+            TypedSliceKind::Slice => runtime.finish_typed_slice(
+                self.0.realm,
+                self.0.source.clone(),
+                target,
+                start,
+                count,
+            )?,
+            TypedSliceKind::Subarray => Completion::Return(JsValue::Object(target.into_handle())),
         }))
     }
 }
@@ -387,8 +405,8 @@ fn finish(
             TypedSliceStep::Primitive { mut resume } => {
                 let value = resume.take_primitive_value();
                 {
-                    let result = if matches!(value, Value::Object(_)) {
-                        runtime.to_primitive(realm, value, ToPrimitiveHint::Number)?
+                    let result = if matches!(value, JsValue::Object(_)) {
+                        runtime.to_primitive_jsvalue(realm, value, ToPrimitiveHint::Number)?
                     } else {
                         Completion::Return(value)
                     };
@@ -421,9 +439,9 @@ fn finish(
     }
 }
 
-#[derive(Default)]
 struct TypedSliceStepPending {
-    primitive_value: Option<Value>,
+    runtime: Runtime,
+    primitive_value: Option<JsValue>,
     species_source: Option<ObjectRef>,
     species_element: Option<TypedArrayElementKind>,
     species_length: Option<u64>,
@@ -433,8 +451,37 @@ struct TypedSliceStepPending {
     species_view_offset: Option<u64>,
     species_view_length: Option<Option<u64>>,
 }
+impl TypedSliceStepPending {
+    fn new(runtime: &Runtime) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            primitive_value: None,
+            species_source: None,
+            species_element: None,
+            species_length: None,
+            species_view_source: None,
+            species_view_element: None,
+            species_view_buffer: None,
+            species_view_offset: None,
+            species_view_length: None,
+        }
+    }
+
+    /// Release the internal edges still owned when the request is abandoned
+    /// before its step consumed them. Taken fields are empty here.
+    fn release_owned(&mut self) {
+        if let Some(value) = self.primitive_value.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
+}
+impl Drop for TypedSliceStepPending {
+    fn drop(&mut self) {
+        self.release_owned();
+    }
+}
 impl TypedSliceStep {
-    pub(crate) fn request_primitive(value: Value, mut resume: TypedSliceResume) -> Self {
+    pub(crate) fn request_primitive(value: JsValue, mut resume: TypedSliceResume) -> Self {
         resume.0.pending_effect.primitive_value = Some(value);
         Self::Primitive { resume }
     }
@@ -466,7 +513,7 @@ impl TypedSliceStep {
     }
 }
 impl TypedSliceResume {
-    pub(crate) fn take_primitive_value(&mut self) -> Value {
+    pub(crate) fn take_primitive_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .primitive_value

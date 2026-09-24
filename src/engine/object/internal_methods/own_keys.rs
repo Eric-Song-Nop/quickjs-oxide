@@ -7,8 +7,8 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     atom::Atom,
     heap::ContextId,
-    object::{CompleteOrdinaryPropertyDescriptor, ObjectRef, PropertyKey},
-    value::{Value, conversion::NativeConversion},
+    object::{ObjectRef, PropertyKey},
+    value::{JsValue, Value, conversion::NativeConversion},
     vm::{Completion, call::DirectCallTarget},
 };
 use std::collections::HashSet;
@@ -40,21 +40,35 @@ pub(crate) struct KeysResumeState {
     realm: ContextId,
     phase: Phase,
 }
+impl Drop for KeysResumeState {
+    fn drop(&mut self) {
+        let list = match &mut self.phase {
+            Phase::Length { list, .. } | Phase::Number { list, .. } | Phase::Item { list, .. } => {
+                Some(std::mem::replace(list, JsValue::Undefined))
+            }
+            _ => None,
+        };
+        if let Some(value) = list {
+            let _ = self.pending_effect.runtime.release_jsvalue(value);
+        }
+    }
+}
 enum Phase {
+    Vacant,
     Method(MethodResume),
     Forward(RootedProxy),
     Trap(RootedProxy),
     Length {
         rooted: RootedProxy,
-        list: Value,
+        list: JsValue,
     },
     Number {
         rooted: RootedProxy,
-        list: Value,
+        list: JsValue,
     },
     Item {
         rooted: RootedProxy,
-        list: Value,
+        list: JsValue,
         length: u32,
         keys: Vec<PropertyKey>,
     },
@@ -87,26 +101,30 @@ impl KeysStep {
         realm: ContextId,
         object: ObjectRef,
     ) -> Result<Self, RuntimeError> {
-        method(realm, MethodStep::start(runtime, realm, object, "ownKeys")?)
+        method(
+            runtime,
+            realm,
+            MethodStep::start(runtime, realm, object, "ownKeys")?,
+        )
     }
 }
-fn method(realm: ContextId, step: MethodStep) -> Result<KeysStep, RuntimeError> {
+fn method(runtime: &Runtime, realm: ContextId, step: MethodStep) -> Result<KeysStep, RuntimeError> {
     Ok(match step {
         MethodStep::Read { mut resume } => {
             let object = resume.take_read_object();
             let key = resume.take_read_key();
-            let _ = resume.take_read_receiver();
+            runtime.release_jsvalue(resume.take_read_receiver())?;
             KeysStep::request_read(
-                Value::Object(object),
+                runtime.into_jsvalue(Value::Object(object))?,
                 key,
                 KeysResume(Box::new(KeysResumeState {
-                    pending_effect: KeysStepPending::default(),
+                    pending_effect: KeysStepPending::new(runtime.clone()),
                     realm,
                     phase: Phase::Method(resume),
                 })),
             )
         }
-        MethodStep::Throw(value) => KeysStep::Complete(NativeConversion::Throw(value)),
+        MethodStep::Throw(value) => KeysStep::Complete(NativeConversion::Throw(value.take())),
         MethodStep::Complete { mut resume } => {
             let rooted = resume.take_completed_rooted();
             let target = resume.take_completed_target();
@@ -115,17 +133,17 @@ fn method(realm: ContextId, step: MethodStep) -> Result<KeysStep, RuntimeError> 
                 None => KeysStep::request_keys(
                     rooted.target.clone(),
                     KeysResume(Box::new(KeysResumeState {
-                        pending_effect: KeysStepPending::default(),
+                        pending_effect: KeysStepPending::new(runtime.clone()),
                         realm,
                         phase: Phase::Forward(rooted),
                     })),
                 ),
                 Some(target) => KeysStep::request_call(
                     target,
-                    Value::Object(rooted.handler.clone()),
-                    vec![Value::Object(rooted.target.clone())],
+                    runtime.into_jsvalue(Value::Object(rooted.handler.clone()))?,
+                    vec![runtime.into_jsvalue(Value::Object(rooted.target.clone()))?],
                     KeysResume(Box::new(KeysResumeState {
-                        pending_effect: KeysStepPending::default(),
+                        pending_effect: KeysStepPending::new(runtime.clone()),
                         realm,
                         phase: Phase::Trap(rooted),
                     })),
@@ -136,56 +154,58 @@ fn method(realm: ContextId, step: MethodStep) -> Result<KeysStep, RuntimeError> 
 }
 fn fail(runtime: &Runtime, realm: ContextId, message: &str) -> Result<KeysStep, RuntimeError> {
     Ok(KeysStep::Complete(NativeConversion::Throw(
-        runtime.new_native_error(realm, NativeErrorKind::Type, message)?,
+        runtime.new_native_error_jsvalue(realm, NativeErrorKind::Type, message)?,
     )))
 }
 fn items(
     runtime: &Runtime,
     realm: ContextId,
     rooted: RootedProxy,
-    list: Value,
+    list: JsValue,
     length: u32,
     keys: Vec<PropertyKey>,
 ) -> Result<KeysStep, RuntimeError> {
+    let mut resume = KeysResume(Box::new(KeysResumeState {
+        pending_effect: KeysStepPending::new(runtime.clone()),
+        realm,
+        phase: Phase::Item {
+            rooted,
+            list,
+            length,
+            keys,
+        },
+    }));
+    let Phase::Item { list, keys, .. } = &resume.0.phase else {
+        unreachable!()
+    };
     if keys.len() < length as usize {
         let key = runtime.intern_property_key(&keys.len().to_string())?;
-        return Ok(KeysStep::request_read(
-            list.clone(),
-            key,
-            KeysResume(Box::new(KeysResumeState {
-                pending_effect: KeysStepPending::default(),
-                realm,
-                phase: Phase::Item {
-                    rooted,
-                    list,
-                    length,
-                    keys,
-                },
-            })),
-        ));
+        let receiver = runtime.dup_jsvalue(list)?;
+        return Ok(KeysStep::request_read(receiver, key, resume));
     }
-    // Pinned QuickJS reads every list element before it reports duplicate keys.
     let mut atoms = HashSet::new();
     atoms
         .try_reserve(keys.len())
         .map_err(|_| RuntimeError::Invariant("Proxy ownKeys set allocation failed"))?;
-    for key in &keys {
+    for key in keys {
         if !atoms.insert(key.atom()) {
             return fail(runtime, realm, "proxy: duplicate property");
         }
     }
-    Ok(KeysStep::request_extensible(
-        rooted.target.clone(),
-        KeysResume(Box::new(KeysResumeState {
-            pending_effect: KeysStepPending::default(),
-            realm,
-            phase: Phase::Extensible {
-                rooted,
-                keys,
-                atoms,
-            },
-        })),
-    ))
+    let Phase::Item {
+        rooted, list, keys, ..
+    } = std::mem::replace(&mut resume.0.phase, Phase::Vacant)
+    else {
+        unreachable!()
+    };
+    runtime.release_jsvalue(list)?;
+    let object = rooted.target.clone();
+    resume.0.phase = Phase::Extensible {
+        rooted,
+        keys,
+        atoms,
+    };
+    Ok(KeysStep::request_extensible(object, resume))
 }
 fn check_next(
     runtime: &Runtime,
@@ -200,7 +220,7 @@ fn check_next(
             state.rooted.target.clone(),
             key.clone(),
             KeysResume(Box::new(KeysResumeState {
-                pending_effect: KeysStepPending::default(),
+                pending_effect: KeysStepPending::new(runtime.clone()),
                 realm,
                 phase: Phase::Descriptor { state, key },
             })),
@@ -217,10 +237,20 @@ fn check_next(
 }
 impl KeysResume {
     pub(crate) fn resume(
-        self,
+        mut self,
         runtime: &Runtime,
         result: Completion,
     ) -> Result<KeysStep, RuntimeError> {
+        if !matches!(
+            &self.0.phase,
+            Phase::Method(_) | Phase::Trap(_) | Phase::Length { .. } | Phase::Item { .. }
+        ) {
+            let (Completion::Return(value) | Completion::Throw(value)) = result;
+            let _ = runtime.release_jsvalue(value);
+            return Err(RuntimeError::Invariant(
+                "ownKeys received an unexpected resume reply",
+            ));
+        }
         let value = match result {
             Completion::Return(value) => value,
             Completion::Throw(value) => {
@@ -228,26 +258,29 @@ impl KeysResume {
             }
         };
         let realm = self.0.realm;
-        match self.0.phase {
-            Phase::Method(resume) => {
-                method(realm, resume.resume(runtime, Completion::Return(value))?)
+        match std::mem::replace(&mut self.0.phase, Phase::Vacant) {
+            Phase::Method(resume) => method(
+                runtime,
+                realm,
+                resume.resume(runtime, Completion::Return(value))?,
+            ),
+            Phase::Trap(rooted) => {
+                self.0.phase = Phase::Length {
+                    rooted,
+                    list: value,
+                };
+                let key =
+                    runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Length)?;
+                let Phase::Length { list, .. } = &self.0.phase else {
+                    unreachable!()
+                };
+                let receiver = runtime.dup_jsvalue(list)?;
+                Ok(KeysStep::request_read(receiver, key, self))
             }
-            Phase::Trap(rooted) => Ok(KeysStep::request_read(
-                value.clone(),
-                runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Length)?,
-                Self(Box::new(KeysResumeState {
-                    pending_effect: KeysStepPending::default(),
-                    realm,
-                    phase: Phase::Length {
-                        rooted,
-                        list: value,
-                    },
-                })),
-            )),
             Phase::Length { rooted, list } => Ok(KeysStep::request_number(
                 value,
                 Self(Box::new(KeysResumeState {
-                    pending_effect: KeysStepPending::default(),
+                    pending_effect: KeysStepPending::new(runtime.clone()),
                     realm,
                     phase: Phase::Number { rooted, list },
                 })),
@@ -256,18 +289,36 @@ impl KeysResume {
                 rooted,
                 list,
                 length,
-                mut keys,
+                keys,
             } => {
-                let key = match value {
-                    Value::String(value) => runtime.intern_property_key_js_string(&value)?,
-                    Value::Symbol(value) => PropertyKey::from(value),
-                    _ => {
-                        return fail(
-                            runtime,
-                            realm,
-                            "proxy: properties must be strings or symbols",
-                        );
+                self.0.phase = Phase::Item {
+                    rooted,
+                    list,
+                    length,
+                    keys,
+                };
+                if !matches!(value, JsValue::String(_) | JsValue::Symbol(_)) {
+                    runtime.release_jsvalue(value)?;
+                    return fail(
+                        runtime,
+                        realm,
+                        "proxy: properties must be strings or symbols",
+                    );
+                }
+                let key = match runtime.property_key_from_primitive_jsvalue(realm, value)? {
+                    NativeConversion::Value(key) => key,
+                    NativeConversion::Throw(value) => {
+                        return Ok(KeysStep::Complete(NativeConversion::Throw(value)));
                     }
+                };
+                let Phase::Item {
+                    rooted,
+                    list,
+                    length,
+                    mut keys,
+                } = std::mem::replace(&mut self.0.phase, Phase::Vacant)
+                else {
+                    unreachable!()
                 };
                 keys.push(key);
                 items(runtime, realm, rooted, list, length, keys)
@@ -276,15 +327,25 @@ impl KeysResume {
         }
     }
     pub(crate) fn number(
-        self,
+        mut self,
         runtime: &Runtime,
         result: NativeConversion<f64>,
     ) -> Result<KeysStep, RuntimeError> {
-        let Phase::Number { rooted, list } = self.0.phase else {
+        if !matches!(&self.0.phase, Phase::Number { .. }) {
+            if let NativeConversion::Throw(value) = result {
+                let _ = runtime.release_jsvalue(value);
+            }
+            return Err(RuntimeError::Invariant(
+                "ownKeys received an unexpected number reply",
+            ));
+        }
+        let Phase::Number { rooted, list } = std::mem::replace(&mut self.0.phase, Phase::Vacant)
+        else {
             return Err(RuntimeError::Invariant(
                 "ownKeys received unexpected numeric reply",
             ));
         };
+        self.0.phase = Phase::Number { rooted, list };
         let length = match result {
             NativeConversion::Value(value) => Runtime::to_uint32_number(value),
             NativeConversion::Throw(value) => {
@@ -294,18 +355,30 @@ impl KeysResume {
         let mut keys = Vec::new();
         keys.try_reserve_exact(length as usize)
             .map_err(|_| RuntimeError::Invariant("Proxy ownKeys list allocation failed"))?;
+        let Phase::Number { rooted, list } = std::mem::replace(&mut self.0.phase, Phase::Vacant)
+        else {
+            unreachable!()
+        };
         items(runtime, self.0.realm, rooted, list, length, keys)
     }
     pub(crate) fn boolean(
-        self,
+        mut self,
         runtime: &Runtime,
         result: NativeConversion<bool>,
     ) -> Result<KeysStep, RuntimeError> {
+        if !matches!(&self.0.phase, Phase::Extensible { .. }) {
+            if let NativeConversion::Throw(value) = result {
+                let _ = runtime.release_jsvalue(value);
+            }
+            return Err(RuntimeError::Invariant(
+                "ownKeys received an unexpected boolean reply",
+            ));
+        }
         let Phase::Extensible {
             rooted,
             keys,
             atoms,
-        } = self.0.phase
+        } = std::mem::replace(&mut self.0.phase, Phase::Vacant)
         else {
             return Err(RuntimeError::Invariant(
                 "ownKeys received unexpected boolean reply",
@@ -325,7 +398,7 @@ impl KeysResume {
         Ok(KeysStep::request_keys(
             rooted.target.clone(),
             Self(Box::new(KeysResumeState {
-                pending_effect: KeysStepPending::default(),
+                pending_effect: KeysStepPending::new(runtime.clone()),
                 realm: self.0.realm,
                 phase: Phase::TargetKeys {
                     rooted,
@@ -337,17 +410,25 @@ impl KeysResume {
         ))
     }
     pub(crate) fn keys(
-        self,
+        mut self,
         runtime: &Runtime,
         result: NativeConversion<Vec<PropertyKey>>,
     ) -> Result<KeysStep, RuntimeError> {
+        if !matches!(&self.0.phase, Phase::Forward(_) | Phase::TargetKeys { .. }) {
+            if let NativeConversion::Throw(value) = result {
+                let _ = runtime.release_jsvalue(value);
+            }
+            return Err(RuntimeError::Invariant(
+                "ownKeys received an unexpected keys reply",
+            ));
+        }
         let value = match result {
             NativeConversion::Value(value) => value,
             NativeConversion::Throw(value) => {
                 return Ok(KeysStep::Complete(NativeConversion::Throw(value)));
             }
         };
-        match self.0.phase {
+        match std::mem::replace(&mut self.0.phase, Phase::Vacant) {
             Phase::Forward(_rooted) => Ok(KeysStep::Complete(NativeConversion::Value(value))),
             Phase::TargetKeys {
                 rooted,
@@ -371,11 +452,21 @@ impl KeysResume {
         }
     }
     pub(crate) fn descriptor(
-        self,
+        mut self,
         runtime: &Runtime,
-        result: NativeConversion<Option<CompleteOrdinaryPropertyDescriptor>>,
+        result: NativeConversion<Option<crate::engine::object::OwnedCompletePropertyDescriptor>>,
     ) -> Result<KeysStep, RuntimeError> {
-        let Phase::Descriptor { mut state, key } = self.0.phase else {
+        if !matches!(&self.0.phase, Phase::Descriptor { .. }) {
+            if let NativeConversion::Throw(value) = result {
+                let _ = runtime.release_jsvalue(value);
+            }
+            return Err(RuntimeError::Invariant(
+                "ownKeys received an unexpected descriptor reply",
+            ));
+        }
+        let Phase::Descriptor { mut state, key } =
+            std::mem::replace(&mut self.0.phase, Phase::Vacant)
+        else {
             return Err(RuntimeError::Invariant(
                 "ownKeys received unexpected descriptor reply",
             ));
@@ -416,7 +507,7 @@ pub(super) fn finish(
                 let key = resume.take_read_key();
                 resume.resume(
                     runtime,
-                    runtime.get_value_property_in_realm(realm, receiver, &key)?,
+                    runtime.get_value_property_in_realm_jsvalue(realm, receiver, &key)?,
                 )?
             }
             KeysStep::Call { mut resume } => {
@@ -426,10 +517,10 @@ pub(super) fn finish(
                 {
                     let completion = match target {
                         DirectCallTarget::Callable(callable) => {
-                            runtime.call_internal(realm, &callable, receiver, &arguments)?
+                            runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?
                         }
                         DirectCallTarget::NonCallableProxy(proxy) => {
-                            runtime.call_proxy(realm, &proxy, receiver, &arguments)?
+                            runtime.call_proxy_jsvalue(realm, &proxy, receiver, arguments)?
                         }
                     };
                     resume.resume(runtime, completion)?
@@ -437,7 +528,7 @@ pub(super) fn finish(
             }
             KeysStep::Number { mut resume } => {
                 let value = resume.take_number_value();
-                resume.number(runtime, runtime.native_to_number(realm, &value)?)?
+                resume.number(runtime, runtime.native_to_number_jsvalue(realm, value)?)?
             }
             KeysStep::Keys { mut resume } => {
                 let object = resume.take_keys_object();
@@ -452,12 +543,183 @@ pub(super) fn finish(
                 let key = resume.take_descriptor_key();
                 resume.descriptor(
                     runtime,
-                    runtime.internal_get_own_property(realm, &object, &key)?,
+                    runtime.internal_get_own_property_owned(realm, &object, &key)?,
                 )?
             }
         };
     }
 }
+
+struct KeysStepPending {
+    runtime: Runtime,
+    read_receiver: Option<JsValue>,
+    read_key: Option<PropertyKey>,
+    call_target: Option<DirectCallTarget>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
+    number_value: Option<JsValue>,
+    keys_object: Option<ObjectRef>,
+    extensible_object: Option<ObjectRef>,
+    descriptor_object: Option<ObjectRef>,
+    descriptor_key: Option<PropertyKey>,
+}
+impl KeysStepPending {
+    fn new(runtime: Runtime) -> Self {
+        Self {
+            runtime,
+            read_receiver: None,
+            read_key: None,
+            call_target: None,
+            call_receiver: None,
+            call_arguments: None,
+            number_value: None,
+            keys_object: None,
+            extensible_object: None,
+            descriptor_object: None,
+            descriptor_key: None,
+        }
+    }
+}
+impl Drop for KeysStepPending {
+    /// Release the internal edges still held when the request is abandoned.
+    /// Consumption goes through `Option::take`; releases are defer-safe and
+    /// nothrow, and never run JavaScript.
+    fn drop(&mut self) {
+        if let Some(value) = self.read_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.call_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(values) = self.call_arguments.take() {
+            for value in values {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+        if let Some(value) = self.number_value.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
+}
+impl KeysStep {
+    pub(crate) fn request_read(
+        receiver: JsValue,
+        key: PropertyKey,
+        mut resume: KeysResume,
+    ) -> Self {
+        resume.0.pending_effect.read_receiver = Some(receiver);
+        resume.0.pending_effect.read_key = Some(key);
+        Self::Read { resume }
+    }
+    pub(crate) fn request_call(
+        target: DirectCallTarget,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
+        mut resume: KeysResume,
+    ) -> Self {
+        resume.0.pending_effect.call_target = Some(target);
+        resume.0.pending_effect.call_receiver = Some(receiver);
+        resume.0.pending_effect.call_arguments = Some(arguments);
+        Self::Call { resume }
+    }
+    pub(crate) fn request_number(value: JsValue, mut resume: KeysResume) -> Self {
+        resume.0.pending_effect.number_value = Some(value);
+        Self::Number { resume }
+    }
+    pub(crate) fn request_keys(object: ObjectRef, mut resume: KeysResume) -> Self {
+        resume.0.pending_effect.keys_object = Some(object);
+        Self::Keys { resume }
+    }
+    pub(crate) fn request_extensible(object: ObjectRef, mut resume: KeysResume) -> Self {
+        resume.0.pending_effect.extensible_object = Some(object);
+        Self::Extensible { resume }
+    }
+    pub(crate) fn request_descriptor(
+        object: ObjectRef,
+        key: PropertyKey,
+        mut resume: KeysResume,
+    ) -> Self {
+        resume.0.pending_effect.descriptor_object = Some(object);
+        resume.0.pending_effect.descriptor_key = Some(key);
+        Self::Descriptor { resume }
+    }
+}
+impl KeysResume {
+    pub(crate) fn take_read_receiver(&mut self) -> JsValue {
+        self.0
+            .pending_effect
+            .read_receiver
+            .take()
+            .expect("KeysStep Read receiver")
+    }
+    pub(crate) fn take_read_key(&mut self) -> PropertyKey {
+        self.0
+            .pending_effect
+            .read_key
+            .take()
+            .expect("KeysStep Read key")
+    }
+    pub(crate) fn take_call_target(&mut self) -> DirectCallTarget {
+        self.0
+            .pending_effect
+            .call_target
+            .take()
+            .expect("KeysStep Call target")
+    }
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
+        self.0
+            .pending_effect
+            .call_receiver
+            .take()
+            .expect("KeysStep Call receiver")
+    }
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
+        self.0
+            .pending_effect
+            .call_arguments
+            .take()
+            .expect("KeysStep Call arguments")
+    }
+    pub(crate) fn take_number_value(&mut self) -> JsValue {
+        self.0
+            .pending_effect
+            .number_value
+            .take()
+            .expect("KeysStep Number value")
+    }
+    pub(crate) fn take_keys_object(&mut self) -> ObjectRef {
+        self.0
+            .pending_effect
+            .keys_object
+            .take()
+            .expect("KeysStep Keys object")
+    }
+    pub(crate) fn take_extensible_object(&mut self) -> ObjectRef {
+        self.0
+            .pending_effect
+            .extensible_object
+            .take()
+            .expect("KeysStep Extensible object")
+    }
+    pub(crate) fn take_descriptor_object(&mut self) -> ObjectRef {
+        self.0
+            .pending_effect
+            .descriptor_object
+            .take()
+            .expect("KeysStep Descriptor object")
+    }
+    pub(crate) fn take_descriptor_key(&mut self) -> PropertyKey {
+        self.0
+            .pending_effect
+            .descriptor_key
+            .take()
+            .expect("KeysStep Descriptor key")
+    }
+}
+const _: () = assert!(std::mem::size_of::<KeysStep>() <= 64);
+
+// S11 all-domain protocol bound; inline completion stays allocation-free.
+const _: () = assert!(std::mem::size_of::<KeysStep>() <= 64);
 
 #[cfg(test)]
 mod tests {
@@ -480,7 +742,10 @@ mod tests {
                 panic!("expected handler read")
             };
             let KeysStep::Call { resume, .. } = resume
-                .resume(&runtime, Completion::Return(callable))
+                .resume(
+                    &runtime,
+                    Completion::Return(runtime.into_jsvalue(callable).unwrap()),
+                )
                 .unwrap()
             else {
                 panic!("expected trap")
@@ -488,13 +753,16 @@ mod tests {
             let list = runtime.new_object(None).unwrap();
             let list_id = list.object_id();
             let KeysStep::Read { resume, .. } = resume
-                .resume(&runtime, Completion::Return(Value::Object(list)))
+                .resume(
+                    &runtime,
+                    Completion::Return(runtime.into_jsvalue(Value::Object(list)).unwrap()),
+                )
                 .unwrap()
             else {
                 panic!("expected length")
             };
             let KeysStep::Number { mut resume, .. } = resume
-                .resume(&runtime, Completion::Return(Value::Int(1)))
+                .resume(&runtime, Completion::Return(JsValue::Int(1)))
                 .unwrap()
             else {
                 panic!("expected conversion")
@@ -512,7 +780,10 @@ mod tests {
                     panic!("expected item")
                 };
                 let KeysStep::Extensible { resume: next, .. } = next
-                    .resume(&runtime, Completion::Return(Value::Symbol(symbol)))
+                    .resume(
+                        &runtime,
+                        Completion::Return(runtime.into_jsvalue(Value::Symbol(symbol)).unwrap()),
+                    )
                     .unwrap()
                 else {
                     panic!("expected target query")
@@ -563,132 +834,3 @@ mod tests {
         }
     }
 }
-
-#[derive(Default)]
-struct KeysStepPending {
-    read_receiver: Option<Value>,
-    read_key: Option<PropertyKey>,
-    call_target: Option<DirectCallTarget>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
-    number_value: Option<Value>,
-    keys_object: Option<ObjectRef>,
-    extensible_object: Option<ObjectRef>,
-    descriptor_object: Option<ObjectRef>,
-    descriptor_key: Option<PropertyKey>,
-}
-impl KeysStep {
-    pub(crate) fn request_read(receiver: Value, key: PropertyKey, mut resume: KeysResume) -> Self {
-        resume.0.pending_effect.read_receiver = Some(receiver);
-        resume.0.pending_effect.read_key = Some(key);
-        Self::Read { resume }
-    }
-    pub(crate) fn request_call(
-        target: DirectCallTarget,
-        receiver: Value,
-        arguments: Vec<Value>,
-        mut resume: KeysResume,
-    ) -> Self {
-        resume.0.pending_effect.call_target = Some(target);
-        resume.0.pending_effect.call_receiver = Some(receiver);
-        resume.0.pending_effect.call_arguments = Some(arguments);
-        Self::Call { resume }
-    }
-    pub(crate) fn request_number(value: Value, mut resume: KeysResume) -> Self {
-        resume.0.pending_effect.number_value = Some(value);
-        Self::Number { resume }
-    }
-    pub(crate) fn request_keys(object: ObjectRef, mut resume: KeysResume) -> Self {
-        resume.0.pending_effect.keys_object = Some(object);
-        Self::Keys { resume }
-    }
-    pub(crate) fn request_extensible(object: ObjectRef, mut resume: KeysResume) -> Self {
-        resume.0.pending_effect.extensible_object = Some(object);
-        Self::Extensible { resume }
-    }
-    pub(crate) fn request_descriptor(
-        object: ObjectRef,
-        key: PropertyKey,
-        mut resume: KeysResume,
-    ) -> Self {
-        resume.0.pending_effect.descriptor_object = Some(object);
-        resume.0.pending_effect.descriptor_key = Some(key);
-        Self::Descriptor { resume }
-    }
-}
-impl KeysResume {
-    pub(crate) fn take_read_receiver(&mut self) -> Value {
-        self.0
-            .pending_effect
-            .read_receiver
-            .take()
-            .expect("KeysStep Read receiver")
-    }
-    pub(crate) fn take_read_key(&mut self) -> PropertyKey {
-        self.0
-            .pending_effect
-            .read_key
-            .take()
-            .expect("KeysStep Read key")
-    }
-    pub(crate) fn take_call_target(&mut self) -> DirectCallTarget {
-        self.0
-            .pending_effect
-            .call_target
-            .take()
-            .expect("KeysStep Call target")
-    }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
-        self.0
-            .pending_effect
-            .call_receiver
-            .take()
-            .expect("KeysStep Call receiver")
-    }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
-        self.0
-            .pending_effect
-            .call_arguments
-            .take()
-            .expect("KeysStep Call arguments")
-    }
-    pub(crate) fn take_number_value(&mut self) -> Value {
-        self.0
-            .pending_effect
-            .number_value
-            .take()
-            .expect("KeysStep Number value")
-    }
-    pub(crate) fn take_keys_object(&mut self) -> ObjectRef {
-        self.0
-            .pending_effect
-            .keys_object
-            .take()
-            .expect("KeysStep Keys object")
-    }
-    pub(crate) fn take_extensible_object(&mut self) -> ObjectRef {
-        self.0
-            .pending_effect
-            .extensible_object
-            .take()
-            .expect("KeysStep Extensible object")
-    }
-    pub(crate) fn take_descriptor_object(&mut self) -> ObjectRef {
-        self.0
-            .pending_effect
-            .descriptor_object
-            .take()
-            .expect("KeysStep Descriptor object")
-    }
-    pub(crate) fn take_descriptor_key(&mut self) -> PropertyKey {
-        self.0
-            .pending_effect
-            .descriptor_key
-            .take()
-            .expect("KeysStep Descriptor key")
-    }
-}
-const _: () = assert!(std::mem::size_of::<KeysStep>() <= 64);
-
-// S11 all-domain protocol bound; inline completion stays allocation-free.
-const _: () = assert!(std::mem::size_of::<KeysStep>() <= 64);

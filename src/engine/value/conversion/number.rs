@@ -2,6 +2,7 @@
 use super::primitive::{PrimitiveResume, PrimitiveStep};
 use super::*;
 use crate::engine::object::CallableRef;
+use crate::engine::value::JsValue;
 
 pub(crate) enum NumberStep {
     Complete(NativeConversion<f64>),
@@ -27,10 +28,10 @@ pub(crate) struct NumberResumeState {
     primitive: PrimitiveResume,
 }
 impl NumberStep {
-    pub(crate) fn start(
+    pub(crate) fn start_jsvalue(
         runtime: &Runtime,
         realm: ContextId,
-        value: Value,
+        value: JsValue,
     ) -> Result<Self, RuntimeError> {
         from_primitive(
             runtime,
@@ -49,7 +50,9 @@ fn from_primitive(
             NumberStep::Complete(NativeConversion::Throw(value))
         }
         PrimitiveStep::Complete(Completion::Return(value)) => {
-            NumberStep::Complete(runtime.number_from_primitive(realm, &value)?)
+            let converted = runtime.number_from_primitive_jsvalue(realm, &value);
+            runtime.release_jsvalue(value)?;
+            NumberStep::Complete(converted?)
         }
         PrimitiveStep::Get { mut resume } => {
             let (object, key) = resume.take_get();
@@ -57,7 +60,7 @@ fn from_primitive(
                 object,
                 key,
                 NumberResume(Box::new(NumberResumeState {
-                    pending_effect: NumberStepPending::default(),
+                    pending_effect: NumberStepPending::new(runtime),
                     realm,
                     primitive: resume,
                 })),
@@ -72,7 +75,7 @@ fn from_primitive(
                 receiver,
                 arguments,
                 NumberResume(Box::new(NumberResumeState {
-                    pending_effect: NumberStepPending::default(),
+                    pending_effect: NumberStepPending::new(runtime),
                     realm,
                     primitive: resume,
                 })),
@@ -94,13 +97,40 @@ impl NumberResume {
     }
 }
 
-#[derive(Default)]
 struct NumberStepPending {
+    runtime: Runtime,
     read_object: Option<ObjectRef>,
     read_key: Option<PropertyKey>,
     call_callable: Option<CallableRef>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
+}
+impl NumberStepPending {
+    fn new(runtime: &Runtime) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            read_object: None,
+            read_key: None,
+            call_callable: None,
+            call_receiver: None,
+            call_arguments: None,
+        }
+    }
+
+    /// Release every edge that was not consumed by a completed step.
+    fn release_owned(&mut self) {
+        if let Some(receiver) = self.call_receiver.take() {
+            let _ = self.runtime.release_jsvalue(receiver);
+        }
+        for argument in self.call_arguments.take().into_iter().flatten() {
+            let _ = self.runtime.release_jsvalue(argument);
+        }
+    }
+}
+impl Drop for NumberStepPending {
+    fn drop(&mut self) {
+        self.release_owned();
+    }
 }
 impl NumberStep {
     pub(crate) fn request_read(
@@ -114,8 +144,8 @@ impl NumberStep {
     }
     pub(crate) fn request_call(
         callable: CallableRef,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: NumberResume,
     ) -> Self {
         resume.0.pending_effect.call_callable = Some(callable);
@@ -146,14 +176,14 @@ impl NumberResume {
             .take()
             .expect("NumberStep Call callable")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver
             .take()
             .expect("NumberStep Call receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .pending_effect
             .call_arguments

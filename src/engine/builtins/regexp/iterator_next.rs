@@ -4,7 +4,7 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::{ContextId, ObjectPayload},
     object::{ObjectRef, PropertyKey, operations::InternalSetResult},
-    value::{JsString, Value, conversion::NativeConversion},
+    value::{JsString, JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion, ToPrimitiveHint,
         call::{NativeInvocation, NativeInvokeOutcome},
@@ -51,9 +51,24 @@ pub(crate) struct RegExpIteratorResumeState {
     matched: Option<ObjectRef>,
     // These getter results remain live through the following conversions and
     // lastIndex setter, as in the synchronous algorithm's local bindings.
-    match_value: Value,
-    index_value: Value,
+    match_value: JsValue,
+    index_value: JsValue,
+    converted: JsValue,
     phase: Phase,
+}
+impl Drop for RegExpIteratorResumeState {
+    fn drop(&mut self) {
+        for value in [
+            &mut self.match_value,
+            &mut self.index_value,
+            &mut self.converted,
+        ] {
+            let _ = self
+                .step_pending
+                .runtime
+                .release_jsvalue(std::mem::replace(value, JsValue::Undefined));
+        }
+    }
 }
 impl RegExpIteratorStep {
     pub(crate) fn start(
@@ -66,31 +81,34 @@ impl RegExpIteratorStep {
                 "RegExp String Iterator next did not receive an iterator-next invocation",
             ));
         };
-        let iterator = match this_value {
-            Value::Object(iterator)
-                if matches!(
-                    runtime
-                        .0
-                        .state
-                        .borrow()
-                        .heap
-                        .object(iterator.object_id())?
-                        .payload,
-                    ObjectPayload::RegExpStringIterator { .. }
-                ) =>
-            {
-                iterator.clone()
-            }
-            _ => {
-                return Ok(Self::Complete(NativeInvokeOutcome::Completion(
-                    Completion::Throw(runtime.new_native_error(
-                        realm,
-                        NativeErrorKind::Type,
-                        "RegExp String Iterator object expected",
-                    )?),
-                )));
-            }
+        let JsValue::Object(iterator_id) = this_value else {
+            return Ok(Self::Complete(NativeInvokeOutcome::Completion(
+                Completion::Throw(runtime.new_native_error_jsvalue(
+                    realm,
+                    NativeErrorKind::Type,
+                    "RegExp String Iterator object expected",
+                )?),
+            )));
         };
+        let iterator = ObjectRef::from_borrowed_handle(runtime.clone(), *iterator_id)?;
+        if !matches!(
+            runtime
+                .0
+                .state
+                .borrow()
+                .heap
+                .object(iterator.object_id())?
+                .payload,
+            ObjectPayload::RegExpStringIterator { .. }
+        ) {
+            return Ok(Self::Complete(NativeInvokeOutcome::Completion(
+                Completion::Throw(runtime.new_native_error_jsvalue(
+                    realm,
+                    NativeErrorKind::Type,
+                    "RegExp String Iterator object expected",
+                )?),
+            )));
+        }
         let (regexp_id, string, global, full_unicode, done) = runtime
             .0
             .state
@@ -99,16 +117,16 @@ impl RegExpIteratorStep {
             .regexp_string_iterator_state(iterator.object_id())?;
         if done {
             return Ok(Self::Complete(NativeInvokeOutcome::IteratorNextRaw {
-                value: Value::Undefined,
+                value: JsValue::Undefined,
                 done: true,
             }));
         }
         let regexp = ObjectRef::from_borrowed_handle(runtime.clone(), regexp_id)?;
         Ok(Self::make_exec(
-            Value::Object(regexp.clone()),
-            Value::String(string.clone()),
+            JsValue::Object(regexp.clone().into_handle()),
+            runtime.into_jsvalue(Value::String(string.clone()))?,
             RegExpIteratorResume(Box::new(RegExpIteratorResumeState {
-                step_pending: RegExpIteratorStepPending::default(),
+                step_pending: RegExpIteratorStepPending::new(runtime),
                 scheduler_set_key: None,
                 realm,
                 iterator,
@@ -117,8 +135,9 @@ impl RegExpIteratorStep {
                 global,
                 full_unicode,
                 matched: None,
-                match_value: Value::Undefined,
-                index_value: Value::Undefined,
+                match_value: JsValue::Undefined,
+                index_value: JsValue::Undefined,
+                converted: JsValue::Undefined,
                 phase: Phase::Exec,
             })),
         ))
@@ -133,16 +152,24 @@ impl RegExpIteratorResume {
         self.0.scheduler_set_key.take().expect("waiting Set key")
     }
 
-    fn abrupt(self, value: Value) -> RegExpIteratorStep {
-        RegExpIteratorStep::Complete(NativeInvokeOutcome::Completion(Completion::Throw(value)))
+    fn abrupt(
+        self,
+        _runtime: &Runtime,
+        value: JsValue,
+    ) -> Result<RegExpIteratorStep, RuntimeError> {
+        Ok(RegExpIteratorStep::Complete(
+            NativeInvokeOutcome::Completion(Completion::Throw(value)),
+        ))
     }
-    fn yielded(self) -> Result<RegExpIteratorStep, RuntimeError> {
+    fn yielded(mut self) -> Result<RegExpIteratorStep, RuntimeError> {
         Ok(RegExpIteratorStep::Complete(
             NativeInvokeOutcome::IteratorNextRaw {
-                value: Value::Object(
+                value: JsValue::Object(
                     self.0
                         .matched
-                        .ok_or(RuntimeError::Invariant("RegExp iterator lost match result"))?,
+                        .take()
+                        .ok_or(RuntimeError::Invariant("RegExp iterator lost match result"))?
+                        .into_handle(),
                 ),
                 done: false,
             },
@@ -155,12 +182,18 @@ impl RegExpIteratorResume {
     ) -> Result<RegExpIteratorStep, RuntimeError> {
         let value = match reply {
             Completion::Return(value) => value,
-            Completion::Throw(value) => return Ok(self.abrupt(value)),
+            Completion::Throw(value) => {
+                return Ok(RegExpIteratorStep::Complete(
+                    NativeInvokeOutcome::Completion(Completion::Throw(value)),
+                ));
+            }
         };
+        let previous = std::mem::replace(&mut self.0.converted, value);
+        runtime.release_jsvalue(previous)?;
         match self.0.phase {
             Phase::Exec => {
-                match value {
-                    Value::Null => {
+                match &self.0.converted {
+                    JsValue::Null => {
                         runtime
                             .0
                             .state
@@ -169,12 +202,19 @@ impl RegExpIteratorResume {
                             .finish_regexp_string_iterator(self.0.iterator.object_id())?;
                         return Ok(RegExpIteratorStep::Complete(
                             NativeInvokeOutcome::IteratorNextRaw {
-                                value: Value::Undefined,
+                                value: JsValue::Undefined,
                                 done: true,
                             },
                         ));
                     }
-                    Value::Object(matched) => self.0.matched = Some(matched),
+                    JsValue::Object(_) => {
+                        let JsValue::Object(id) =
+                            std::mem::replace(&mut self.0.converted, JsValue::Undefined)
+                        else {
+                            unreachable!()
+                        };
+                        self.0.matched = Some(ObjectRef::from_owned_handle(runtime.clone(), id));
+                    }
                     _ => {
                         return Err(RuntimeError::Invariant(
                             "RegExpExec returned neither an object nor null",
@@ -199,31 +239,40 @@ impl RegExpIteratorResume {
                 ))
             }
             Phase::MatchString => {
-                self.0.match_value = value.clone();
-                Ok(RegExpIteratorStep::make_string(value, self))
+                self.0.match_value = std::mem::replace(&mut self.0.converted, JsValue::Undefined);
+                Ok(RegExpIteratorStep::make_string(
+                    runtime.dup_jsvalue(&self.0.match_value)?,
+                    self,
+                ))
             }
             Phase::LastIndex => {
-                self.0.index_value = value.clone();
+                self.0.index_value = std::mem::replace(&mut self.0.converted, JsValue::Undefined);
                 self.0.phase = Phase::Advance;
-                Ok(RegExpIteratorStep::make_primitive(value, self))
+                Ok(RegExpIteratorStep::make_primitive(
+                    runtime.dup_jsvalue(&self.0.index_value)?,
+                    self,
+                ))
             }
             Phase::Advance => {
-                if matches!(value, Value::Object(_)) {
+                if matches!(self.0.converted, JsValue::Object(_)) {
                     return Err(RuntimeError::Invariant(
                         "RegExp iterator length conversion returned an object",
                     ));
                 }
-                let current = match runtime.native_to_length(self.0.realm, &value)? {
-                    NativeConversion::Value(value) => value,
-                    NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
-                };
+                let current =
+                    match runtime.number_from_primitive_jsvalue(self.0.realm, &self.0.converted)? {
+                        NativeConversion::Value(value) => Runtime::length_from_number(value),
+                        NativeConversion::Throw(value) => {
+                            return self.abrupt(runtime, value);
+                        }
+                    };
                 let next = advance_string_index(&self.0.string, current, self.0.full_unicode);
                 self.0.phase = Phase::Set;
                 Ok(RegExpIteratorStep::make_set(
                     self.0.regexp.clone(),
                     runtime
                         .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::LastIndex)?,
-                    Value::number(next as f64),
+                    runtime.into_jsvalue(Value::number(next as f64))?,
                     self,
                 ))
             }
@@ -238,13 +287,16 @@ impl RegExpIteratorResume {
         reply: NativeConversion<JsString>,
     ) -> Result<RegExpIteratorStep, RuntimeError> {
         if !matches!(self.0.phase, Phase::MatchString) {
+            if let NativeConversion::Throw(value) = reply {
+                runtime.release_jsvalue(value)?;
+            }
             return Err(RuntimeError::Invariant(
                 "RegExp iterator string phase mismatch",
             ));
         }
         let string = match reply {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
+            NativeConversion::Throw(value) => return self.abrupt(runtime, value),
         };
         if !string.is_empty() {
             return self.yielded();
@@ -263,12 +315,15 @@ impl RegExpIteratorResume {
         reply: NativeConversion<InternalSetResult>,
     ) -> Result<RegExpIteratorStep, RuntimeError> {
         if !matches!(self.0.phase, Phase::Set) {
+            if let NativeConversion::Throw(value) = reply {
+                runtime.release_jsvalue(value)?;
+            }
             return Err(RuntimeError::Invariant(
                 "RegExp iterator set phase mismatch",
             ));
         }
         if let Some(value) = runtime.finish_set_property_or_throw(self.0.realm, &key, reply)? {
-            return Ok(self.abrupt(value));
+            return self.abrupt(runtime, value);
         }
         self.yielded()
     }
@@ -296,13 +351,13 @@ pub(crate) fn finish(
             }
             RegExpIteratorStep::String { mut resume } => {
                 let value = resume.take_string_value();
-                resume.string(runtime, runtime.native_to_js_string(realm, &value)?)?
+                resume.string(runtime, runtime.native_to_js_string_jsvalue(realm, value)?)?
             }
             RegExpIteratorStep::Primitive { mut resume } => {
                 let value = resume.take_primitive_value();
                 resume.resume(
                     runtime,
-                    runtime.to_primitive(realm, value, ToPrimitiveHint::Number)?,
+                    runtime.to_primitive_jsvalue(realm, value, ToPrimitiveHint::Number)?,
                 )?
             }
             RegExpIteratorStep::Set { mut resume } => {
@@ -312,12 +367,12 @@ pub(crate) fn finish(
                 resume.set(
                     runtime,
                     key.clone(),
-                    runtime.internal_set(
+                    runtime.internal_set_jsvalue(
                         realm,
                         &object,
                         &key,
                         value,
-                        Value::Object(object.clone()),
+                        JsValue::Object(object.clone().into_handle()),
                     )?,
                 )?
             }
@@ -325,16 +380,48 @@ pub(crate) fn finish(
     }
 }
 
-#[derive(Default)]
 pub(crate) struct RegExpIteratorStepPending {
-    regexp: Option<Value>,
-    input: Option<Value>,
+    runtime: Runtime,
+    regexp: Option<JsValue>,
+    input: Option<JsValue>,
     object: Option<ObjectRef>,
     key: Option<PropertyKey>,
-    value: Option<Value>,
+    value: Option<JsValue>,
+}
+impl RegExpIteratorStepPending {
+    fn new(runtime: &Runtime) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            regexp: None,
+            input: None,
+            object: None,
+            key: None,
+            value: None,
+        }
+    }
+
+    /// Release the internal edges still owned when the request is abandoned
+    /// before its step consumed them. Taken fields are empty here.
+    fn release_owned(&mut self) {
+        for value in [self.regexp.take(), self.input.take(), self.value.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
+}
+impl Drop for RegExpIteratorStepPending {
+    fn drop(&mut self) {
+        self.release_owned();
+    }
 }
 impl RegExpIteratorStep {
-    pub(crate) fn make_exec(regexp: Value, input: Value, mut resume: RegExpIteratorResume) -> Self {
+    pub(crate) fn make_exec(
+        regexp: JsValue,
+        input: JsValue,
+        mut resume: RegExpIteratorResume,
+    ) -> Self {
         resume.0.step_pending.regexp = Some(regexp);
         resume.0.step_pending.input = Some(input);
         Self::Exec { resume }
@@ -348,18 +435,18 @@ impl RegExpIteratorStep {
         resume.0.step_pending.key = Some(key);
         Self::Read { resume }
     }
-    pub(crate) fn make_string(value: Value, mut resume: RegExpIteratorResume) -> Self {
+    pub(crate) fn make_string(value: JsValue, mut resume: RegExpIteratorResume) -> Self {
         resume.0.step_pending.value = Some(value);
         Self::String { resume }
     }
-    pub(crate) fn make_primitive(value: Value, mut resume: RegExpIteratorResume) -> Self {
+    pub(crate) fn make_primitive(value: JsValue, mut resume: RegExpIteratorResume) -> Self {
         resume.0.step_pending.value = Some(value);
         Self::Primitive { resume }
     }
     pub(crate) fn make_set(
         object: ObjectRef,
         key: PropertyKey,
-        value: Value,
+        value: JsValue,
         mut resume: RegExpIteratorResume,
     ) -> Self {
         resume.0.step_pending.object = Some(object);
@@ -369,14 +456,14 @@ impl RegExpIteratorStep {
     }
 }
 impl RegExpIteratorResume {
-    pub(crate) fn take_exec_regexp(&mut self) -> Value {
+    pub(crate) fn take_exec_regexp(&mut self) -> JsValue {
         self.0
             .step_pending
             .regexp
             .take()
             .expect("RegExpIteratorStep::Exec lost regexp")
     }
-    pub(crate) fn take_exec_input(&mut self) -> Value {
+    pub(crate) fn take_exec_input(&mut self) -> JsValue {
         self.0
             .step_pending
             .input
@@ -399,7 +486,7 @@ impl RegExpIteratorResume {
             .expect("RegExpIteratorStep::Read lost key")
     }
 
-    pub(crate) fn take_string_value(&mut self) -> Value {
+    pub(crate) fn take_string_value(&mut self) -> JsValue {
         self.0
             .step_pending
             .value
@@ -407,7 +494,7 @@ impl RegExpIteratorResume {
             .expect("RegExpIteratorStep::String lost value")
     }
 
-    pub(crate) fn take_primitive_value(&mut self) -> Value {
+    pub(crate) fn take_primitive_value(&mut self) -> JsValue {
         self.0
             .step_pending
             .value
@@ -429,7 +516,7 @@ impl RegExpIteratorResume {
             .take()
             .expect("RegExpIteratorStep::Set lost key")
     }
-    pub(crate) fn take_set_value(&mut self) -> Value {
+    pub(crate) fn take_set_value(&mut self) -> JsValue {
         self.0
             .step_pending
             .value

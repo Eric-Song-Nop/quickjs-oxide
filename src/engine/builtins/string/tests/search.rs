@@ -1,3 +1,4 @@
+use crate::engine::atom::AtomIdx;
 use crate::engine::heap::{AutoInitProperty, PropertySlot};
 use crate::engine::object::shape::PropertyFlags;
 
@@ -90,7 +91,8 @@ fn string_includes_family_publishes_typed_autoinit_entries_and_identities() {
     let object = state.heap.object(prototype.object_id()).unwrap();
     let shape = state.heap.shape(object.shape).unwrap();
     for (name, selector, key) in &keys {
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert_eq!(
             shape.entries()[slot_index].flags,
             PropertyFlags::data(true, false, true),
@@ -161,26 +163,26 @@ fn string_includes_preserves_pinned_values_utf16_and_shared_magic_kernel() {
         (StringIncludesKind::EndsWith, "bc", None, true),
         (StringIncludesKind::EndsWith, "ab", Some(2), true),
     ] {
-        let mut readable = vec![Value::String(JsString::from_static(search))];
+        let mut readable = vec![js(&runtime, Value::String(JsString::from_static(search)))];
         if let Some(position) = position {
-            readable.push(Value::Int(position));
+            readable.push(JsValue::Int(position));
         }
-        assert_eq!(
-            runtime
-                .call_string_prototype_includes(
-                    context.realm,
-                    selector,
-                    NativeInvocation::Call {
-                        this_value: Value::String(JsString::from_static("abc")),
-                    },
-                    &NativeArguments {
-                        actual_arg_count: readable.len(),
-                        readable,
-                    },
-                )
-                .unwrap(),
-            Completion::Return(Value::Bool(expected)),
-        );
+        let arguments = NativeArguments {
+            actual_arg_count: readable.len(),
+            readable,
+        };
+        let completion = runtime
+            .call_string_prototype_includes(
+                context.realm,
+                selector,
+                NativeInvocation::Call {
+                    this_value: js(&runtime, Value::String(JsString::from_static("abc"))),
+                },
+                &arguments,
+            )
+            .unwrap();
+        release_arguments(&runtime, arguments);
+        assert_eq!(returned(&runtime, completion), Value::Bool(expected));
     }
 }
 

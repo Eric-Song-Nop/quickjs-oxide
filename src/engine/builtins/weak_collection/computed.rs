@@ -4,7 +4,7 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::{ContextId, WeakCollectionKey},
     object::{CallableRef, ObjectRef},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
@@ -14,7 +14,7 @@ pub(crate) enum ComputedStep {
     Complete(Completion),
     Call {
         callable: CallableRef,
-        arguments: Vec<Value>,
+        arguments: Vec<JsValue>,
         resume: ComputedResume,
     },
 }
@@ -34,7 +34,13 @@ const _: () = assert!(std::mem::size_of::<ComputedResume>() <= 8);
 pub(crate) struct ComputedResumeState {
     map: ObjectRef,
     key: WeakCollectionKey,
-    _key_owner: Value,
+    _key_owner: JsValue,
+}
+impl Drop for ComputedResumeState {
+    fn drop(&mut self) {
+        let value = std::mem::replace(&mut self._key_owner, JsValue::Undefined);
+        let _ = self.map.runtime().release_jsvalue(value);
+    }
 }
 impl ComputedStep {
     pub(crate) fn start(
@@ -53,42 +59,40 @@ impl ComputedStep {
         let key_value = arguments
             .readable
             .first()
-            .cloned()
             .ok_or(RuntimeError::Invariant("WeakMap key argv was not padded"))?;
-        let callback_value = arguments
-            .readable
-            .get(1)
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "WeakMap computed value argv was not padded",
-            ))?;
+        let callback_value = arguments.readable.get(1).ok_or(RuntimeError::Invariant(
+            "WeakMap computed value argv was not padded",
+        ))?;
         let callback = match callback_value {
-            Value::Object(ref object) => runtime.as_callable(object)?,
+            JsValue::Object(object) => runtime.as_callable_object(*object)?,
             _ => None,
         };
         let Some(callable) = callback else {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(realm, NativeErrorKind::Type, "not a function")?,
+                runtime.new_native_error_jsvalue(realm, NativeErrorKind::Type, "not a function")?,
             )));
         };
-        let Some(key) = runtime.weak_collection_key(&key_value, "WeakMap key")? else {
+        let Some(key) = runtime.weak_collection_key(key_value)? else {
             return Ok(Self::Complete(
                 runtime.invalid_weak_key(realm, WeakCollectionKind::Map)?,
             ));
         };
-        if let Some(value) = runtime.find_weak_map_record(map, key)? {
-            return Ok(Self::Complete(Completion::Return(
-                runtime.root_raw_value(&value)?,
-            )));
+        if let Some(value) = runtime.find_weak_map_record(&map, key)? {
+            return Ok(Self::Complete(Completion::Return(runtime.dup_jsvalue(
+                &JsValue::from_raw(value).ok_or(RuntimeError::Invariant(
+                    "WeakMap value has an internal sentinel",
+                ))?,
+            )?)));
         }
+        let resume = ComputedResume(Box::new(ComputedResumeState {
+            map,
+            key,
+            _key_owner: runtime.dup_jsvalue(key_value)?,
+        }));
         Ok(Self::Call {
             callable,
-            arguments: vec![key_value.clone()],
-            resume: ComputedResume(Box::new(ComputedResumeState {
-                map: map.clone(),
-                key,
-                _key_owner: key_value,
-            })),
+            arguments: vec![runtime.dup_jsvalue(key_value)?],
+            resume,
         })
     }
 }
@@ -101,8 +105,14 @@ impl ComputedResume {
         match reply {
             Completion::Throw(value) => Ok(ComputedStep::Complete(Completion::Throw(value))),
             Completion::Return(value) => {
-                runtime.delete_weak_map_record(&self.0.map, self.0.key)?;
-                runtime.set_weak_map_record(&self.0.map, self.0.key, value.clone())?;
+                let stored = (|| {
+                    runtime.delete_weak_map_record(&self.0.map, self.0.key)?;
+                    runtime.set_weak_map_record(&self.0.map, self.0.key, &value)
+                })();
+                if let Err(error) = stored {
+                    runtime.release_jsvalue(value)?;
+                    return Err(error);
+                }
                 Ok(ComputedStep::Complete(Completion::Return(value)))
             }
         }
@@ -122,7 +132,7 @@ pub(crate) fn finish(
                 resume,
             } => resume.resume(
                 runtime,
-                runtime.call_internal(realm, &callable, Value::Undefined, &arguments)?,
+                runtime.call_internal_jsvalue(realm, &callable, JsValue::Undefined, arguments)?,
             )?,
         };
     }

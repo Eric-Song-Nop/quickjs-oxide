@@ -2,7 +2,7 @@
 use crate::engine::{
     api::{Error, runtime::Runtime},
     code::runtime::PublishedFunctionSnapshot,
-    value::Value,
+    value::JsValue,
     vm::{exception::runtime_error_to_vm_error, stack::FrameTransaction},
 };
 #[derive(Clone, Copy)]
@@ -13,10 +13,13 @@ pub(super) enum Operation {
     Define(u32),
     Delete,
 }
-fn index(value: &Value) -> Option<u32> {
+fn index(runtime: &Runtime, value: &JsValue) -> Option<u32> {
     match value {
-        Value::Int(n) => u32::try_from(*n).ok(),
-        Value::String(s) => crate::engine::atom::AtomTable::canonical_array_index(s),
+        JsValue::Int(n) => u32::try_from(*n).ok(),
+        JsValue::String(id) => {
+            let text = super::super::numeric::string_payload(runtime, *id).ok()?;
+            crate::engine::atom::AtomTable::canonical_array_index(&text)
+        }
         _ => None,
     }
 }
@@ -35,7 +38,7 @@ pub(super) fn complete(
             let key = slots.pop()?;
             (slots.pop()?, key, value)
         };
-        let handled = match index(&key) {
+        let handled = match index(runtime, &key) {
             Some(index) => runtime
                 .try_dense_array_write_owned(&base, index, &value)
                 .map_err(runtime_error_to_vm_error)?,
@@ -46,6 +49,18 @@ pub(super) fn complete(
             slots.push(base)?;
             slots.push(key)?;
             slots.push(value)?;
+        } else {
+            // The stored slot retains its own edge; the consumed operands must
+            // still be released or their roots leak.
+            runtime
+                .release_jsvalue(key)
+                .map_err(runtime_error_to_vm_error)?;
+            runtime
+                .release_jsvalue(value)
+                .map_err(runtime_error_to_vm_error)?;
+            runtime
+                .release_jsvalue(base)
+                .map_err(runtime_error_to_vm_error)?;
         }
         #[cfg(feature = "profiling")]
         if handled {
@@ -69,18 +84,21 @@ pub(super) fn complete(
             .try_define_field_owned(&base, executable, key, &value)
             .map_err(runtime_error_to_vm_error)?,
         Operation::Delete => {
-            if matches!(value, Value::Int(_) | Value::String(_) | Value::Symbol(_)) {
+            if matches!(
+                value,
+                JsValue::Int(_) | JsValue::String(_) | JsValue::Symbol(_)
+            ) {
                 let key = super::super::property_keys::canonical(runtime, &value)?;
                 result = runtime
                     .try_delete_own_data(&base, &key)
                     .map_err(runtime_error_to_vm_error)?
-                    .map(Value::Bool);
+                    .map(JsValue::Bool);
             }
             result.is_some()
         }
         Operation::ElementRead(_) => {
-            result =
-                index(&value).and_then(|index| runtime.try_dense_array_kept_read(&base, index));
+            result = index(runtime, &value)
+                .and_then(|index| runtime.try_dense_array_kept_read(&base, index));
             result.is_some()
         }
         Operation::ElementWrite => unreachable!(),
@@ -92,17 +110,42 @@ pub(super) fn complete(
         return Ok(false);
     }
     match operation {
-        Operation::Define(_) => transaction.slots().push(base)?,
+        Operation::Define(_) => {
+            runtime
+                .release_jsvalue(value)
+                .map_err(runtime_error_to_vm_error)?;
+            transaction.slots().push(base)?;
+        }
         Operation::ElementRead(keep_key) => {
             let mut slots = transaction.slots();
             slots.push(base)?;
             if keep_key {
                 slots.push(value)?;
+            } else {
+                runtime
+                    .release_jsvalue(value)
+                    .map_err(runtime_error_to_vm_error)?;
             }
             slots.push(result.expect("read result"))?;
         }
-        Operation::Delete => transaction.slots().push(result.expect("delete result"))?,
-        Operation::Write(_) | Operation::ElementWrite => {}
+        Operation::Delete => {
+            runtime
+                .release_jsvalue(value)
+                .map_err(runtime_error_to_vm_error)?;
+            runtime
+                .release_jsvalue(base)
+                .map_err(runtime_error_to_vm_error)?;
+            transaction.slots().push(result.expect("delete result"))?;
+        }
+        Operation::Write(_) => {
+            runtime
+                .release_jsvalue(value)
+                .map_err(runtime_error_to_vm_error)?;
+            runtime
+                .release_jsvalue(base)
+                .map_err(runtime_error_to_vm_error)?;
+        }
+        Operation::ElementWrite => unreachable!(),
     }
     #[cfg(feature = "profiling")]
     crate::engine::api::profiling::record_owned_execution_event(match operation {

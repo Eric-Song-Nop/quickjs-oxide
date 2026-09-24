@@ -7,13 +7,19 @@ use crate::engine::{
     api::{runtime::Runtime, runtime_error::RuntimeError},
     builtins::native::{AtomicsNativeKind, AtomicsOperationKind},
     heap::ContextId,
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, Value, conversion::NativeConversion},
     vm::{Completion, ToPrimitiveHint, call::NativeArguments},
 };
 pub(crate) enum AtomicsStep {
     Complete(Completion),
-    Primitive { value: Value, resume: AtomicsResume },
-    Number { value: Value, resume: AtomicsResume },
+    Primitive {
+        value: JsValue,
+        resume: AtomicsResume,
+    },
+    Number {
+        value: JsValue,
+        resume: AtomicsResume,
+    },
 }
 enum Phase {
     Index,
@@ -37,13 +43,28 @@ impl std::ops::DerefMut for AtomicsResume {
 }
 const _: () = assert!(std::mem::size_of::<AtomicsResume>() <= 8);
 pub(crate) struct AtomicsResumeState {
+    runtime: Runtime,
+    converted: JsValue,
+    stored: JsValue,
     realm: ContextId,
     kind: AtomicsNativeKind,
-    arguments: Vec<Value>,
+    arguments: Vec<JsValue>,
     prepared: Option<AtomicAccessPreparation>,
     access: Option<AtomicAccess>,
     operand: [u8; 8],
     phase: Phase,
+}
+impl Drop for AtomicsResumeState {
+    fn drop(&mut self) {
+        for value in self.arguments.drain(..) {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        for value in [&mut self.converted, &mut self.stored] {
+            let _ = self
+                .runtime
+                .release_jsvalue(std::mem::replace(value, JsValue::Undefined));
+        }
+    }
 }
 impl AtomicsStep {
     pub(crate) fn start(
@@ -58,14 +79,20 @@ impl AtomicsStep {
             ));
         }
         let mut resume = AtomicsResume(Box::new(AtomicsResumeState {
+            runtime: runtime.clone(),
+            converted: JsValue::Undefined,
+            stored: JsValue::Undefined,
             realm,
             kind,
-            arguments: arguments.readable.clone(),
+            arguments: Vec::with_capacity(arguments.readable.len()),
             prepared: None,
             access: None,
             operand: [0; 8],
             phase: Phase::Index,
         }));
+        for value in &arguments.readable {
+            resume.arguments.push(runtime.dup_jsvalue(value)?);
+        }
         if kind == AtomicsNativeKind::IsLockFree {
             resume.phase = Phase::Size;
             return Ok(Self::Number {
@@ -74,10 +101,12 @@ impl AtomicsStep {
             });
         }
         let mode = resume.mode();
-        let view = resume.argument(0, "Atomics TypedArray was not readable")?;
-        resume.prepared = Some(match runtime.atomics_prepare_access(realm, &view, mode)? {
+        let view = resume.arguments.first().ok_or(RuntimeError::Invariant(
+            "Atomics TypedArray was not readable",
+        ))?;
+        resume.prepared = Some(match runtime.atomics_prepare_access(realm, view, mode)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(resume.abrupt(value)),
+            NativeConversion::Throw(value) => return resume.abrupt(runtime, value),
         });
         Ok(Self::Primitive {
             value: resume.argument(1, "Atomics index was not readable")?,
@@ -93,20 +122,21 @@ impl AtomicsResume {
             _ => AtomicAccessMode::Operation,
         }
     }
-    fn argument(&self, index: usize, message: &'static str) -> Result<Value, RuntimeError> {
-        self.0
-            .arguments
-            .get(index)
-            .cloned()
-            .ok_or(RuntimeError::Invariant(message))
+    fn argument(&self, index: usize, message: &'static str) -> Result<JsValue, RuntimeError> {
+        self.0.runtime.dup_jsvalue(
+            self.0
+                .arguments
+                .get(index)
+                .ok_or(RuntimeError::Invariant(message))?,
+        )
     }
     fn access(&self) -> Result<&AtomicAccess, RuntimeError> {
         self.0.access.as_ref().ok_or(RuntimeError::Invariant(
             "Atomics conversion lost its access",
         ))
     }
-    fn abrupt(self, value: Value) -> AtomicsStep {
-        AtomicsStep::Complete(Completion::Throw(value))
+    fn abrupt(self, __runtime: &Runtime, value: JsValue) -> Result<AtomicsStep, RuntimeError> {
+        Ok(AtomicsStep::Complete(Completion::Throw(value)))
     }
     fn modify(
         self,
@@ -117,10 +147,15 @@ impl AtomicsResume {
         let access = self.access()?;
         match runtime.atomics_revalidate_after_value(self.0.realm, access)? {
             NativeConversion::Value(()) => {}
-            NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
+            NativeConversion::Throw(value) => return self.abrupt(runtime, value),
         }
         Ok(AtomicsStep::Complete(Completion::Return(
-            runtime.atomics_modify(access, operation, self.0.operand, replacement)?,
+            runtime.into_jsvalue(runtime.atomics_modify(
+                access,
+                operation,
+                self.0.operand,
+                replacement,
+            )?)?,
         )))
     }
     pub(crate) fn resume(
@@ -130,18 +165,27 @@ impl AtomicsResume {
     ) -> Result<AtomicsStep, RuntimeError> {
         let value = match result {
             Completion::Return(value) => value,
-            Completion::Throw(value) => return Ok(self.abrupt(value)),
+            Completion::Throw(value) => {
+                return Ok(AtomicsStep::Complete(Completion::Throw(value)));
+            }
         };
-        if matches!(value, Value::Object(_)) {
+        let previous = std::mem::replace(&mut self.converted, value);
+        runtime.release_jsvalue(previous)?;
+        if matches!(self.converted, JsValue::Object(_)) {
             return Err(RuntimeError::Invariant(
                 "Atomics primitive conversion returned an object",
             ));
         }
         match self.0.phase {
             Phase::Index => {
-                let index = match runtime.native_to_index(self.0.realm, &value)? {
+                let number =
+                    match runtime.number_from_primitive_jsvalue(self.0.realm, &self.converted)? {
+                        NativeConversion::Value(value) => value,
+                        NativeConversion::Throw(value) => return self.abrupt(runtime, value),
+                    };
+                let index = match runtime.index_from_number(self.0.realm, number)? {
                     NativeConversion::Value(value) => value,
-                    NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
+                    NativeConversion::Throw(value) => return self.abrupt(runtime, value),
                 };
                 let prepared = self.0.prepared.take().ok_or(RuntimeError::Invariant(
                     "Atomics index lost validation snapshot",
@@ -154,17 +198,17 @@ impl AtomicsResume {
                         self.mode(),
                     )? {
                         NativeConversion::Value(value) => value,
-                        NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
+                        NativeConversion::Throw(value) => return self.abrupt(runtime, value),
                     },
                 );
                 if self.0.kind == AtomicsNativeKind::Operation(AtomicsOperationKind::Load) {
                     return Ok(AtomicsStep::Complete(Completion::Return(
-                        runtime.atomics_load(self.access()?)?,
+                        runtime.into_jsvalue(runtime.atomics_load(self.access()?)?)?,
                     )));
                 }
                 if self.0.kind == AtomicsNativeKind::Notify {
                     let value = self.argument(2, "Atomics.notify count was not readable")?;
-                    if matches!(value, Value::Undefined) {
+                    if matches!(value, JsValue::Undefined) {
                         return Ok(AtomicsStep::Complete(
                             runtime.atomics_notify_converted(self.access()?, i32::MAX)?,
                         ));
@@ -182,16 +226,27 @@ impl AtomicsResume {
                 })
             }
             Phase::Operand if self.0.kind == AtomicsNativeKind::Store => {
-                let access = self.access()?;
-                let stored = if access.snapshot.element.is_bigint() {
-                    match runtime.native_to_bigint(self.0.realm, &value)? {
-                        NativeConversion::Value(value) => Value::BigInt(value),
-                        NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
+                let element = self.access()?.snapshot.element;
+                self.stored = if element.is_bigint() {
+                    match runtime.bigint_from_primitive_jsvalue(self.0.realm, &self.converted)? {
+                        NativeConversion::Value(value) => {
+                            if matches!(
+                                self.converted,
+                                JsValue::BigInt(_) | JsValue::ShortBigInt(_)
+                            ) {
+                                runtime.dup_jsvalue(&self.converted)?
+                            } else {
+                                runtime.into_jsvalue(Value::BigInt(value))?
+                            }
+                        }
+                        NativeConversion::Throw(value) => return self.abrupt(runtime, value),
                     }
                 } else {
-                    let number = match runtime.native_to_number(self.0.realm, &value)? {
+                    let number = match runtime
+                        .number_from_primitive_jsvalue(self.0.realm, &self.converted)?
+                    {
                         NativeConversion::Value(value) => value,
-                        NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
+                        NativeConversion::Throw(value) => return self.abrupt(runtime, value),
                     };
                     let integer = if number.is_nan() {
                         0.0
@@ -199,36 +254,40 @@ impl AtomicsResume {
                         let integer = number.trunc();
                         if integer == 0.0 { 0.0 } else { integer }
                     };
-                    Value::number(integer)
+                    runtime.into_jsvalue(Value::number(integer))?
                 };
-                let bytes = match runtime.typed_array_convert_element(
+                let bytes = match runtime.typed_array_convert_element_jsvalue(
                     self.0.realm,
-                    access.snapshot.element,
-                    &stored,
+                    element,
+                    runtime.dup_jsvalue(&self.stored)?,
                 )? {
                     NativeConversion::Value(value) => value,
-                    NativeConversion::Throw(_) => {
+                    NativeConversion::Throw(thrown) => {
+                        runtime.release_jsvalue(thrown)?;
                         return Err(RuntimeError::Invariant(
                             "primitive Atomics.store value failed its second conversion",
                         ));
                     }
                 };
+                let access = self.access()?;
                 match runtime.atomics_revalidate_after_value(self.0.realm, access)? {
                     NativeConversion::Value(()) => {}
-                    NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
+                    NativeConversion::Throw(value) => return self.abrupt(runtime, value),
                 }
-                Ok(AtomicsStep::Complete(
-                    runtime.atomics_store_converted(access, stored, bytes)?,
-                ))
+                Ok(AtomicsStep::Complete(runtime.atomics_store_converted(
+                    access,
+                    &self.stored,
+                    bytes,
+                )?))
             }
             Phase::Operand => {
-                self.0.operand = match runtime.typed_array_convert_element(
+                self.0.operand = match runtime.typed_array_convert_element_jsvalue(
                     self.0.realm,
                     self.access()?.snapshot.element,
-                    &value,
+                    runtime.dup_jsvalue(&self.converted)?,
                 )? {
                     NativeConversion::Value(value) => value,
-                    NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
+                    NativeConversion::Throw(value) => return self.abrupt(runtime, value),
                 };
                 match self.0.kind {
                     AtomicsNativeKind::Operation(AtomicsOperationKind::CompareExchange) => {
@@ -254,13 +313,13 @@ impl AtomicsResume {
                 }
             }
             Phase::Replacement => {
-                let replacement = match runtime.typed_array_convert_element(
+                let replacement = match runtime.typed_array_convert_element_jsvalue(
                     self.0.realm,
                     self.access()?.snapshot.element,
-                    &value,
+                    runtime.dup_jsvalue(&self.converted)?,
                 )? {
                     NativeConversion::Value(value) => value,
-                    NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
+                    NativeConversion::Throw(value) => return self.abrupt(runtime, value),
                 };
                 self.modify(
                     runtime,
@@ -278,10 +337,10 @@ impl AtomicsResume {
     ) -> Result<AtomicsStep, RuntimeError> {
         let number = match result {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
+            NativeConversion::Throw(value) => return self.abrupt(runtime, value),
         };
         Ok(AtomicsStep::Complete(match self.0.phase {
-            Phase::Size => Completion::Return(Value::Bool(matches!(
+            Phase::Size => Completion::Return(JsValue::Bool(matches!(
                 atomic_to_int32_sat(number),
                 1 | 2 | 4 | 8
             ))),
@@ -309,10 +368,10 @@ pub(crate) fn finish(
             AtomicsStep::Complete(result) => return Ok(result),
             AtomicsStep::Primitive { value, resume } => resume.resume(
                 runtime,
-                runtime.to_primitive(realm, value, ToPrimitiveHint::Number)?,
+                runtime.to_primitive_jsvalue(realm, value, ToPrimitiveHint::Number)?,
             )?,
             AtomicsStep::Number { value, resume } => {
-                resume.number(runtime, runtime.native_to_number(realm, &value)?)?
+                resume.number(runtime, runtime.native_to_number_jsvalue(realm, value)?)?
             }
         };
     }

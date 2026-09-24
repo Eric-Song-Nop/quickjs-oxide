@@ -6,7 +6,7 @@ use crate::engine::{
     builtins::native::{ArrayFindKind, ArrayReduceKind},
     heap::ContextId,
     object::{CallableRef, ObjectRef},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{
         Completion,
         call::{DirectCallTarget, NativeArguments, NativeInvocation},
@@ -53,12 +53,13 @@ struct TraversalState {
     kind: TypedTraversalKind,
     target: ObjectRef,
     callback: CallableRef,
-    this_arg: Value,
+    this_arg: JsValue,
+    held_value: JsValue,
     length: u64,
     step: u64,
 }
 enum TraversalPhase {
-    Find { value: Value, index: u64 },
+    Find { index: u64 },
     Reduce,
 }
 impl TypedTraversalStep {
@@ -74,57 +75,58 @@ impl TypedTraversalStep {
                 "TypedArray traversal received a constructor invocation",
             ));
         };
-        let target = match runtime.require_typed_array(realm, this_value.clone())? {
+        let target = match runtime.require_typed_array_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
+            NativeConversion::Throw(value) => {
+                return Ok(Self::Complete(Completion::Throw(value)));
+            }
         };
         let length = match runtime.typed_array_validated_length(realm, &target)? {
             NativeConversion::Value(value) => u64::from(value),
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
+            NativeConversion::Throw(value) => {
+                return Ok(Self::Complete(Completion::Throw(value)));
+            }
         };
-        let callback = runtime.callable_from_value(
-            arguments
-                .readable
-                .first()
-                .ok_or(RuntimeError::Invariant(
-                    "TypedArray traversal callback argv was not padded",
-                ))?
-                .clone(),
-        )?;
-        let second = if arguments.actual_arg_count > 1 {
-            arguments
-                .readable
-                .get(1)
-                .ok_or(RuntimeError::Invariant(
-                    "TypedArray traversal second argument was missing",
-                ))?
-                .clone()
+        let callback_value = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "TypedArray traversal callback argv was not padded",
+        ))?;
+        let callback = if let JsValue::Object(id) = callback_value {
+            runtime.as_callable_object(*id)?
         } else {
-            Value::Undefined
-        };
-        let this_arg = if matches!(kind, TypedTraversalKind::Find(_)) {
-            second.clone()
-        } else {
-            Value::Undefined
-        };
+            None
+        }
+        .ok_or_else(|| {
+            RuntimeError::Engine(crate::engine::api::Error::new(
+                crate::engine::api::ErrorKind::Type,
+                "not a function",
+            ))
+        })?;
         let mut state = TraversalState {
             realm,
             kind,
             target,
             callback,
-            this_arg,
+            this_arg: JsValue::Undefined,
+            held_value: JsValue::Undefined,
             length,
             step: 0,
         };
+        if arguments.actual_arg_count > 1 && matches!(kind, TypedTraversalKind::Find(_)) {
+            state.this_arg = runtime.dup_jsvalue(arguments.readable.get(1).ok_or(
+                RuntimeError::Invariant("TypedArray traversal second argument was missing"),
+            )?)?;
+        }
         match kind {
             TypedTraversalKind::Find(_) => state.find(runtime),
             TypedTraversalKind::Reduce(_) => {
                 let accumulator = if arguments.actual_arg_count > 1 {
-                    second
+                    runtime.dup_jsvalue(arguments.readable.get(1).ok_or(
+                        RuntimeError::Invariant("TypedArray traversal second argument was missing"),
+                    )?)?
                 } else {
                     if length == 0 {
                         return Ok(Self::Complete(Completion::Throw(
-                            runtime.new_native_error(
+                            runtime.new_native_error_jsvalue(
                                 realm,
                                 NativeErrorKind::Type,
                                 "empty array",
@@ -134,12 +136,20 @@ impl TypedTraversalStep {
                     let index = state.index();
                     state.step += 1;
                     runtime
-                        .typed_array_read_index(&state.target, index)?
-                        .unwrap_or(Value::Undefined)
+                        .typed_array_read_index_jsvalue(&state.target, index)?
+                        .unwrap_or(JsValue::Undefined)
                 };
                 state.reduce(runtime, accumulator)
             }
         }
+    }
+}
+impl Drop for TraversalState {
+    fn drop(&mut self) {
+        let runtime = self.target.runtime();
+        let _ = runtime.release_jsvalue(std::mem::replace(&mut self.this_arg, JsValue::Undefined));
+        let _ =
+            runtime.release_jsvalue(std::mem::replace(&mut self.held_value, JsValue::Undefined));
     }
 }
 impl TraversalState {
@@ -152,98 +162,120 @@ impl TraversalState {
             _ => self.step,
         }
     }
-    fn arguments(
-        &self,
-        runtime: &Runtime,
-        count: usize,
-    ) -> Result<NativeConversion<Vec<Value>>, RuntimeError> {
-        let mut arguments = Vec::new();
-        if arguments.try_reserve_exact(count).is_err() {
-            return Ok(NativeConversion::Throw(runtime.new_native_error(
-                self.realm,
-                NativeErrorKind::Internal,
-                "out of memory",
-            )?));
-        }
-        Ok(NativeConversion::Value(arguments))
-    }
     fn find(mut self, runtime: &Runtime) -> Result<TypedTraversalStep, RuntimeError> {
         if self.step == self.length {
-            return Ok(TypedTraversalStep::Complete(Completion::Return(
-                match self.kind {
-                    TypedTraversalKind::Find(ArrayFindKind::Find | ArrayFindKind::FindLast) => {
-                        Value::Undefined
-                    }
-                    TypedTraversalKind::Find(_) => Value::Int(-1),
-                    _ => return Err(RuntimeError::Invariant("TypedArray find lost its selector")),
-                },
-            )));
+            let value = match self.kind {
+                TypedTraversalKind::Find(ArrayFindKind::Find | ArrayFindKind::FindLast) => {
+                    JsValue::Undefined
+                }
+                TypedTraversalKind::Find(_) => JsValue::Int(-1),
+                _ => return Err(RuntimeError::Invariant("TypedArray find lost its selector")),
+            };
+            return Ok(TypedTraversalStep::Complete(Completion::Return(value)));
         }
         let index = self.index();
         self.step += 1;
-        let value = runtime
-            .typed_array_read_index(&self.target, index)?
-            .unwrap_or(Value::Undefined);
-        let mut arguments = match self.arguments(runtime, 3)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => {
-                return Ok(TypedTraversalStep::Complete(Completion::Throw(value)));
-            }
-        };
-        arguments.push(value.clone());
-        arguments.push(Value::number(index as f64));
-        arguments.push(Value::Object(self.target.clone()));
-        Ok(TypedTraversalStep::request_call(
-            DirectCallTarget::Callable(self.callback.clone()),
-            self.this_arg.clone(),
-            arguments,
-            TypedTraversalResume(Box::new(TypedTraversalResumeState {
-                pending_effect: TypedTraversalStepPending::default(),
-                state: self,
-                phase: TraversalPhase::Find { value, index },
-            })),
-        ))
+        self.held_value = runtime
+            .typed_array_read_index_jsvalue(&self.target, index)?
+            .unwrap_or(JsValue::Undefined);
+        let mut resume = TypedTraversalResume(Box::new(TypedTraversalResumeState {
+            pending_effect: TypedTraversalStepPending::new(runtime),
+            state: self,
+            phase: TraversalPhase::Find { index },
+        }));
+        if !resume.reserve_arguments(3) {
+            return Ok(TypedTraversalStep::Complete(Completion::Throw(
+                runtime.new_native_error_jsvalue(
+                    resume.0.state.realm,
+                    NativeErrorKind::Internal,
+                    "out of memory",
+                )?,
+            )));
+        }
+        resume.0.pending_effect.call_receiver =
+            Some(runtime.dup_jsvalue(&resume.0.state.this_arg)?);
+        let value = runtime.dup_jsvalue(&resume.0.state.held_value)?;
+        resume
+            .0
+            .pending_effect
+            .call_arguments
+            .as_mut()
+            .unwrap()
+            .push(value);
+        resume.fill_arguments(index);
+        Ok(TypedTraversalStep::Call { resume })
     }
     fn reduce(
         mut self,
         runtime: &Runtime,
-        accumulator: Value,
+        accumulator: JsValue,
     ) -> Result<TypedTraversalStep, RuntimeError> {
+        runtime.release_jsvalue(std::mem::replace(&mut self.held_value, accumulator))?;
         if self.step == self.length {
             return Ok(TypedTraversalStep::Complete(Completion::Return(
-                accumulator,
+                std::mem::replace(&mut self.held_value, JsValue::Undefined),
             )));
         }
         let index = self.index();
         self.step += 1;
+        let mut resume = TypedTraversalResume(Box::new(TypedTraversalResumeState {
+            pending_effect: TypedTraversalStepPending::new(runtime),
+            state: self,
+            phase: TraversalPhase::Reduce,
+        }));
+        if !resume.reserve_arguments(4) {
+            return Ok(TypedTraversalStep::Complete(Completion::Throw(
+                runtime.new_native_error_jsvalue(
+                    resume.0.state.realm,
+                    NativeErrorKind::Internal,
+                    "out of memory",
+                )?,
+            )));
+        }
+        let accumulator = std::mem::replace(&mut resume.0.state.held_value, JsValue::Undefined);
+        resume
+            .0
+            .pending_effect
+            .call_arguments
+            .as_mut()
+            .unwrap()
+            .push(accumulator);
         let value = runtime
-            .typed_array_read_index(&self.target, index)?
-            .unwrap_or(Value::Undefined);
-        let mut arguments = match self.arguments(runtime, 4)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => {
-                return Ok(TypedTraversalStep::Complete(Completion::Throw(value)));
-            }
-        };
-        arguments.push(accumulator);
-        arguments.push(value);
-        arguments.push(Value::number(index as f64));
-        arguments.push(Value::Object(self.target.clone()));
-        Ok(TypedTraversalStep::request_call(
-            DirectCallTarget::Callable(self.callback.clone()),
-            Value::Undefined,
-            arguments,
-            TypedTraversalResume(Box::new(TypedTraversalResumeState {
-                pending_effect: TypedTraversalStepPending::default(),
-                state: self,
-                phase: TraversalPhase::Reduce,
-            })),
-        ))
+            .typed_array_read_index_jsvalue(&resume.0.state.target, index)?
+            .unwrap_or(JsValue::Undefined);
+        resume
+            .0
+            .pending_effect
+            .call_arguments
+            .as_mut()
+            .unwrap()
+            .push(value);
+        resume.0.pending_effect.call_receiver = Some(JsValue::Undefined);
+        resume.fill_arguments(index);
+        Ok(TypedTraversalStep::Call { resume })
     }
 }
 impl TypedTraversalResume {
+    fn reserve_arguments(&mut self, count: usize) -> bool {
+        self.0.pending_effect.call_arguments = Some(Vec::new());
+        self.0
+            .pending_effect
+            .call_arguments
+            .as_mut()
+            .unwrap()
+            .try_reserve_exact(count)
+            .is_ok()
+    }
+    fn fill_arguments(&mut self, index: u64) {
+        let arguments = self.0.pending_effect.call_arguments.as_mut().unwrap();
+        arguments
+            .push(crate::engine::value::number::operations::Number::compact(index as f64).into());
+        arguments.push(JsValue::Object(self.0.state.target.clone().into_handle()));
+        self.0.pending_effect.call_target =
+            Some(DirectCallTarget::Callable(self.0.state.callback.clone()));
+    }
     pub(crate) fn resume(
-        self,
+        mut self,
         runtime: &Runtime,
         result: Completion,
     ) -> Result<TypedTraversalStep, RuntimeError> {
@@ -254,22 +286,30 @@ impl TypedTraversalResume {
             }
         };
         match self.0.phase {
-            TraversalPhase::Find { value, index } => {
-                if runtime.value_to_boolean(&result)? {
-                    Ok(TypedTraversalStep::Complete(Completion::Return(
-                        match self.0.state.kind {
-                            TypedTraversalKind::Find(
-                                ArrayFindKind::Find | ArrayFindKind::FindLast,
-                            ) => value,
-                            TypedTraversalKind::Find(_) => Value::number(index as f64),
-                            _ => {
-                                return Err(RuntimeError::Invariant(
-                                    "TypedArray find reply lost its selector",
-                                ));
-                            }
-                        },
-                    )))
+            TraversalPhase::Find { index } => {
+                let truth = runtime.value_to_boolean_jsvalue(&result);
+                runtime.release_jsvalue(result)?;
+                if truth? {
+                    let found = match self.0.state.kind {
+                        TypedTraversalKind::Find(ArrayFindKind::Find | ArrayFindKind::FindLast) => {
+                            std::mem::replace(&mut self.0.state.held_value, JsValue::Undefined)
+                        }
+                        TypedTraversalKind::Find(_) => {
+                            crate::engine::value::number::operations::Number::compact(index as f64)
+                                .into()
+                        }
+                        _ => {
+                            return Err(RuntimeError::Invariant(
+                                "TypedArray find reply lost its selector",
+                            ));
+                        }
+                    };
+                    Ok(TypedTraversalStep::Complete(Completion::Return(found)))
                 } else {
+                    runtime.release_jsvalue(std::mem::replace(
+                        &mut self.0.state.held_value,
+                        JsValue::Undefined,
+                    ))?;
                     self.0.state.find(runtime)
                 }
             }
@@ -277,6 +317,7 @@ impl TypedTraversalResume {
         }
     }
 }
+
 pub(super) fn finish(
     runtime: &Runtime,
     realm: ContextId,
@@ -287,41 +328,52 @@ pub(super) fn finish(
             TypedTraversalStep::Complete(result) => return Ok(result),
             TypedTraversalStep::Call { mut resume } => {
                 let target = resume.take_call_target();
+                let DirectCallTarget::Callable(callable) = target else {
+                    return Err(RuntimeError::Invariant(
+                        "TypedArray traversal requested an invalid call target",
+                    ));
+                };
                 let receiver = resume.take_call_receiver();
                 let arguments = resume.take_call_arguments();
-                {
-                    let DirectCallTarget::Callable(callable) = target else {
-                        return Err(RuntimeError::Invariant(
-                            "TypedArray traversal requested an invalid call target",
-                        ));
-                    };
-                    resume.resume(
-                        runtime,
-                        runtime.call_internal(realm, &callable, receiver, &arguments)?,
-                    )?
-                }
+                resume.resume(
+                    runtime,
+                    runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?,
+                )?
             }
         };
     }
 }
 
-#[derive(Default)]
 struct TypedTraversalStepPending {
+    runtime: Runtime,
     call_target: Option<DirectCallTarget>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
 }
-impl TypedTraversalStep {
-    pub(crate) fn request_call(
-        target: DirectCallTarget,
-        receiver: Value,
-        arguments: Vec<Value>,
-        mut resume: TypedTraversalResume,
-    ) -> Self {
-        resume.0.pending_effect.call_target = Some(target);
-        resume.0.pending_effect.call_receiver = Some(receiver);
-        resume.0.pending_effect.call_arguments = Some(arguments);
-        Self::Call { resume }
+impl TypedTraversalStepPending {
+    fn new(runtime: &Runtime) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            call_target: None,
+            call_receiver: None,
+            call_arguments: None,
+        }
+    }
+
+    /// Release the internal edges still owned when the request is abandoned
+    /// before its step consumed them. Taken fields are empty here.
+    fn release_owned(&mut self) {
+        if let Some(receiver) = self.call_receiver.take() {
+            let _ = self.runtime.release_jsvalue(receiver);
+        }
+        for argument in self.call_arguments.take().into_iter().flatten() {
+            let _ = self.runtime.release_jsvalue(argument);
+        }
+    }
+}
+impl Drop for TypedTraversalStepPending {
+    fn drop(&mut self) {
+        self.release_owned();
     }
 }
 impl TypedTraversalResume {
@@ -332,14 +384,14 @@ impl TypedTraversalResume {
             .take()
             .expect("TypedTraversalStep Call target")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver
             .take()
             .expect("TypedTraversalStep Call receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .pending_effect
             .call_arguments

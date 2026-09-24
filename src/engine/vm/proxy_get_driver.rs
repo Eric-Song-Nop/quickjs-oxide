@@ -11,14 +11,12 @@ use super::{
 use crate::engine::api::{Error, runtime::Runtime};
 use crate::engine::code::function::metadata::FunctionKind;
 use crate::engine::object::{
-    CompleteOrdinaryPropertyDescriptor, ObjectRef, OrdinaryRead, PropertyKey, ProxyGetResume,
-    ProxyGetStep, ProxyOwnResume, ProxyOwnStep,
+    ObjectRef, OrdinaryRead, PropertyKey, ProxyGetResume, ProxyGetStep, ProxyOwnResume,
+    ProxyOwnStep,
 };
-use crate::engine::object::{
-    OrdinaryPropertyDescriptor, PreparedHas, ProxyBooleanKind, ProxyBooleanResume, ProxyBooleanStep,
-};
+use crate::engine::object::{PreparedHas, ProxyBooleanKind, ProxyBooleanResume, ProxyBooleanStep};
 use crate::engine::value::conversion::descriptor::{DescriptorResume, DescriptorStep};
-use crate::engine::value::{Value, conversion::NativeConversion};
+use crate::engine::value::{JsValue, Value, conversion::NativeConversion};
 
 use crate::engine::object::{ProxyPrototypeKind, ProxyPrototypeStep};
 
@@ -43,6 +41,12 @@ pub(super) struct PendingProxyGet {
     // The innermost domain guard must leave before its native activation.
     resume: Resume,
     query: Query,
+}
+
+impl Drop for PendingProxyGet {
+    fn drop(&mut self) {
+        std::mem::replace(&mut self.resume, Resume::Identity).release_owned();
+    }
 }
 
 impl PendingProxyGet {
@@ -153,12 +157,16 @@ impl Query {
         slots: &mut super::stack::SlotStore,
         result: Result<super::call::NativeInvokeOutcome, Error>,
     ) -> Result<Step, Error> {
-        let scope = self
-            .natives
-            .pop()
-            .ok_or_else(|| Error::internal("native result has no scope"))?;
+        let Some(scope) = self.natives.pop() else {
+            if let Ok(result) = result {
+                Step::NativeRawComplete(Some(result)).release_owned(runtime);
+            }
+            return Err(Error::internal("native result has no scope"));
+        };
         self.saved_native_depth -= 1 + scope.parents.len() as u128;
-        while self.parents.pop().is_some() {}
+        while let Some(resume) = self.parents.pop() {
+            resume.release_owned();
+        }
         let empty = std::mem::replace(&mut self.parents, scope.parents);
         // Reservation happens before installing the native scope.
         self.spare_parents.push(empty);
@@ -171,11 +179,16 @@ impl Drop for Query {
         // Current domain states belong to the innermost native activation.
         // Each saved resume/parent stack belongs to its caller, outside that
         // activation; release them before proceeding to the next outer scope.
-        while self.parents.pop().is_some() {}
+        while let Some(resume) = self.parents.pop() {
+            resume.release_owned();
+        }
         while let Some(mut scope) = self.natives.pop() {
+            let _ = scope.call.release_invocation();
             drop(scope.call);
-            drop(scope.resume);
-            while scope.parents.pop().is_some() {}
+            scope.resume.release_owned();
+            while let Some(resume) = scope.parents.pop() {
+                resume.release_owned();
+            }
         }
     }
 }
@@ -214,29 +227,34 @@ enum Finish {
 }
 
 fn finish_numeric(
+    runtime: &Runtime,
     execution: &mut RunningExecution,
     frame: FrameId,
-    value: Value,
-    previous: Option<Value>,
+    value: JsValue,
+    previous: Option<JsValue>,
     _depth: usize,
 ) -> Result<CallStep, Error> {
-    super::frame_operations::commit_numeric_output(execution, frame, value, previous, _depth)?;
+    super::frame_operations::commit_numeric_output(
+        runtime, execution, frame, value, previous, _depth,
+    )?;
     Ok(CallStep::Entered)
 }
 
 fn finish_instruction(
+    runtime: &Runtime,
     execution: &mut RunningExecution,
     owner: ReturnOwner,
     completion: Completion,
     push: bool,
     depth: usize,
 ) -> Result<Progress, Error> {
-    finish_instruction_call(execution, owner, completion, push, depth).map(Progress::Call)
+    finish_instruction_call(runtime, execution, owner, completion, push, depth).map(Progress::Call)
 }
 
 // Shared instruction completion keeps the broad conversion transport outside
 // callers that already know they are completing an ordinary property opcode.
 fn finish_instruction_call(
+    runtime: &Runtime,
     execution: &mut RunningExecution,
     owner: ReturnOwner,
     completion: Completion,
@@ -244,18 +262,27 @@ fn finish_instruction_call(
     _depth: usize,
 ) -> Result<CallStep, Error> {
     match completion {
-        Completion::Return(value) => {
-            let parent = execution.frames.current_mut(owner.frame()?)?;
-            if push {
-                execution.slots.push(&mut parent.window, value)?;
-            }
-            parent.resume_pc = parent
-                .fault_pc
-                .checked_add(1)
-                .ok_or_else(|| Error::internal("property resume PC overflow"))?;
-            #[cfg(feature = "profiling")]
-            crate::engine::api::profiling::record_owned_instruction(_depth);
-            Ok(CallStep::Entered)
+        Completion::Return(mut value) => {
+            let result: Result<CallStep, Error> = (|| {
+                let parent = execution.frames.current_mut(owner.frame()?)?;
+                let resume_pc = parent
+                    .fault_pc
+                    .checked_add(1)
+                    .ok_or_else(|| Error::internal("property resume PC overflow"))?;
+                if push {
+                    execution.slots.push_owned(&mut parent.window, &mut value)?;
+                }
+                parent.resume_pc = resume_pc;
+                #[cfg(feature = "profiling")]
+                crate::engine::api::profiling::record_owned_instruction(_depth);
+                Ok(CallStep::Entered)
+            })();
+            let released = runtime
+                .release_jsvalue(value)
+                .map_err(runtime_error_to_vm_error);
+            let result = result?;
+            released?;
+            Ok(result)
         }
         completion => Ok(CallStep::Complete(completion)),
     }
@@ -273,40 +300,48 @@ pub(super) fn start(
     frame: FrameId,
     object: ObjectRef,
     key: PropertyKey,
-    receiver: Value,
+    receiver: JsValue,
     depth: usize,
 ) -> Result<CallStep, Error> {
-    let parent = execution.frames.current_mut(frame)?;
-    let identity = parent
-        .property_generation
-        .checked_add(1)
-        .ok_or_else(|| Error::internal("property operation identity exhausted"))?;
-    parent.property_generation = identity;
-    let realm = parent.executable.realm;
+    let mut receiver = Some(receiver);
     let result = (|| {
-        let step = ProxyGetStep::start_buffered(
-            runtime,
-            realm,
-            object,
-            key,
-            receiver,
-            execution.slots.take_argument_buffer(3)?,
-        )
-        .map_err(runtime_error_to_vm_error)?;
-        advance(
-            runtime,
-            execution,
-            frame,
-            identity,
-            Vec::new(),
-            step.into(),
-            Finish::PropertyRead(depth),
-        )
+        let parent = execution.frames.current_mut(frame)?;
+        let identity = parent
+            .property_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::internal("property operation identity exhausted"))?;
+        parent.property_generation = identity;
+        let realm = parent.executable.realm;
+        let result = (|| {
+            let arguments = execution.slots.take_argument_buffer(3)?;
+            let step = ProxyGetStep::start_buffered(
+                runtime,
+                realm,
+                object,
+                key,
+                receiver.take().expect("proxy read receiver"),
+                arguments,
+            )
+            .map_err(runtime_error_to_vm_error)?;
+            advance(
+                runtime,
+                execution,
+                frame,
+                identity,
+                Vec::new(),
+                step.into(),
+                Finish::PropertyRead(depth),
+            )
+        })();
+        match finish_error(runtime, realm, result)? {
+            Progress::Call(step) => Ok(step),
+            Progress::Conversion(_) => Err(Error::internal("property read returned a conversion")),
+        }
     })();
-    match finish_error(runtime, realm, result)? {
-        Progress::Call(step) => Ok(step),
-        Progress::Conversion(_) => Err(Error::internal("property read returned a conversion")),
+    if let Some(receiver) = receiver {
+        let _ = runtime.release_jsvalue(receiver);
     }
+    result
 }
 
 /// A super lookup retains its frozen base independently of the getter receiver.
@@ -317,21 +352,30 @@ pub(super) fn start_owned_read(
     frame: FrameId,
     object: ObjectRef,
     key: PropertyKey,
-    receiver: Value,
+    receiver: JsValue,
     depth: usize,
 ) -> Result<CallStep, Error> {
-    let parent = execution.frames.current_mut(frame)?;
-    let identity = parent
-        .property_generation
-        .checked_add(1)
-        .ok_or_else(|| Error::internal("property operation identity exhausted"))?;
-    parent.property_generation = identity;
-    let realm = parent.executable.realm;
-    let step = Step::Read {
+    let mut step = Step::Read {
         object: Some(object.clone()),
         key: Some(key),
         receiver: Some(receiver),
         resume: Some(Resume::ReadOwner(object)),
+    };
+    let prepared = (|| {
+        let parent = execution.frames.current_mut(frame)?;
+        let identity = parent
+            .property_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::internal("property operation identity exhausted"))?;
+        parent.property_generation = identity;
+        Ok((identity, parent.executable.realm))
+    })();
+    let (identity, realm) = match prepared {
+        Ok(value) => value,
+        Err(error) => {
+            step.release_owned(runtime);
+            return Err(error);
+        }
     };
     let result = advance(
         runtime,
@@ -381,6 +425,7 @@ pub(super) fn start_boolean(
                     "delete_completed_without_query",
                 );
                 finish_instruction_call(
+                    runtime,
                     execution,
                     ReturnOwner::Frame(frame),
                     completion,
@@ -444,7 +489,7 @@ pub(super) fn start_boolean(
 }
 
 /// The query entry is also used to validate the protocol before native entry migration.
-#[cfg(test)]
+#[cfg(all(test, feature = "profiling"))]
 pub(super) fn start_prototype(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -498,16 +543,10 @@ pub(super) fn start_conversion(
     parent.property_generation = identity;
     let realm = parent.executable.realm;
     let result = (|| {
-        let receiver = Value::Object(object.clone());
-        let step = ProxyGetStep::start_buffered(
-            runtime,
-            realm,
-            object,
-            key,
-            receiver,
-            execution.slots.take_argument_buffer(3)?,
-        )
-        .map_err(runtime_error_to_vm_error)?;
+        let arguments = execution.slots.take_argument_buffer(3)?;
+        let receiver = JsValue::Object(object.clone().into_handle());
+        let step = ProxyGetStep::start_buffered(runtime, realm, object, key, receiver, arguments)
+            .map_err(runtime_error_to_vm_error)?;
         advance(
             runtime,
             execution,
@@ -527,8 +566,8 @@ pub(super) fn start_call(
     execution: &mut RunningExecution,
     frame: FrameId,
     proxy: ObjectRef,
-    receiver: Value,
-    arguments: Vec<Value>,
+    receiver: crate::engine::value::JsValue,
+    arguments: Vec<crate::engine::value::JsValue>,
     tail: bool,
     depth: usize,
 ) -> Result<CallStep, Error> {
@@ -552,8 +591,8 @@ pub(super) fn start_callback_call(
     execution: &mut RunningExecution,
     frame: FrameId,
     callable: crate::engine::object::CallableRef,
-    receiver: Value,
-    arguments: Vec<Value>,
+    receiver: crate::engine::value::JsValue,
+    arguments: Vec<crate::engine::value::JsValue>,
     tail: bool,
     depth: usize,
 ) -> Result<CallStep, Error> {
@@ -582,8 +621,8 @@ pub(super) fn start_classified_native_call(
     target: crate::engine::builtins::native::NativeFunctionId,
     defining_realm: crate::engine::heap::ContextId,
     min_readable_args: u8,
-    receiver: Value,
-    arguments: Vec<Value>,
+    receiver: JsValue,
+    arguments: Vec<JsValue>,
     tail: bool,
     depth: usize,
 ) -> Result<CallStep, Error> {
@@ -613,8 +652,8 @@ pub(super) fn start_native_with_classification(
     target: crate::engine::builtins::native::NativeFunctionId,
     defining_realm: crate::engine::heap::ContextId,
     min_readable_args: u8,
-    receiver: Value,
-    arguments: Vec<Value>,
+    receiver: JsValue,
+    arguments: Vec<JsValue>,
     tail: bool,
     depth: usize,
     selected: Option<super::frames::NativeClassification>,
@@ -635,6 +674,7 @@ pub(super) fn start_native_with_classification(
             let completion = if !execution.frames.can_push_with_continuations(0)
                 || runtime.host_stack_would_overflow()
             {
+                release_call_operands(runtime, receiver, arguments);
                 overflow(runtime, realm)?
             } else {
                 native::begin_synchronous(
@@ -652,6 +692,7 @@ pub(super) fn start_native_with_classification(
                 )?
             };
             let result = finish_call_instruction_call(
+                runtime,
                 execution,
                 ReturnOwner::Frame(frame),
                 completion,
@@ -693,8 +734,8 @@ pub(super) fn start_waitable_native_call(
     target: crate::engine::builtins::native::NativeFunctionId,
     defining_realm: crate::engine::heap::ContextId,
     min_readable_args: u8,
-    receiver: Value,
-    arguments: Vec<Value>,
+    receiver: JsValue,
+    arguments: Vec<JsValue>,
     tail: bool,
     depth: usize,
     selected: Option<super::frames::NativeClassification>,
@@ -707,7 +748,9 @@ pub(super) fn start_waitable_native_call(
             let _operation = runtime.operation();
         }
         if !execution.frames.can_push_with_continuations(0) || runtime.host_stack_would_overflow() {
+            release_call_operands(runtime, receiver, arguments);
             return finish_call_instruction_call(
+                runtime,
                 execution,
                 owner,
                 overflow(runtime, realm)?,
@@ -735,7 +778,7 @@ pub(super) fn start_waitable_native_call(
                 crate::engine::api::profiling::record_owned_execution_event(
                     "native_call_completed_without_query",
                 );
-                finish_call_instruction_call(execution, owner, completion, depth, tail)
+                finish_call_instruction_call(runtime, execution, owner, completion, depth, tail)
             }
             native::LocalNativeResult::Waiting(mut records) => {
                 // Take individual live fields, never pop/move the wide record.
@@ -775,8 +818,7 @@ pub(super) fn start_waitable_native_call(
                         // Release the abandoned inner state while its outer
                         // activation still owns the protocol call. The reply
                         // resume is likewise consumed before the outer finish.
-                        records[0].step =
-                            Step::Complete(Some(Completion::Return(Value::Undefined)));
+                        records[0].step.release_owned(runtime);
                         if let Some(mut parent) = parent.take() {
                             let outer = parent.call.take().expect("outer replace activation");
                             drop(parent);
@@ -787,7 +829,9 @@ pub(super) fn start_waitable_native_call(
                         execution.query_storage.recycle_native_wait(records);
                         query.recycle(&mut execution.query_storage);
                         return result.and_then(|completion| {
-                            finish_call_instruction_call(execution, owner, completion, depth, tail)
+                            finish_call_instruction_call(
+                                runtime, execution, owner, completion, depth, tail,
+                            )
                         });
                     }
                 };
@@ -804,7 +848,9 @@ pub(super) fn start_waitable_native_call(
                 native::install_waiting(&mut query, call, resume);
                 let step = std::mem::replace(
                     &mut records[0].step,
-                    Step::Complete(Some(Completion::Return(Value::Undefined))),
+                    Step::Complete(Some(Completion::Return(
+                        crate::engine::value::JsValue::Undefined,
+                    ))),
                 );
                 execution.query_storage.recycle_native_wait(records);
                 #[cfg(feature = "profiling")]
@@ -819,16 +865,19 @@ pub(super) fn start_waitable_native_call(
 }
 
 fn finish_call_instruction(
+    runtime: &Runtime,
     execution: &mut RunningExecution,
     owner: ReturnOwner,
     completion: Completion,
     depth: usize,
     tail: bool,
 ) -> Result<Progress, Error> {
-    finish_call_instruction_call(execution, owner, completion, depth, tail).map(Progress::Call)
+    finish_call_instruction_call(runtime, execution, owner, completion, depth, tail)
+        .map(Progress::Call)
 }
 
 fn finish_call_instruction_call(
+    runtime: &Runtime,
     execution: &mut RunningExecution,
     owner: ReturnOwner,
     completion: Completion,
@@ -840,7 +889,7 @@ fn finish_call_instruction_call(
         crate::engine::api::profiling::record_owned_instruction(depth);
         return Ok(CallStep::Complete(completion));
     }
-    finish_instruction_call(execution, owner, completion, true, depth)
+    finish_instruction_call(runtime, execution, owner, completion, true, depth)
 }
 
 #[inline(never)]
@@ -868,13 +917,15 @@ pub(super) fn start_apply(
     let realm = execution.frames.current_mut(frame)?.executable.realm;
     let result = (|| {
         let parent = execution.frames.current_mut(frame)?;
+        // The operands stay in their slots; the spread machine borrows rooted
+        // copies while `start_instruction` consumes the slot owners.
         let step = crate::engine::builtins::InvokeStep::start_spread(
             runtime,
             realm,
             kind,
-            execution.slots.peek(&parent.window, 2)?.clone(),
-            execution.slots.peek(&parent.window, 1)?.clone(),
-            execution.slots.peek(&parent.window, 0)?.clone(),
+            execution.slots.peek(&parent.window, 2)?,
+            execution.slots.peek(&parent.window, 1)?,
+            execution.slots.peek(&parent.window, 0)?,
         )
         .map_err(runtime_error_to_vm_error)?;
         start_instruction(runtime, execution, frame, step.into(), 3)
@@ -891,8 +942,8 @@ pub(super) fn start_construct(
     execution: &mut RunningExecution,
     frame: FrameId,
     target: super::call::ConstructorRef,
-    new_target: Value,
-    arguments: Vec<Value>,
+    new_target: crate::engine::value::JsValue,
+    arguments: Vec<crate::engine::value::JsValue>,
     operand_count: usize,
 ) -> Result<CallStep, Error> {
     let realm = execution.frames.current_mut(frame)?.executable.realm;
@@ -928,9 +979,13 @@ fn start_instruction(
         .ok_or_else(|| Error::internal("instruction operation identity exhausted"))?;
     parent.property_generation = identity;
     let depth = execution.slots.depth(&parent.window);
-    // The request owns every source value before any window owner is released.
+    // The request owns rooted/duplicated source values before any window owner
+    // is released, so releasing the consumed slot owners cannot invalidate it.
     for _ in 0..operand_count {
-        execution.slots.pop(&mut parent.window)?;
+        let owner = execution.slots.pop(&mut parent.window)?;
+        runtime
+            .release_jsvalue(owner)
+            .map_err(runtime_error_to_vm_error)?;
     }
     advance(
         runtime,
@@ -948,8 +1003,8 @@ pub(super) fn start_native_conversion_call(
     execution: &mut RunningExecution,
     frame: FrameId,
     callable: crate::engine::object::CallableRef,
-    receiver: Value,
-    arguments: Vec<Value>,
+    receiver: JsValue,
+    arguments: Vec<JsValue>,
     wait: super::conversion_driver::ConversionWait,
 ) -> Result<Progress, Error> {
     start_owned_callback(
@@ -968,8 +1023,8 @@ fn start_owned_callback(
     execution: &mut RunningExecution,
     frame: FrameId,
     callable: crate::engine::object::CallableRef,
-    receiver: Value,
-    arguments: Vec<Value>,
+    receiver: JsValue,
+    arguments: Vec<JsValue>,
     finish: Finish,
 ) -> Result<Progress, Error> {
     let parent = execution.frames.current_mut(frame)?;
@@ -1001,8 +1056,8 @@ pub(super) fn start_conversion_call(
     execution: &mut RunningExecution,
     frame: FrameId,
     proxy: ObjectRef,
-    receiver: Value,
-    arguments: Vec<Value>,
+    receiver: JsValue,
+    arguments: Vec<JsValue>,
     wait: super::conversion_driver::ConversionWait,
 ) -> Result<Progress, Error> {
     start_proxy_call(
@@ -1021,8 +1076,8 @@ fn start_proxy_call(
     execution: &mut RunningExecution,
     frame: FrameId,
     proxy: ObjectRef,
-    receiver: Value,
-    arguments: Vec<Value>,
+    receiver: JsValue,
+    arguments: Vec<JsValue>,
     finish: Finish,
 ) -> Result<Progress, Error> {
     let parent = execution.frames.current_mut(frame)?;
@@ -1056,8 +1111,8 @@ pub(super) fn start_write(
     frame: FrameId,
     object: ObjectRef,
     key: PropertyKey,
-    value: Value,
-    receiver: Value,
+    value: JsValue,
+    receiver: JsValue,
     strict: bool,
     depth: usize,
 ) -> Result<CallStep, Error> {
@@ -1074,8 +1129,8 @@ pub(super) fn start_write_progress(
     frame: FrameId,
     object: ObjectRef,
     key: PropertyKey,
-    value: Value,
-    receiver: Value,
+    value: JsValue,
+    receiver: JsValue,
     strict: bool,
     depth: usize,
 ) -> Result<super::property_driver::PropertyProgress, Error> {
@@ -1098,8 +1153,8 @@ pub(super) fn start_receiver_write_progress(
     execution: &mut RunningExecution,
     frame: FrameId,
     key: PropertyKey,
-    value: Value,
-    receiver: Value,
+    value: JsValue,
+    receiver: JsValue,
     strict: bool,
     depth: usize,
 ) -> Result<super::property_driver::PropertyProgress, Error> {
@@ -1115,12 +1170,19 @@ fn start_write_adapted(
     frame: FrameId,
     object: Option<ObjectRef>,
     key: PropertyKey,
-    value: Value,
-    receiver: Value,
+    value: JsValue,
+    receiver: JsValue,
     strict: bool,
     depth: usize,
 ) -> Result<super::property_driver::PropertyProgress, Error> {
-    let parent = execution.frames.current_mut(frame)?;
+    let parent = match execution.frames.current_mut(frame) {
+        Ok(parent) => parent,
+        Err(error) => {
+            let _ = runtime.release_jsvalue(value);
+            let _ = runtime.release_jsvalue(receiver);
+            return Err(error);
+        }
+    };
     let realm = parent.executable.realm;
     let result = (|| {
         let mut waiting_result = None;
@@ -1212,6 +1274,7 @@ fn finish_write_action(
     crate::engine::api::profiling::record_owned_execution_event("write_completed_without_query");
     use super::property_driver::PropertyProgress;
     match finish_instruction_call(
+        runtime,
         execution,
         ReturnOwner::Frame(frame),
         completion,
@@ -1402,8 +1465,18 @@ pub(super) fn start_root(
             arguments,
         } => Step::Call {
             target: Some(DirectCallTarget::Callable(callable)),
-            receiver: Some(receiver),
-            arguments: Some(arguments),
+            receiver: Some(
+                runtime
+                    .into_jsvalue(receiver)
+                    .map_err(runtime_error_to_vm_error)?,
+            ),
+            arguments: Some(
+                arguments
+                    .into_iter()
+                    .map(|argument| runtime.into_jsvalue(argument))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(runtime_error_to_vm_error)?,
+            ),
             resume: Some(Resume::Identity),
         },
         super::driver::RootOperation::Construct(normalized) => construct::prepared(
@@ -1421,7 +1494,11 @@ pub(super) fn start_root(
         } => Step::Read {
             object: Some(object),
             key: Some(key),
-            receiver: Some(receiver),
+            receiver: Some(
+                runtime
+                    .into_jsvalue(receiver)
+                    .map_err(runtime_error_to_vm_error)?,
+            ),
             resume: Some(Resume::Identity),
         },
         super::driver::RootOperation::Own { object, key } => Step::Descriptor {
@@ -1436,7 +1513,7 @@ pub(super) fn start_root(
         } => Step::Define {
             object: Some(object),
             key: Some(key),
-            descriptor: Some(descriptor),
+            descriptor: Some(descriptor.into()),
             resume: Some(Resume::RootDefine),
         },
         super::driver::RootOperation::Set {
@@ -1447,8 +1524,16 @@ pub(super) fn start_root(
         } => Step::Set {
             object: Some(object),
             key: Some(key),
-            value: Some(value),
-            receiver: Some(receiver),
+            value: Some(
+                runtime
+                    .into_jsvalue(value)
+                    .map_err(runtime_error_to_vm_error)?,
+            ),
+            receiver: Some(
+                runtime
+                    .into_jsvalue(receiver)
+                    .map_err(runtime_error_to_vm_error)?,
+            ),
             resume: Some(Resume::RootSet),
         },
 
@@ -1545,6 +1630,11 @@ fn drive_inner(
             Ok(step) => advance_inner(runtime, execution, owner, identity, &mut query, step),
             Err(error) => Err(error.take().expect("pending dispatch error")),
         };
+        // Any fields not transferred into the returned effect still belong to
+        // this request, including terminal throws after a dispatch error.
+        if let Ok(step) = &mut step {
+            step.release_owned(runtime);
+        }
         match result {
             Ok(Next::Done(result)) => {
                 #[cfg(feature = "profiling")]
@@ -1578,7 +1668,7 @@ fn drive_inner(
                         let pending = take_pending(execution, owner)?;
                         let (_, restored, resume) =
                             execution.query_storage.release_pending(pending);
-                        drop(resume);
+                        resume.release_owned();
                         query = restored;
                         #[cfg(feature = "profiling")]
                         {
@@ -1749,6 +1839,14 @@ fn advance_inner(
     }
 }
 
+// A call abandoned before frame installation still owns its raw operands.
+fn release_call_operands(runtime: &Runtime, receiver: JsValue, arguments: Vec<JsValue>) {
+    let _ = runtime.release_jsvalue(receiver);
+    for argument in arguments {
+        let _ = runtime.release_jsvalue(argument);
+    }
+}
+
 #[inline(never)]
 // Transfer the selected callable and its reply ownership directly; a bundled request would add a second transport.
 #[allow(clippy::too_many_arguments)]
@@ -1759,8 +1857,8 @@ fn invoke(
     identity: u64,
     query: &mut Query,
     target: DirectCallTarget,
-    receiver: Value,
-    arguments: Vec<Value>,
+    receiver: JsValue,
+    arguments: Vec<JsValue>,
     resume: Resume,
     next_step: &mut Step,
 ) -> Result<Next, Error> {
@@ -1802,6 +1900,7 @@ fn invoke(
             .can_push_with_continuations(query.continuation_depth())
             || runtime.bytecode_call_would_overflow()
         {
+            release_call_operands(runtime, receiver, arguments);
             call.executable()
                 .ensure_root(runtime)
                 .map_err(runtime_error_to_vm_error)?;
@@ -1842,6 +1941,8 @@ fn invoke(
     } = match super::call::normalize_callback(runtime, realm, callable, receiver, arguments)? {
         NativeConversion::Value(call) => call,
         NativeConversion::Throw(value) => {
+            // The normalization boundary threw a public root; transfer it into
+            // the internal completion without a retain/release pair.
             step = resume
                 .resume(runtime, Completion::Throw(value))
                 .map_err(runtime_error_to_vm_error)?;
@@ -1854,6 +1955,7 @@ fn invoke(
             .frames
             .can_push_with_continuations(query.continuation_depth())
         {
+            release_call_operands(runtime, receiver, arguments);
             step = resume
                 .resume(runtime, overflow(runtime, realm)?)
                 .map_err(runtime_error_to_vm_error)?;
@@ -1918,13 +2020,15 @@ fn invoke(
             .map_err(|error| Error::internal(error.to_string()))?
             .metadata;
         let kind = metadata.function_kind;
-        let module_link = metadata.is_module && receiver == Value::Bool(true);
+        let module_link =
+            metadata.is_module && matches!(receiver, crate::engine::value::JsValue::Bool(true));
         {
             if !execution
                 .frames
                 .can_push_with_continuations(query.continuation_depth())
                 || runtime.bytecode_call_would_overflow()
             {
+                release_call_operands(runtime, receiver, arguments);
                 let completion = runtime
                     .bytecode_stack_overflow_completion(realm, &bytecode)
                     .map_err(runtime_error_to_vm_error)?;
@@ -1953,7 +2057,7 @@ fn invoke(
                 arguments,
                 bytecode,
                 closure_slots,
-                new_target: Value::Undefined,
+                new_target: crate::engine::value::JsValue::Undefined,
                 caller_realm: realm,
                 return_to: ReturnTarget {
                     owner,
@@ -2005,32 +2109,39 @@ fn invoke(
         .heap
         .context(realm)
         .map_err(|error| Error::internal(error.to_string()))?;
-    runtime
-        .validate_value_domain(&receiver, "call this value")
-        .map_err(runtime_error_to_vm_error)?;
-    for argument in &arguments {
-        runtime
-            .validate_value_domain(argument, "call argument")
-            .map_err(runtime_error_to_vm_error)?;
-    }
+    // Internal values carry no runtime branding; the slot authentication
+    // above already proved every operand owner.
     let completion = if runtime.native_call_would_overflow(target) {
-        overflow(runtime, realm)?
+        let overflowed = overflow(runtime, realm);
+        runtime
+            .release_jsvalue(receiver)
+            .map_err(runtime_error_to_vm_error)?;
+        for argument in arguments {
+            runtime
+                .release_jsvalue(argument)
+                .map_err(runtime_error_to_vm_error)?;
+        }
+        overflowed?
     } else {
         let execution_realm = if target.uses_calling_realm() {
             realm
         } else {
             defining_realm
         };
-        runtime
-            .call_native_function(
+        let outcome = runtime
+            .invoke_native_function_jsvalue(
                 &callable,
                 execution_realm,
                 target,
                 min_readable_args,
-                receiver,
-                &arguments,
+                super::call::NativeInvocation::Call {
+                    this_value: receiver,
+                },
+                arguments,
+                super::call::NativeInvokeMode::Ordinary,
             )
-            .map_err(runtime_error_to_vm_error)?
+            .map_err(runtime_error_to_vm_error)?;
+        Runtime::ordinary_native_completion(outcome).map_err(runtime_error_to_vm_error)?
     };
     step = resume
         .resume(runtime, completion)
@@ -2042,7 +2153,7 @@ fn invoke(
 fn overflow(runtime: &Runtime, realm: crate::engine::heap::ContextId) -> Result<Completion, Error> {
     Ok(Completion::Throw(
         runtime
-            .new_native_error(
+            .new_native_error_jsvalue(
                 realm,
                 crate::engine::api::error::NativeErrorKind::Internal,
                 "stack overflow",
@@ -2166,8 +2277,8 @@ mod native_scope_tests {
             .unwrap();
             let entry = BytecodeCallRequest {
                 callable: parent_callable,
-                receiver: Value::Undefined,
-                new_target: Value::Undefined,
+                receiver: JsValue::Undefined,
+                new_target: JsValue::Undefined,
                 arguments: Vec::new(),
                 bytecode,
                 closure_slots,
@@ -2201,13 +2312,16 @@ mod native_scope_tests {
                 target,
                 realm,
                 min_readable_args,
-                Value::Undefined,
-                vec![argument],
+                JsValue::Undefined,
+                vec![runtime.into_jsvalue(argument).unwrap()],
                 false,
                 0,
             )
             .unwrap();
-            assert!(matches!(result, CallStep::Complete(Completion::Throw(_))));
+            let CallStep::Complete(Completion::Throw(thrown)) = result else {
+                panic!("expected a rejected native call");
+            };
+            runtime.release_jsvalue(thrown).unwrap();
             let parent = execution.frames.current_mut(frame).unwrap();
             assert_eq!(parent.property_generation, 0);
             assert_eq!(parent.resume_pc, 0);
@@ -2262,7 +2376,7 @@ mod native_scope_tests {
                 // The unchanged standard matcher predicate requires a Data
                 // native exec. Materialize that lazy property only: do not run
                 // replace or warm this execution's Query cache.
-                context.eval("RegExp.prototype.exec").unwrap();
+                drop(context.eval("RegExp.prototype.exec").unwrap());
             }
             if name == "String.prototype.replace" {
                 arguments[0] = context.eval("/a/g").unwrap();
@@ -2298,8 +2412,8 @@ mod native_scope_tests {
             .unwrap();
             let entry = BytecodeCallRequest {
                 callable: parent,
-                receiver: Value::Undefined,
-                new_target: Value::Undefined,
+                receiver: JsValue::Undefined,
+                new_target: JsValue::Undefined,
                 arguments: Vec::new(),
                 bytecode,
                 closure_slots,
@@ -2328,16 +2442,19 @@ mod native_scope_tests {
                 target,
                 realm,
                 min_readable_args,
-                receiver,
-                arguments,
+                runtime.into_jsvalue(receiver).unwrap(),
+                arguments
+                    .into_iter()
+                    .map(|value| runtime.into_jsvalue(value).unwrap())
+                    .collect(),
                 true,
                 0,
             )
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
-            assert!(
-                matches!(result, CallStep::Complete(Completion::Return(_))),
-                "{name}"
-            );
+            let CallStep::Complete(Completion::Return(value)) = result else {
+                panic!("{name}: expected a completed native call");
+            };
+            runtime.release_jsvalue(value).unwrap();
             assert_eq!(
                 execution
                     .frames
@@ -2377,7 +2494,7 @@ mod native_scope_tests {
                 target,
                 min_readable_args,
                 super::super::call::NativeInvocation::Call {
-                    this_value: Value::Undefined,
+                    this_value: JsValue::Undefined,
                 },
                 &[],
                 super::super::call::NativeInvokeMode::Ordinary,
@@ -2429,8 +2546,11 @@ mod native_scope_tests {
         assert_eq!(query.realm, outer.realm);
         assert_eq!(query.continuation_depth(), 3);
         assert_eq!(runtime.0.state.borrow().active_frames.len(), 1);
-        let Step::Complete(Some(Completion::Throw(Value::Object(error)))) = step else {
+        let Step::Complete(Some(Completion::Throw(thrown))) = step else {
             panic!("expected captured error")
+        };
+        let Value::Object(error) = runtime.root_value(&thrown).unwrap() else {
+            panic!("expected error object")
         };
         assert_eq!(
             runtime.get_prototype_of(&error).unwrap().map(Value::Object),
@@ -2449,12 +2569,15 @@ mod native_scope_tests {
             .finish_native(
                 &runtime,
                 &mut slots,
-                Ok(Completion::Throw(Value::Object(error.clone()))),
+                Ok(Completion::Throw(runtime.dup_jsvalue(&thrown).unwrap())),
             )
             .unwrap();
-        assert!(
-            matches!(step, Step::Complete(Some(Completion::Throw(Value::Object(value)))) if value == error)
-        );
+        let Step::Complete(Some(Completion::Throw(value))) = step else {
+            panic!("expected returned captured error")
+        };
+        assert_eq!(value, thrown);
+        runtime.release_jsvalue(value).unwrap();
+        runtime.release_jsvalue(thrown).unwrap();
         assert_eq!(query.realm, caller.realm);
         assert_eq!(query.continuation_depth(), 1);
         assert!(runtime.0.state.borrow().active_frames.is_empty());
@@ -2465,7 +2588,7 @@ pub(super) fn start_iterator_read(
     runtime: &Runtime,
     execution: &mut RunningExecution,
     pending: super::iterator_driver::PendingIterator,
-    receiver: Value,
+    receiver: crate::engine::value::JsValue,
     key: PropertyKey,
 ) -> Result<CallStep, Error> {
     start_iterator_query(
@@ -2485,7 +2608,7 @@ pub(super) fn start_iterator_call(
     execution: &mut RunningExecution,
     pending: super::iterator_driver::PendingIterator,
     callable: crate::engine::object::CallableRef,
-    receiver: Value,
+    receiver: crate::engine::value::JsValue,
 ) -> Result<CallStep, Error> {
     start_iterator_query(
         runtime,
@@ -2505,8 +2628,8 @@ pub(super) fn start_iterator_invoke(
     execution: &mut RunningExecution,
     pending: super::iterator_driver::PendingIterator,
     target: DirectCallTarget,
-    receiver: Value,
-    arguments: Vec<Value>,
+    receiver: crate::engine::value::JsValue,
+    arguments: Vec<crate::engine::value::JsValue>,
 ) -> Result<CallStep, Error> {
     start_iterator_query(
         runtime,
@@ -2525,11 +2648,15 @@ pub(super) fn start_iterator_next(
     runtime: &Runtime,
     execution: &mut RunningExecution,
     pending: super::iterator_driver::PendingIterator,
-    iterator: Value,
+    iterator: crate::engine::value::JsValue,
     method: crate::engine::object::CallableRef,
 ) -> Result<CallStep, Error> {
-    let Value::Object(iterator) = iterator else {
-        return Err(Error::internal("iterator record lost object receiver"));
+    let iterator = match iterator {
+        JsValue::Object(id) => ObjectRef::from_owned_handle(runtime.clone(), id),
+        value => {
+            let _ = runtime.release_jsvalue(value);
+            return Err(Error::internal("iterator record lost object receiver"));
+        }
     };
     let step = crate::engine::builtins::IteratorNextStep::start_callable(
         runtime,
@@ -2577,7 +2704,7 @@ pub(super) fn start_array_next_without_pending(
     callable: crate::engine::object::CallableRef,
     defining_realm: crate::engine::heap::ContextId,
     min_readable_args: u8,
-    iterator: Value,
+    iterator: crate::engine::value::JsValue,
 ) -> Result<CallStep, Error> {
     use crate::engine::builtins::{IteratorNextResume, ObjectIteratorStep};
     let realm = execution.frames.current_mut(frame)?.executable.realm;
@@ -2590,7 +2717,9 @@ pub(super) fn start_array_next_without_pending(
                 _ => return Err(Error::internal("iterator overflow did not throw")),
             })
         } else {
-            let mut waiting = Step::Complete(Some(Completion::Return(Value::Undefined)));
+            let mut waiting = Step::Complete(Some(Completion::Return(
+                crate::engine::value::JsValue::Undefined,
+            )));
             let mut waiting_call = None;
             let result = native::compact_array_next_into(
                 runtime,
@@ -2632,7 +2761,7 @@ pub(super) fn start_array_next_without_pending(
                 );
             };
             resume
-                .raw_completion(result)
+                .raw_completion(runtime, result)
                 .map_err(runtime_error_to_vm_error)?
                 .map_err(|_| Error::internal("Array-next returned an ordinary result object"))?
         };
@@ -2642,11 +2771,21 @@ pub(super) fn start_array_next_without_pending(
         );
         let (value, done, abrupt) = match result {
             ObjectIteratorStep::Yield(value) => (value, false, None),
-            ObjectIteratorStep::Done => (Value::Undefined, true, None),
-            ObjectIteratorStep::Throw(value) => (Value::Undefined, false, Some(value)),
+            ObjectIteratorStep::Done => (crate::engine::value::JsValue::Undefined, true, None),
+            ObjectIteratorStep::Throw(value) => {
+                (crate::engine::value::JsValue::Undefined, false, Some(value))
+            }
         };
-        super::iterator_driver::finish_next(execution, frame, record_base, value, done, abrupt)
-            .map(Progress::Call)
+        super::iterator_driver::finish_next(
+            runtime,
+            execution,
+            frame,
+            record_base,
+            value,
+            done,
+            abrupt,
+        )
+        .map(Progress::Call)
     })();
     match finish_error(runtime, realm, result)? {
         Progress::Call(step) => Ok(step),
@@ -2692,7 +2831,9 @@ fn start_array_next_direct(
         if !execution.query_storage.reserve_cached_native_entry()? {
             return Err(Error::internal("direct native entry lost reserved storage"));
         }
-        let mut waiting = Step::Complete(Some(Completion::Return(Value::Undefined)));
+        let mut waiting = Step::Complete(Some(Completion::Return(
+            crate::engine::value::JsValue::Undefined,
+        )));
         let mut waiting_call = None;
         let result = native::begin_into(
             runtime,
@@ -2704,7 +2845,7 @@ fn start_array_next_direct(
             min_readable_args,
             super::call::NativeInvokeMode::IteratorNextRaw,
             super::call::NativeInvocation::Call {
-                this_value: Value::Object(iterator),
+                this_value: JsValue::Object(iterator.into_handle()),
             },
             Vec::new(),
             crate::engine::builtins::continuation::NativeOperation::ArrayNext,
@@ -2735,7 +2876,7 @@ fn start_array_next_direct(
             );
         };
         match resume
-            .raw_completion(result)
+            .raw_completion(runtime, result)
             .map_err(runtime_error_to_vm_error)?
         {
             Ok(result) => result,
@@ -2756,7 +2897,7 @@ fn start_array_next_direct(
     crate::engine::api::profiling::record_owned_execution_event(
         "iterator_native_completed_without_query",
     );
-    super::iterator_driver::finish(execution, pending).map(Progress::Call)
+    super::iterator_driver::finish(runtime, execution, pending).map(Progress::Call)
 }
 
 fn iterator_query_identity(execution: &mut RunningExecution, frame: FrameId) -> Result<u64, Error> {
@@ -2833,7 +2974,7 @@ pub(super) fn start_instance(
     runtime: &Runtime,
     execution: &mut RunningExecution,
     frame: FrameId,
-    candidate: Value,
+    candidate: JsValue,
     target: ObjectRef,
     depth: usize,
 ) -> Result<CallStep, Error> {
@@ -2873,20 +3014,26 @@ pub(super) fn start_object_copy(
 ) -> Result<CallStep, Error> {
     let parent = execution.frames.current_mut(frame)?;
     let realm = parent.executable.realm;
-    let target = execution.slots.peek(&parent.window, target_depth)?.clone();
-    let Value::Object(target) = target else {
+    // The copy machine borrows rooted copies; the slot owners stay live until
+    // the pops below consume them.
+    let JsValue::Object(target) = execution.slots.peek(&parent.window, target_depth)? else {
         return Err(Error::internal(
             "CopyDataProperties target is not an object",
         ));
     };
-    let source = execution.slots.peek(&parent.window, source_depth)?.clone();
+    let target = ObjectRef::from_borrowed_handle(runtime.clone(), *target)
+        .map_err(|error| runtime_error_to_vm_error(error.into()))?;
+    let source = execution.slots.peek(&parent.window, source_depth)?;
     let excluded = if let Some(depth) = excluded_depth {
-        let Value::Object(object) = execution.slots.peek(&parent.window, depth)?.clone() else {
+        let JsValue::Object(id) = execution.slots.peek(&parent.window, depth)? else {
             return Err(Error::internal(
                 "CopyDataProperties exclusion is not an object",
             ));
         };
-        Some(object)
+        Some(
+            ObjectRef::from_borrowed_handle(runtime.clone(), *id)
+                .map_err(|error| runtime_error_to_vm_error(error.into()))?,
+        )
     } else {
         None
     };
@@ -2899,19 +3046,28 @@ pub(super) fn start_object_copy(
     if excluded_depth.is_none() {
         let source = execution.slots.pop(&mut parent.window)?;
         if identity.is_none() {
-            // At exhaustion retain this already-rooted owner only long enough
-            // to restore the old failure input if a real wait is selected.
+            // At exhaustion retain this owner only long enough to restore the
+            // old failure input if a real wait is selected.
             rejected_source = Some(source);
+        } else {
+            // The normal source owner releases before any copy effects, as before.
+            runtime
+                .release_jsvalue(source)
+                .map_err(runtime_error_to_vm_error)?;
         }
-        // The normal source owner drops before any copy effects, as before.
     }
     let result = (|| {
         let step = step
             .advance_without_callback(runtime)
             .map_err(runtime_error_to_vm_error)?;
         if let crate::engine::builtins::ObjectCopyStep::Complete(completion) = step {
-            drop(rejected_source.take());
+            if let Some(source) = rejected_source.take() {
+                runtime
+                    .release_jsvalue(source)
+                    .map_err(runtime_error_to_vm_error)?;
+            }
             return finish_instruction_call(
+                runtime,
                 execution,
                 ReturnOwner::Frame(frame),
                 completion,
@@ -2943,7 +3099,11 @@ pub(super) fn start_object_copy(
             Finish::Discard(depth),
         )
     })();
-    drop(rejected_source);
+    if let Some(source) = rejected_source.take() {
+        runtime
+            .release_jsvalue(source)
+            .map_err(runtime_error_to_vm_error)?;
+    }
     match finish_error(runtime, realm, result)? {
         Progress::Call(step) => Ok(step),
         Progress::Conversion(_) => Err(Error::internal("object copy returned conversion")),
@@ -2956,8 +3116,8 @@ pub(super) fn start_vm_call(
     execution: &mut RunningExecution,
     frame: FrameId,
     callable: crate::engine::object::CallableRef,
-    receiver: Value,
-    arguments: Vec<Value>,
+    receiver: JsValue,
+    arguments: Vec<JsValue>,
     value_use: ReturnValue,
 ) -> Result<CallStep, Error> {
     match start_owned_callback(
@@ -3022,7 +3182,8 @@ fn continue_iterator(
     use super::iterator_driver::IteratorAction;
     let (step, next) = match action {
         IteratorAction::Finish => {
-            return super::iterator_driver::finish(execution, pending).map(IteratorProgress::Done);
+            return super::iterator_driver::finish(runtime, execution, pending)
+                .map(IteratorProgress::Done);
         }
         IteratorAction::Read(receiver, key) => (
             Step::ReadValue {
@@ -3051,8 +3212,12 @@ fn continue_iterator(
             false,
         ),
         IteratorAction::Next(callable, receiver) => {
-            let Value::Object(iterator) = receiver else {
-                return Err(Error::internal("iterator record lost object receiver"));
+            let iterator = match receiver {
+                JsValue::Object(id) => ObjectRef::from_owned_handle(runtime.clone(), id),
+                value => {
+                    let _ = runtime.release_jsvalue(value);
+                    return Err(Error::internal("iterator record lost object receiver"));
+                }
             };
             (
                 crate::engine::builtins::IteratorNextStep::start_callable(
@@ -3091,7 +3256,7 @@ pub(super) fn start_numeric(
             crate::engine::api::profiling::record_owned_execution_event(
                 "numeric_completed_without_query",
             );
-            return match finish_numeric(execution, frame, value, previous, depth)? {
+            return match finish_numeric(runtime, execution, frame, value, previous, depth)? {
                 CallStep::Entered => Ok(NumericProgress::Completed),
                 _ => Err(Error::internal(
                     "immediate numeric completion changed its frame protocol",
@@ -3136,7 +3301,7 @@ pub(super) fn start_class_parent(
     frame: FrameId,
 ) -> Result<CallStep, Error> {
     let step = Step::ReadValue {
-        receiver: Some(Value::Object(parent)),
+        receiver: Some(JsValue::Object(parent.into_handle())),
         key: Some(
             runtime
                 .intern_property_key("prototype")
@@ -3159,14 +3324,19 @@ pub(super) fn start_public_field(
     frame: FrameId,
     object: ObjectRef,
     key: PropertyKey,
-    value: Value,
+    value: crate::engine::value::JsValue,
     depth: usize,
 ) -> Result<CallStep, Error> {
+    let mut descriptor = crate::engine::object::OwnedPropertyDescriptor::new(runtime);
+    descriptor.value = crate::engine::object::DescriptorField::Present(value);
+    descriptor.writable = crate::engine::object::DescriptorField::Present(true);
+    descriptor.enumerable = crate::engine::object::DescriptorField::Present(true);
+    descriptor.configurable = crate::engine::object::DescriptorField::Present(true);
     let realm = execution.frames.current_mut(frame)?.executable.realm;
     let step = Step::Define {
         object: Some(object),
         key: Some(key),
-        descriptor: Some(Runtime::public_class_field_descriptor(value)),
+        descriptor: Some(descriptor.into()),
         resume: Some(Resume::PublicField),
     };
     start_instruction_query(
@@ -3229,7 +3399,8 @@ pub(super) fn start_for_in_query(
             crate::engine::api::profiling::record_owned_execution_event(
                 "for_in_completed_without_query",
             );
-            finish_for_in(execution, frame, value, done, depth)
+            // The for-in machine now produces internal values directly.
+            finish_for_in(runtime, execution, frame, value, done, depth)
         }
         ForInStep::Throw(value) => Ok(CallStep::Complete(Completion::Throw(value))),
         step => {
@@ -3273,26 +3444,37 @@ fn start_for_in_pending(
 }
 
 fn finish_for_in(
+    runtime: &Runtime,
     execution: &mut RunningExecution,
     frame: FrameId,
-    value: Value,
+    value: crate::engine::value::JsValue,
     done: Option<bool>,
     _depth: usize,
 ) -> Result<CallStep, Error> {
-    let parent = execution.frames.current_mut(frame)?;
-    execution.slots.push(&mut parent.window, value)?;
-    if let Some(done) = done {
-        execution
-            .slots
-            .push(&mut parent.window, Value::Bool(done))?;
-    }
-    parent.resume_pc = parent
-        .fault_pc
-        .checked_add(1)
-        .ok_or_else(|| Error::internal("for-in resume PC overflow"))?;
-    #[cfg(feature = "profiling")]
-    crate::engine::api::profiling::record_owned_instruction(_depth);
-    Ok(CallStep::Entered)
+    let mut value = value;
+    let result: Result<CallStep, Error> = (|| {
+        let parent = execution.frames.current_mut(frame)?;
+        let resume_pc = parent
+            .fault_pc
+            .checked_add(1)
+            .ok_or_else(|| Error::internal("for-in resume PC overflow"))?;
+        execution.slots.push_owned(&mut parent.window, &mut value)?;
+        if let Some(done) = done {
+            execution
+                .slots
+                .push(&mut parent.window, JsValue::Bool(done))?;
+        }
+        parent.resume_pc = resume_pc;
+        #[cfg(feature = "profiling")]
+        crate::engine::api::profiling::record_owned_instruction(_depth);
+        Ok(CallStep::Entered)
+    })();
+    let released = runtime
+        .release_jsvalue(value)
+        .map_err(runtime_error_to_vm_error);
+    let result = result?;
+    released?;
+    Ok(result)
 }
 
 pub(super) fn start_literal_definition(
@@ -3324,8 +3506,9 @@ pub(super) fn start_import(
         .executable
         .ensure_root(runtime)
         .map_err(runtime_error_to_vm_error)?;
-    let options = execution.slots.peek(&parent.window, 0)?.clone();
-    let specifier = execution.slots.peek(&parent.window, 1)?.clone();
+    // Slot owners remain live until the import record has acquired its edges.
+    let options = execution.slots.peek(&parent.window, 0)?;
+    let specifier = execution.slots.peek(&parent.window, 1)?;
     let result = crate::engine::modules::import::ImportStep::start(
         runtime,
         realm,

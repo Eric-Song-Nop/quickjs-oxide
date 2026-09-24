@@ -3,7 +3,7 @@
 use crate::engine::{
     api::{Error, runtime::Runtime},
     heap::ContextId,
-    value::Value,
+    value::JsValue,
     vm::{
         exception::runtime_error_to_vm_error,
         numeric::operation::{NumericKind, primitive_output},
@@ -11,11 +11,25 @@ use crate::engine::{
     },
 };
 
+#[inline]
 pub(super) fn supported(slots: &RunSlots<'_>, kind: NumericKind) -> bool {
+    // Check each operand with straight-line code. Iterating a range keeps the
+    // peek Result in memory across the loop and drags its drop glue onto the
+    // hot success path. Destructuring (instead of matching a temporary) moves
+    // the Err variant out, so the Ok branch folds to a plain tag test.
+    #[inline(always)]
+    fn primitive_operand(slots: &RunSlots<'_>, offset: usize) -> bool {
+        match slots.peek(offset) {
+            Ok(value) => !matches!(value, JsValue::Object(_)),
+            Err(error) => {
+                drop(error);
+                false
+            }
+        }
+    }
     kind.primitive_arithmetic()
-        && (0..if kind.unary() { 1 } else { 2 }).all(
-            |offset| matches!(slots.peek(offset), Ok(value) if !matches!(value, Value::Object(_))),
-        )
+        && primitive_operand(slots, 0)
+        && (kind.unary() || primitive_operand(slots, 1))
 }
 
 /// The caller published the exact arithmetic PC before entering this helper.
@@ -32,7 +46,7 @@ pub(super) fn complete(
     realm: ContextId,
     transaction: &mut FrameTransaction<'_>,
     kind: NumericKind,
-    thrown: &mut Option<Value>,
+    thrown: &mut Option<JsValue>,
     active_frame: super::super::frames::ActiveFrameToken,
     fault_pc: usize,
 ) -> Result<bool, Error> {
@@ -47,31 +61,12 @@ pub(super) fn complete(
     };
     // Parsing, BigInt allocation, Symbol release and error materialization all
     // occur after the input RunSlots has ended. Object coercion is never admitted.
-    let output = match primitive_output(kind, left, right) {
+    // The Err payload is handed to the outlined cold helper by reference so the
+    // wide Error never travels through this frame's success path.
+    let output = match primitive_output(runtime, kind, left, right) {
         Ok(output) => output,
         Err(error) => {
-            let Some(kind) =
-                crate::engine::api::error::NativeErrorKind::from_javascript_error(error.kind())
-            else {
-                return Err(error);
-            };
-            // The JavaScript error is the only observation point for this PC.
-            // The Symbol/BigInt pre-materialize gate already materialized the
-            // frame for the cases that reach it; string-too-long may not have.
-            if active_frame.is_materialized() {
-                runtime
-                    .update_active_bytecode_pc(
-                        active_frame,
-                        crate::engine::vm::BytecodePc::new(fault_pc),
-                    )
-                    .map_err(runtime_error_to_vm_error)?;
-            }
-            *thrown = Some(
-                runtime
-                    .new_native_error_from_error(realm, kind, &error)
-                    .map_err(runtime_error_to_vm_error)?,
-            );
-            return Ok(false);
+            return materialize_thrown(runtime, realm, error, thrown, active_frame, fault_pc);
         }
     };
     let mut value = Some(output.value);
@@ -96,6 +91,41 @@ pub(super) fn complete(
         );
     }
     Ok(true)
+}
+
+/// Outlined JavaScript-error materialization for [`complete`]. Keeping the
+/// engine-error passthrough, PC publication and native-error construction out
+/// of the resident helper removes the wide Error temporaries and their drop
+/// glue from the arithmetic success path.
+#[cold]
+#[inline(never)]
+fn materialize_thrown(
+    runtime: &Runtime,
+    realm: ContextId,
+    error: Error,
+    thrown: &mut Option<JsValue>,
+    active_frame: super::super::frames::ActiveFrameToken,
+    fault_pc: usize,
+) -> Result<bool, Error> {
+    let Some(kind) =
+        crate::engine::api::error::NativeErrorKind::from_javascript_error(error.kind())
+    else {
+        return Err(error);
+    };
+    // The JavaScript error is the only observation point for this PC.
+    // The Symbol/BigInt pre-materialize gate already materialized the
+    // frame for the cases that reach it; string-too-long may not have.
+    if active_frame.is_materialized() {
+        runtime
+            .update_active_bytecode_pc(active_frame, crate::engine::vm::BytecodePc::new(fault_pc))
+            .map_err(runtime_error_to_vm_error)?;
+    }
+    *thrown = Some(
+        runtime
+            .new_native_error_from_error_jsvalue(realm, kind, &error)
+            .map_err(runtime_error_to_vm_error)?,
+    );
+    Ok(false)
 }
 
 #[cfg(all(test, feature = "profiling"))]

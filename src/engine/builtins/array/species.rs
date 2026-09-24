@@ -3,7 +3,7 @@ use crate::engine::{
     api::{runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
     object::{ObjectRef, PropertyKey, WellKnownSymbol},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, Value, conversion::NativeConversion},
     vm::{Completion, call::ConstructorRef},
 };
 pub(crate) enum SpeciesStep {
@@ -15,7 +15,7 @@ pub(crate) enum SpeciesStep {
     },
     Construct {
         target: ConstructorRef,
-        arguments: Vec<Value>,
+        arguments: Vec<JsValue>,
     },
 }
 enum Phase {
@@ -34,7 +34,7 @@ impl SpeciesStep {
         source: &ObjectRef,
         length: u64,
     ) -> Result<Self, RuntimeError> {
-        match runtime.internal_is_array(realm, &Value::Object(source.clone()))? {
+        match runtime.internal_is_array_jsvalue(realm, &JsValue::Object(source.object_id()))? {
             NativeConversion::Throw(value) => Ok(Self::Complete(Completion::Throw(value))),
             NativeConversion::Value(false) => allocate(runtime, realm, length),
             NativeConversion::Value(true) => Ok(Self::Read {
@@ -52,10 +52,9 @@ impl SpeciesStep {
 }
 fn allocate(runtime: &Runtime, realm: ContextId, length: u64) -> Result<SpeciesStep, RuntimeError> {
     // The fresh, unpublished Array and numeric length cannot call JavaScript.
-    Ok(SpeciesStep::Complete(runtime.new_array_with_length(
-        realm,
-        Some(Value::number(length as f64)),
-    )?))
+    Ok(SpeciesStep::Complete(
+        runtime.new_array_with_length(realm, Some(length as f64))?,
+    ))
 }
 impl SpeciesResume {
     pub(crate) fn resume(
@@ -63,35 +62,35 @@ impl SpeciesResume {
         runtime: &Runtime,
         result: Completion,
     ) -> Result<SpeciesStep, RuntimeError> {
-        let mut constructor = match result {
+        let constructor = match result {
             Completion::Return(value) => value,
             Completion::Throw(value) => return Ok(SpeciesStep::Complete(Completion::Throw(value))),
         };
         if matches!(self.phase, Phase::Constructor) {
-            if let Value::Object(object) = &constructor
-                && runtime.is_constructor(object)?
-            {
-                let constructor_realm =
-                    match runtime.function_realm_from_value(self.realm, &constructor)? {
+            if let JsValue::Object(id) = constructor {
+                let object = ObjectRef::from_owned_handle(runtime.clone(), id);
+                if runtime.is_constructor(&object)? {
+                    let constructor_realm = match runtime
+                        .function_realm_from_jsvalue(self.realm, &JsValue::Object(id))?
+                    {
                         NativeConversion::Value(realm) => realm,
                         NativeConversion::Throw(value) => {
                             return Ok(SpeciesStep::Complete(Completion::Throw(value)));
                         }
                     };
-                if constructor_realm != self.realm
-                    && runtime
-                        .0
-                        .state
-                        .borrow()
-                        .heap
-                        .context(constructor_realm)?
-                        .array_constructor
-                        .is_some_and(|default| default == object.object_id())
-                {
-                    constructor = Value::Undefined;
+                    if constructor_realm != self.realm
+                        && runtime
+                            .0
+                            .state
+                            .borrow()
+                            .heap
+                            .context(constructor_realm)?
+                            .array_constructor
+                            == Some(id)
+                    {
+                        return allocate(runtime, self.realm, self.length);
+                    }
                 }
-            }
-            if let Value::Object(object) = constructor {
                 self.phase = Phase::Species;
                 return Ok(SpeciesStep::Read {
                     object,
@@ -99,16 +98,16 @@ impl SpeciesResume {
                     resume: self,
                 });
             }
-        } else if matches!(constructor, Value::Null) {
-            constructor = Value::Undefined;
-        }
-        if matches!(constructor, Value::Undefined) {
+        } else if matches!(constructor, JsValue::Null) {
             return allocate(runtime, self.realm, self.length);
         }
-        match runtime.constructor_from_value(self.realm, constructor)? {
+        if matches!(constructor, JsValue::Undefined) {
+            return allocate(runtime, self.realm, self.length);
+        }
+        match runtime.constructor_from_jsvalue(self.realm, constructor)? {
             NativeConversion::Value(target) => Ok(SpeciesStep::Construct {
                 target,
-                arguments: vec![Value::number(self.length as f64)],
+                arguments: vec![runtime.into_jsvalue(Value::number(self.length as f64))?],
             }),
             NativeConversion::Throw(value) => Ok(SpeciesStep::Complete(Completion::Throw(value))),
         }
@@ -131,7 +130,12 @@ pub(crate) fn finish(
                 runtime.get_property_in_realm(realm, &object, &key)?,
             )?,
             SpeciesStep::Construct { target, arguments } => {
-                return runtime.construct_constructor_internal(realm, &target, &target, &arguments);
+                return runtime.construct_internal_jsvalue(
+                    realm,
+                    &target,
+                    crate::engine::vm::call::ConstructNewTarget::Validated(target.clone()),
+                    arguments,
+                );
             }
         };
     }

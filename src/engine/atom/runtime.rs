@@ -4,7 +4,9 @@ use crate::engine::api::runtime_error::RuntimeError;
 
 use crate::engine::atom::{Atom, AtomError, AtomKind, AtomSpelling};
 use crate::engine::object::{PropertyKey, SymbolRef, WellKnownSymbol};
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::JsString;
+#[cfg(test)]
+use crate::engine::value::Value;
 
 impl Runtime {
     pub(crate) fn pinned_property_key(
@@ -24,6 +26,25 @@ impl Runtime {
             .borrow_mut()
             .atoms
             .intern_property_key_js_string(text)?;
+        Ok(PropertyKey::from_owned_atom(self.clone(), atom))
+    }
+
+    /// Intern a live internal string without cloning its payload for transport.
+    /// The caller keeps its owning edge until this non-callback borrow ends.
+    pub(crate) fn intern_property_key_string_id(
+        &self,
+        id: crate::engine::heap::StringId,
+    ) -> Result<PropertyKey, RuntimeError> {
+        let _operation = self.operation();
+        let atom = {
+            let mut state = self.0.state.borrow_mut();
+            let state = &mut *state;
+            let text = state
+                .heap
+                .string(id)
+                .map_err(|error| RuntimeError::Engine(Error::internal(error.to_string())))?;
+            state.atoms.intern_property_key_js_string(text)?
+        };
         Ok(PropertyKey::from_owned_atom(self.clone(), atom))
     }
 
@@ -47,6 +68,24 @@ impl Runtime {
 
     /// Allocation-free numeric subset of ToPropertyKey, including numeric -0.
     /// Larger, negative and fractional numbers retain the full conversion path.
+    pub(crate) fn immediate_numeric_property_key_jsvalue(
+        &self,
+        value: &crate::engine::value::JsValue,
+    ) -> Option<PropertyKey> {
+        let index = match value {
+            crate::engine::value::JsValue::Int(value) => u32::try_from(*value).ok()?,
+            crate::engine::value::JsValue::Float(value)
+                if *value >= 0.0 && *value <= u32::MAX as f64 && value.fract() == 0.0 =>
+            {
+                *value as u32
+            }
+            _ => return None,
+        };
+        Atom::from_immediate_integer(index)
+            .map(|atom| PropertyKey::from_owned_atom(self.clone(), atom))
+    }
+
+    #[cfg(test)]
     pub(crate) fn immediate_numeric_property_key(&self, value: &Value) -> Option<PropertyKey> {
         let index = match value {
             Value::Int(value) => u32::try_from(*value).ok()?,

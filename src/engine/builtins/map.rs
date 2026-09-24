@@ -19,7 +19,7 @@ use crate::engine::object::{
     WellKnownSymbol,
 };
 use crate::engine::value::conversion::NativeConversion;
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation, NativeInvokeOutcome};
 #[cfg(test)]
@@ -100,28 +100,32 @@ impl Runtime {
         let entries_key =
             self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Entries)?;
         let entries = match self.get_property_in_realm(realm, &map_prototype, &entries_key)? {
-            Completion::Return(value @ Value::Object(_)) => value,
-            Completion::Return(_) => {
+            Completion::Return(JsValue::Object(id)) => {
+                ObjectRef::from_owned_handle(self.clone(), id)
+            }
+            Completion::Return(value) => {
+                self.release_jsvalue(value)?;
                 return Err(RuntimeError::Invariant(
                     "Map.prototype.entries was not callable during bootstrap",
                 ));
             }
-            Completion::Throw(_) => {
+            Completion::Throw(value) => {
+                self.release_jsvalue(value)?;
                 return Err(RuntimeError::Invariant(
                     "Map.prototype.entries initialization threw during bootstrap",
                 ));
             }
         };
         let iterator_key = PropertyKey::from(self.well_known_symbol(WellKnownSymbol::Iterator));
-        if !self.define_own_property(
+        if !self.define_raw_property(
             &map_prototype,
             &iterator_key,
-            &OrdinaryPropertyDescriptor {
-                value: DescriptorField::Present(entries),
-                writable: DescriptorField::Present(true),
-                enumerable: DescriptorField::Present(false),
-                configurable: DescriptorField::Present(true),
-                ..OrdinaryPropertyDescriptor::new()
+            &crate::engine::object::property::PropertyDescriptor {
+                value: Some(crate::engine::heap::RawValue::Object(entries.object_id())),
+                writable: Some(true),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
             },
         )? {
             return Err(RuntimeError::Invariant(
@@ -279,7 +283,9 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        self.call_map_native_borrowed(realm, kind, &invocation, arguments)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            self.call_map_native_borrowed(realm, kind, invocation, arguments)
+        })
     }
     pub(crate) fn call_map_native_borrowed(
         &self,
@@ -317,7 +323,7 @@ impl Runtime {
                 "Map species did not receive a getter invocation",
             ));
         };
-        Ok(Completion::Return(this_value.clone()))
+        Ok(Completion::Return(self.dup_jsvalue(this_value)?))
     }
 
     fn call_map_constructor(
@@ -339,12 +345,26 @@ impl Runtime {
         )
     }
 
-    fn map_receiver<'a>(
+    fn map_receiver(
         &self,
         realm: ContextId,
-        invocation: &'a NativeInvocation,
+        invocation: &NativeInvocation,
         getter: bool,
-    ) -> Result<NativeConversion<&'a ObjectRef>, RuntimeError> {
+    ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
+        match self.map_receiver_id(realm, invocation, getter)? {
+            NativeConversion::Value(id) => Ok(NativeConversion::Value(
+                ObjectRef::from_borrowed_handle(self.clone(), id)?,
+            )),
+            NativeConversion::Throw(value) => Ok(NativeConversion::Throw(value)),
+        }
+    }
+
+    fn map_receiver_id(
+        &self,
+        realm: ContextId,
+        invocation: &NativeInvocation,
+        getter: bool,
+    ) -> Result<NativeConversion<crate::engine::heap::ObjectId>, RuntimeError> {
         let this_value = match (getter, invocation) {
             (false, NativeInvocation::Call { this_value })
             | (true, NativeInvocation::Getter { this_value }) => this_value,
@@ -354,38 +374,75 @@ impl Runtime {
                 ));
             }
         };
-        let Value::Object(object) = this_value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        let JsValue::Object(id) = this_value else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "Map object expected",
             )?));
         };
-        if !object.belongs_to(self) {
-            return Err(RuntimeError::WrongRuntime("Map receiver"));
-        }
         let is_map = matches!(
-            self.0
-                .state
-                .borrow()
-                .heap
-                .object(object.object_id())?
-                .payload,
+            self.0.state.borrow().heap.object(*id)?.payload,
             ObjectPayload::Map { .. }
         );
         if !is_map {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "Map object expected",
             )?));
         }
-        Ok(NativeConversion::Value(object))
+        Ok(NativeConversion::Value(*id))
     }
 
-    pub(in crate::engine::builtins) fn normalized_map_key(value: Value) -> Value {
+    /// Root one collection-stored payload as an owned internal value.
+    ///
+    /// Immediates copy without touching the heap; handle payloads retain
+    /// their edge directly. This replaces the generic `JsValue::from_raw` +
+    /// `dup_jsvalue` round trip on the `Map.prototype.get` hot path, which
+    /// spilled the 16-byte value through overlapping stack temporaries.
+    pub(in crate::engine::builtins) fn retain_collection_stored_value(
+        &self,
+        value: RawValue,
+    ) -> Result<JsValue, RuntimeError> {
+        Ok(match value {
+            RawValue::Undefined => JsValue::Undefined,
+            RawValue::Null => JsValue::Null,
+            RawValue::Bool(value) => JsValue::Bool(value),
+            RawValue::Int(value) => JsValue::Int(value),
+            RawValue::Float(value) => JsValue::Float(value),
+            RawValue::ShortBigInt(value) => JsValue::ShortBigInt(value),
+            RawValue::String(id) => {
+                self.retain_string_handle(id)?;
+                JsValue::String(id)
+            }
+            RawValue::BigInt(id) => {
+                self.retain_bigint_handle(id)?;
+                JsValue::BigInt(id)
+            }
+            RawValue::Object(id) => {
+                // The collection record owns this edge and the live receiver
+                // keeps the record alive for the whole native call, so the
+                // trusted retain skips the redundant identity revalidation.
+                self.retain_live_object_handle(id)?;
+                JsValue::Object(id)
+            }
+            RawValue::Symbol(index) => {
+                let atom = self.0.state.borrow().atoms.brand(index)?;
+                self.retain_atom_handle(atom)?;
+                JsValue::Symbol(index)
+            }
+            RawValue::Private(_) | RawValue::Uninitialized | RawValue::Exception => {
+                return Err(RuntimeError::Invariant(
+                    "collection record stored an internal value sentinel",
+                ));
+            }
+        })
+    }
+
+    pub(in crate::engine::builtins) fn normalized_map_key(value: JsValue) -> JsValue {
         match value {
-            Value::Float(0.0) => Value::Int(0),
+            JsValue::Float(0.0) => JsValue::Int(0),
             value => value,
         }
     }
@@ -393,49 +450,63 @@ impl Runtime {
     pub(in crate::engine::builtins) fn find_map_record(
         &self,
         map: &ObjectRef,
-        key: &Value,
+        key: &JsValue,
     ) -> Result<Option<(usize, RawValue)>, RuntimeError> {
-        let raw_key = self.raw_property_value(key)?;
+        self.find_map_record_id(map.object_id(), key)
+    }
+    fn find_map_record_id(
+        &self,
+        map: crate::engine::heap::ObjectId,
+        key: &JsValue,
+    ) -> Result<Option<(usize, RawValue)>, RuntimeError> {
+        let raw_key = match key {
+            JsValue::Float(0.0) => crate::engine::heap::RawValue::Int(0),
+            _ => key.as_raw(),
+        };
         let state = self.0.state.borrow();
         let heap = &state.heap;
-        let Some(index) = heap.map_find_record(map.object_id(), &raw_key)? else {
-            return Ok(None);
-        };
-        let value = heap
-            .map_records(map.object_id())?
-            .get(index)
-            .expect("indexed Map record exists")
-            .value
-            .clone();
-        Ok(Some((index, value)))
+        Ok(heap
+            .map_find_entry(map, &raw_key)?
+            .map(|(index, record)| (index, record.value.clone())))
     }
 
     pub(in crate::engine::builtins) fn set_map_record(
         &self,
         map: &ObjectRef,
-        key: Value,
-        value: Value,
+        key: JsValue,
+        value: JsValue,
     ) -> Result<(), RuntimeError> {
-        self.validate_value_domain(&key, "Map key")?;
-        self.validate_value_domain(&value, "Map value")?;
-        let key = Self::normalized_map_key(key);
-        let raw_key = self.raw_property_value(&key)?;
-        let raw_value = self.raw_property_value(&value)?;
+        let result = self.set_map_record_borrowed(map.object_id(), &key, &value);
+        let key_release = self.release_jsvalue(key);
+        let value_release = self.release_jsvalue(value);
+        result?;
+        key_release?;
+        value_release
+    }
+
+    // Native argv owns these edges throughout this non-callback transaction.
+    fn set_map_record_borrowed(
+        &self,
+        map: crate::engine::heap::ObjectId,
+        key: &JsValue,
+        value: &JsValue,
+    ) -> Result<(), RuntimeError> {
+        let raw_key = match key {
+            JsValue::Float(0.0) => RawValue::Int(0),
+            _ => key.as_raw(),
+        };
+        let raw_value = value.as_raw();
         let mut state = self.0.state.borrow_mut();
-        let existing = state.heap.map_find_record(map.object_id(), &raw_key)?;
+        let existing = state.heap.map_find_record(map, &raw_key)?;
         let retained = if existing.is_some() {
             state.retain_raw_value_atoms([&raw_value])?
         } else {
             state.retain_raw_value_atoms([&raw_key, &raw_value])?
         };
         let result = if let Some(index) = existing {
-            state
-                .heap
-                .map_replace_record_value(map.object_id(), index, raw_value)
+            state.heap.map_replace_record_value(map, index, raw_value)
         } else {
-            state
-                .heap
-                .map_insert_record(map.object_id(), raw_key, raw_value)
+            state.heap.map_insert_record(map, raw_key, raw_value)
         };
         let cleanup = match result {
             Ok(cleanup) => cleanup,
@@ -444,20 +515,30 @@ impl Runtime {
                 return Err(error.into());
             }
         };
-        state.apply_cleanup(cleanup)?;
-        drop(state);
-        drop(key);
-        drop(value);
-        Ok(())
+        state.apply_cleanup(cleanup)
     }
 
-    fn delete_map_record(&self, map: &ObjectRef, key: &Value) -> Result<bool, RuntimeError> {
-        let key = Self::normalized_map_key(key.clone());
-        let Some((index, _)) = self.find_map_record(map, &key)? else {
-            return Ok(false);
+    fn delete_map_record(&self, map: &ObjectRef, key: JsValue) -> Result<bool, RuntimeError> {
+        let result = self.delete_map_record_borrowed(map.object_id(), &key);
+        let released = self.release_jsvalue(key);
+        let result = result?;
+        released?;
+        Ok(result)
+    }
+    fn delete_map_record_borrowed(
+        &self,
+        map: crate::engine::heap::ObjectId,
+        key: &JsValue,
+    ) -> Result<bool, RuntimeError> {
+        let raw_key = match key {
+            JsValue::Float(0.0) => RawValue::Int(0),
+            _ => key.as_raw(),
         };
         let mut state = self.0.state.borrow_mut();
-        let cleanup = state.heap.map_delete_record(map.object_id(), index)?;
+        let Some(index) = state.heap.map_find_record(map, &raw_key)? else {
+            return Ok(false);
+        };
+        let cleanup = state.heap.map_delete_record(map, index)?;
         state.apply_cleanup(cleanup)?;
         Ok(true)
     }
@@ -468,26 +549,25 @@ impl Runtime {
         invocation: &NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let map = match self.map_receiver(realm, invocation, false)? {
+        let map = match self.map_receiver_id(realm, invocation, false)? {
             NativeConversion::Value(map) => map,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        let key = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "Map.prototype.set key argv was not padded",
-            ))?;
-        let value = arguments
-            .readable
-            .get(1)
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "Map.prototype.set value argv was not padded",
-            ))?;
-        self.set_map_record(map, key, value)?;
-        Ok(Completion::Return(Value::Object(map.clone())))
+        let key = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "Map.prototype.set key argv was not padded",
+        ))?;
+        let value = arguments.readable.get(1).ok_or(RuntimeError::Invariant(
+            "Map.prototype.set value argv was not padded",
+        ))?;
+        self.set_map_record_borrowed(map, key, value)?;
+        // Return the receiver without routing the already-validated object id
+        // through the generic `dup_jsvalue` value round trip. The receiver argv
+        // edge keeps the map live for the whole call, so the trusted retain
+        // skips the redundant slot identity revalidation.
+        self.retain_live_object_handle(map)?;
+        Ok(Completion::Return(JsValue::Object(map)))
     }
 
     fn call_map_get(
@@ -496,18 +576,31 @@ impl Runtime {
         invocation: &NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let map = match self.map_receiver(realm, invocation, false)? {
+        let map = match self.map_receiver_id(realm, invocation, false)? {
             NativeConversion::Value(map) => map,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        let key = Self::normalized_map_key(arguments.readable.first().cloned().ok_or(
-            RuntimeError::Invariant("Map.prototype.get key argv was not padded"),
-        )?);
-        let value = match self.find_map_record(map, &key)? {
-            Some((_, value)) => self.root_raw_value(&value)?,
-            None => Value::Undefined,
-        };
-        Ok(Completion::Return(value))
+        let key = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "Map.prototype.get key argv was not padded",
+        ))?;
+        // Build the completion per payload arm so scalar results reach the
+        // caller-provided return slot directly. Funnelling the 16-byte value
+        // through nested `Result`/`Completion` temporaries compiled into
+        // overlapping stack copies that stall on store forwarding.
+        Ok(match self.find_map_record_id(map, key)? {
+            None => Completion::Return(JsValue::Undefined),
+            Some((_, RawValue::Undefined)) => Completion::Return(JsValue::Undefined),
+            Some((_, RawValue::Null)) => Completion::Return(JsValue::Null),
+            Some((_, RawValue::Bool(value))) => Completion::Return(JsValue::Bool(value)),
+            Some((_, RawValue::Int(value))) => Completion::Return(JsValue::Int(value)),
+            Some((_, RawValue::Float(value))) => Completion::Return(JsValue::Float(value)),
+            Some((_, RawValue::ShortBigInt(value))) => {
+                Completion::Return(JsValue::ShortBigInt(value))
+            }
+            Some((_, value)) => Completion::Return(self.retain_collection_stored_value(value)?),
+        })
     }
 
     fn call_map_has(
@@ -516,16 +609,27 @@ impl Runtime {
         invocation: &NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let map = match self.map_receiver(realm, invocation, false)? {
+        let map = match self.map_receiver_id(realm, invocation, false)? {
             NativeConversion::Value(map) => map,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        let key = Self::normalized_map_key(arguments.readable.first().cloned().ok_or(
-            RuntimeError::Invariant("Map.prototype.has key argv was not padded"),
-        )?);
-        Ok(Completion::Return(Value::Bool(
-            self.find_map_record(map, &key)?.is_some(),
-        )))
+        let key = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "Map.prototype.has key argv was not padded",
+        ))?;
+        let raw_key = match key {
+            JsValue::Float(0.0) => RawValue::Int(0),
+            _ => key.as_raw(),
+        };
+        let has = self
+            .0
+            .state
+            .borrow()
+            .heap
+            .map_find_record(map, &raw_key)?
+            .is_some();
+        Ok(Completion::Return(JsValue::Bool(has)))
     }
 
     fn call_map_delete(
@@ -534,19 +638,17 @@ impl Runtime {
         invocation: &NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let map = match self.map_receiver(realm, invocation, false)? {
+        let map = match self.map_receiver_id(realm, invocation, false)? {
             NativeConversion::Value(map) => map,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        let key = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "Map.prototype.delete key argv was not padded",
-            ))?;
-        Ok(Completion::Return(Value::Bool(
-            self.delete_map_record(map, &key)?,
+        let key = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "Map.prototype.delete key argv was not padded",
+        ))?;
+        Ok(Completion::Return(JsValue::Bool(
+            self.delete_map_record_borrowed(map, key)?,
         )))
     }
 
@@ -555,14 +657,17 @@ impl Runtime {
         realm: ContextId,
         invocation: &NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        let map = match self.map_receiver(realm, invocation, false)? {
+        let map = match self.map_receiver_id(realm, invocation, false)? {
             NativeConversion::Value(map) => map,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
+
         let mut state = self.0.state.borrow_mut();
-        let cleanup = state.heap.map_clear(map.object_id())?;
+        let cleanup = state.heap.map_clear(map)?;
         state.apply_cleanup(cleanup)?;
-        Ok(Completion::Return(Value::Undefined))
+        Ok(Completion::Return(JsValue::Undefined))
     }
 
     fn call_map_size(
@@ -570,12 +675,15 @@ impl Runtime {
         realm: ContextId,
         invocation: &NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        let map = match self.map_receiver(realm, invocation, true)? {
+        let map = match self.map_receiver_id(realm, invocation, true)? {
             NativeConversion::Value(map) => map,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        let size = self.0.state.borrow().heap.map_size(map.object_id())?;
-        Ok(Completion::Return(Value::number(size as f64)))
+
+        let size = self.0.state.borrow().heap.map_size(map)?;
+        Ok(Completion::Return(JsValue::Int(size as i32)))
     }
 
     fn call_map_get_or_insert(
@@ -654,11 +762,13 @@ impl Runtime {
     ) -> Result<Completion, RuntimeError> {
         let map = match self.map_receiver(realm, invocation, false)? {
             NativeConversion::Value(map) => map,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        Ok(Completion::Return(Value::Object(
-            self.new_map_iterator(realm, map, kind)?,
-        )))
+        Ok(Completion::Return(self.into_jsvalue(Value::Object(
+            self.new_map_iterator(realm, &map, kind)?,
+        ))?))
     }
 
     pub(crate) fn call_map_iterator_next(
@@ -668,9 +778,11 @@ impl Runtime {
     ) -> Result<Completion, RuntimeError> {
         match self.call_map_iterator_next_raw(realm, invocation)? {
             NativeInvokeOutcome::Completion(completion) => Ok(completion),
-            NativeInvokeOutcome::IteratorNextRaw { value, done } => Ok(Completion::Return(
-                Value::Object(self.new_iterator_result(realm, value, done)?),
-            )),
+            NativeInvokeOutcome::IteratorNextRaw { value, done } => {
+                Ok(Completion::Return(self.into_jsvalue(Value::Object(
+                    self.new_iterator_result_jsvalue(realm, value, done)?,
+                ))?))
+            }
         }
     }
 
@@ -684,26 +796,29 @@ impl Runtime {
                 "Map Iterator next did not receive an iterator-next invocation",
             ));
         };
-        let Value::Object(iterator) = this_value else {
+        let JsValue::Object(iterator) = this_value else {
+            self.release_jsvalue(this_value)?;
             return Ok(NativeInvokeOutcome::Completion(Completion::Throw(
-                self.new_native_error(
+                self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "Map Iterator object expected",
                 )?,
             )));
         };
+        let iterator = ObjectRef::from_owned_handle(self.clone(), iterator);
+        let iterator_id = iterator.object_id();
         let state = self
             .0
             .state
             .borrow_mut()
             .heap
-            .begin_map_iterator_next(iterator.object_id());
+            .begin_map_iterator_next(iterator_id);
         let (map, mut index, kind) = match state {
             Ok(state) => state,
             Err(HeapError::Invariant(_)) => {
                 return Ok(NativeInvokeOutcome::Completion(Completion::Throw(
-                    self.new_native_error(
+                    self.new_native_error_jsvalue(
                         realm,
                         NativeErrorKind::Type,
                         "Map Iterator object expected",
@@ -714,7 +829,7 @@ impl Runtime {
         };
         let Some(map_id) = map else {
             return Ok(NativeInvokeOutcome::IteratorNextRaw {
-                value: Value::Undefined,
+                value: JsValue::Undefined,
                 done: true,
             });
         };
@@ -728,10 +843,10 @@ impl Runtime {
             .map(|(id, record)| (id, record.key.clone(), record.value.clone()));
         let Some((record_index, key, value)) = record else {
             let mut state = self.0.state.borrow_mut();
-            let cleanup = state.heap.finish_map_iterator(iterator.object_id())?;
+            let cleanup = state.heap.finish_map_iterator(iterator_id)?;
             state.apply_cleanup(cleanup)?;
             return Ok(NativeInvokeOutcome::IteratorNextRaw {
-                value: Value::Undefined,
+                value: JsValue::Undefined,
                 done: true,
             });
         };
@@ -742,19 +857,30 @@ impl Runtime {
             .state
             .borrow_mut()
             .heap
-            .set_map_iterator_index(iterator.object_id(), index)?;
+            .set_map_iterator_index(iterator_id, index)?;
         self.0
             .state
             .borrow_mut()
             .heap
-            .set_map_iterator_current(iterator.object_id(), record_index)?;
-        let key = self.root_raw_value(&key)?;
+            .set_map_iterator_current(iterator_id, record_index)?;
         let value = match kind {
-            MapIteratorKind::Key => key,
-            MapIteratorKind::Value => self.root_raw_value(&value)?,
-            MapIteratorKind::KeyAndValue => Value::Object(
-                self.new_array_from_values(realm, vec![key, self.root_raw_value(&value)?])?,
-            ),
+            MapIteratorKind::Key => self.retain_collection_stored_value(key)?,
+            MapIteratorKind::Value => self.retain_collection_stored_value(value.clone())?,
+            MapIteratorKind::KeyAndValue => {
+                let key = self.retain_collection_stored_value(key)?;
+                let value = self.retain_collection_stored_value(value.clone());
+                let value = match value {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = self.release_jsvalue(key);
+                        return Err(error);
+                    }
+                };
+                JsValue::Object(
+                    self.new_array_from_values_jsvalue(realm, vec![key, value])?
+                        .into_handle(),
+                )
+            }
         };
         Ok(NativeInvokeOutcome::IteratorNextRaw { value, done: false })
     }
@@ -848,14 +974,18 @@ mod tests {
         };
         let function = runtime.as_callable(&function).unwrap().unwrap();
 
-        context
-            .call(&function, Value::Undefined, &[])
-            .expect("warm Map Symbol ownership probe");
-        let baseline = runtime.test_atom_count();
-        for _ in 0..3 {
+        drop(
             context
                 .call(&function, Value::Undefined, &[])
-                .expect("repeat Map Symbol ownership probe");
+                .expect("warm Map Symbol ownership probe"),
+        );
+        let baseline = runtime.test_atom_count();
+        for _ in 0..3 {
+            drop(
+                context
+                    .call(&function, Value::Undefined, &[])
+                    .expect("repeat Map Symbol ownership probe"),
+            );
             assert_eq!(runtime.test_atom_count(), baseline);
         }
     }

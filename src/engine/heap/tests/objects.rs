@@ -51,15 +51,11 @@ fn proxy_revocation_releases_only_the_one_shot_closure_capture() {
         .unwrap();
     assert_eq!(heap.object_strong_count(target), Ok(2));
     assert_eq!(heap.object_strong_count(handler), Ok(2));
-    assert_eq!(
-        heap.proxy_snapshot(proxy),
-        Ok(ProxyData {
-            target,
-            handler,
-            is_callable: false,
-            is_revoked: false,
-        })
-    );
+    let snapshot = heap.proxy_snapshot(proxy).unwrap();
+    assert_eq!(snapshot.target, target);
+    assert_eq!(snapshot.handler, handler);
+    assert!(!snapshot.is_callable);
+    assert!(!snapshot.is_revoked);
 
     let revoker = heap
         .allocate_object(ObjectData::bound_internal_native_function(
@@ -80,10 +76,10 @@ fn proxy_revocation_releases_only_the_one_shot_closure_capture() {
     assert!(heap.proxy_snapshot(proxy).unwrap().is_revoked);
     assert_eq!(heap.object_strong_count(target), Ok(2));
     assert_eq!(heap.object_strong_count(handler), Ok(2));
-    assert_eq!(
+    assert!(matches!(
         heap.native_internal_callable(revoker),
         Ok(Some(InternalCallableData::ProxyRevoke { proxy: None }))
-    );
+    ));
 
     let (revoked_again, cleanup) = heap.revoke_proxy_from_callable(revoker).unwrap();
     assert!(!revoked_again);
@@ -218,11 +214,14 @@ fn primitive_object_payload_category_is_structurally_validated() {
     let shape = empty_shape(&mut heap);
     let number_payload = PrimitiveObjectData::Number(f64::NAN);
     assert_eq!(number_payload.kind(), PrimitiveKind::Number);
+    let category_string = heap
+        .allocate_string(JsString::try_from_utf16([0x61, 0xd800, 0x62]).unwrap())
+        .unwrap();
     assert_eq!(
-        PrimitiveObjectData::String(JsString::try_from_utf16([0x61, 0xd800, 0x62]).unwrap(),)
-            .kind(),
+        PrimitiveObjectData::String(category_string).kind(),
         PrimitiveKind::String
     );
+    heap.release_string(category_string).unwrap();
     assert_eq!(
         PrimitiveObjectData::Boolean(false).kind(),
         PrimitiveKind::Boolean
@@ -232,10 +231,12 @@ fn primitive_object_payload_category_is_structurally_validated() {
         PrimitiveObjectData::Symbol(symbol_atom).kind(),
         PrimitiveKind::Symbol
     );
+    let category_bigint = heap.allocate_bigint(JsBigInt::one()).unwrap();
     assert_eq!(
-        PrimitiveObjectData::BigInt(JsBigInt::one()).kind(),
+        PrimitiveObjectData::BigInt(category_bigint).kind(),
         PrimitiveKind::BigInt
     );
+    heap.release_bigint(category_bigint).unwrap();
 
     let mut invalid = ObjectData::primitive(shape, Vec::new(), number_payload.clone());
     invalid.kind = ObjectKind::Ordinary;
@@ -271,22 +272,28 @@ fn primitive_object_payload_category_is_structurally_validated() {
     assert_eq!(object_atoms(number_data).count(), 0);
 
     let string_value = JsString::try_from_utf16([0x61, 0xd800, 0x62]).unwrap();
+    let string_id = heap.allocate_string(string_value.clone()).unwrap();
     let string = heap
         .allocate_object(ObjectData::primitive(
             shape,
             Vec::new(),
-            PrimitiveObjectData::String(string_value.clone()),
+            PrimitiveObjectData::String(string_id),
         ))
         .unwrap();
+    heap.release_string(string_id).unwrap();
     let string_data = heap.object(string).unwrap();
     assert!(matches!(
         &string_data.payload,
         ObjectPayload::Primitive(PrimitiveObjectData::String(value))
-            if value == &string_value
+            if *value == string_id && heap.string(*value).unwrap() == &string_value
     ));
-    assert_eq!(object_edges(string_data), vec![RawId::Shape(shape)]);
+    assert_eq!(
+        object_edges(string_data),
+        vec![RawId::Shape(shape), RawId::String(string_id)]
+    );
     assert_eq!(object_atoms(string_data).count(), 0);
 
+    let symbol_index = AtomIdx::from_raw(symbol_atom.raw());
     let symbol = heap
         .allocate_object(ObjectData::primitive(
             shape,
@@ -300,27 +307,35 @@ fn primitive_object_payload_category_is_structurally_validated() {
         ObjectPayload::Primitive(PrimitiveObjectData::Symbol(atom)) if atom == symbol_atom
     ));
     assert_eq!(object_edges(symbol_data), vec![RawId::Shape(shape)]);
-    assert_eq!(object_atoms(symbol_data).collect::<Vec<_>>(), [symbol_atom]);
+    assert_eq!(
+        object_atoms(symbol_data).collect::<Vec<_>>(),
+        [symbol_index]
+    );
 
+    let bigint_id = heap.allocate_bigint(JsBigInt::from(i64::MAX)).unwrap();
     let bigint = heap
         .allocate_object(ObjectData::primitive(
             shape,
             Vec::new(),
-            PrimitiveObjectData::BigInt(JsBigInt::from(i64::MAX)),
+            PrimitiveObjectData::BigInt(bigint_id),
         ))
         .unwrap();
+    heap.release_bigint(bigint_id).unwrap();
     let bigint_data = heap.object(bigint).unwrap();
     assert!(matches!(
         &bigint_data.payload,
         ObjectPayload::Primitive(PrimitiveObjectData::BigInt(value))
-            if value == &JsBigInt::from(i64::MAX)
+            if *value == bigint_id && heap.bigint(*value).unwrap() == &JsBigInt::from(i64::MAX)
     ));
-    assert_eq!(object_edges(bigint_data), vec![RawId::Shape(shape)]);
+    assert_eq!(
+        object_edges(bigint_data),
+        vec![RawId::Shape(shape), RawId::BigInt(bigint_id)]
+    );
     assert_eq!(object_atoms(bigint_data).count(), 0);
 
     heap.release_object(bigint).unwrap();
     let symbol_cleanup = heap.release_object(symbol).unwrap();
-    assert_eq!(symbol_cleanup.atoms, [symbol_atom]);
+    assert_eq!(symbol_cleanup.atoms, [symbol_index]);
     let string_cleanup = heap.release_object(string).unwrap();
     assert!(string_cleanup.atoms.is_empty());
     heap.release_object(number).unwrap();
@@ -415,18 +430,18 @@ fn regexp_payload_is_branded_edge_free_and_structurally_validated() {
     let ordinary = heap
         .allocate_object(ObjectData::ordinary(shape, Vec::new()))
         .unwrap();
-    assert_eq!(
+    assert!(matches!(
         heap.regexp_data(ordinary),
         Err(HeapError::Invariant(
             "RegExp data requested for an object with the wrong class"
         ))
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         heap.replace_regexp_data(ordinary, RegExpObjectData::Uninitialized),
         Err(HeapError::Invariant(
             "RegExp data update reached an object with the wrong class"
         ))
-    );
+    ));
 
     heap.release_object(ordinary).unwrap();
     heap.release_object(regexp).unwrap();
@@ -455,7 +470,10 @@ fn compiled_regexp_payload_replacement_and_finalization_release_rc_leaves() {
             },
         )
         .unwrap();
-    assert_eq!(previous, RegExpObjectData::Uninitialized);
+    assert!(
+        matches!(previous, RegExpObjectData::Uninitialized),
+        "previous payload mismatch: {previous:?}"
+    );
     assert_eq!(Rc::strong_count(&program), 2);
     let RegExpObjectData::Compiled {
         pattern: stored_pattern,

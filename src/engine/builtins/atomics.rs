@@ -18,6 +18,7 @@ use crate::engine::builtins::native::{
 use std::time::Duration;
 
 use super::*;
+use crate::engine::value::JsValue;
 
 mod operation;
 #[cfg(test)]
@@ -155,7 +156,6 @@ impl Runtime {
         }
         Ok(atomics)
     }
-
     pub(crate) fn call_atomics_native(
         &self,
         realm: ContextId,
@@ -163,11 +163,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Atomics method did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         match kind {
             AtomicsNativeKind::Operation(operation) => {
                 self.call_atomics_operation(realm, operation, arguments)
@@ -190,18 +192,19 @@ impl Runtime {
     fn atomics_prepare_access(
         &self,
         realm: ContextId,
-        typed_array: &Value,
+        typed_array: &JsValue,
         mode: AtomicAccessMode,
     ) -> Result<NativeConversion<AtomicAccessPreparation>, RuntimeError> {
-        let Value::Object(object) = typed_array else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        let JsValue::Object(id) = typed_array else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "integer TypedArray expected",
             )?));
         };
-        let Some(snapshot) = self.typed_array_snapshot_if_branded(object)? else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        let object = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
+        let Some(snapshot) = self.typed_array_snapshot_if_branded(&object)? else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "integer TypedArray expected",
@@ -214,7 +217,7 @@ impl Runtime {
             }
         };
         if !valid_element {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "integer TypedArray expected",
@@ -225,7 +228,7 @@ impl Runtime {
         // QuickJS performs this non-shared wait rejection before even its
         // initial detach check.
         if mode == AtomicAccessMode::Wait && !buffer_access.is_shared() {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "not a SharedArrayBuffer TypedArray",
@@ -234,7 +237,7 @@ impl Runtime {
 
         let buffer = buffer_access.state;
         if buffer.detached {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer is detached",
@@ -264,7 +267,7 @@ impl Runtime {
             old_length,
         } = prepared;
         if index >= u64::from(old_length) {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "out-of-bound access",
@@ -274,14 +277,14 @@ impl Runtime {
         if mode == AtomicAccessMode::Operation {
             let current = self.typed_array_state_from_snapshot(snapshot)?;
             if current.out_of_bounds {
-                return Ok(NativeConversion::Throw(self.new_native_error(
+                return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "ArrayBuffer is detached or resized",
                 )?));
             }
             if index >= u64::from(current.length) {
-                return Ok(NativeConversion::Throw(self.new_native_error(
+                return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Range,
                     "out-of-bound access",
@@ -306,14 +309,14 @@ impl Runtime {
         if current.out_of_bounds {
             // js_atomics_op/js_atomics_store explicitly use the detached
             // ArrayBuffer error here even when a RAB resize caused the state.
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer is detached",
             )?));
         }
         if access.index >= u64::from(current.length) {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "out-of-bound access",
@@ -435,17 +438,18 @@ impl Runtime {
                 "Atomics.pause hint was not readable",
             ))?;
             let valid = match value {
-                Value::Undefined | Value::Int(_) => true,
-                Value::Float(value) => value.is_finite() && value.fract() == 0.0,
-                Value::Null
-                | Value::Bool(_)
-                | Value::BigInt(_)
-                | Value::String(_)
-                | Value::Symbol(_)
-                | Value::Object(_) => false,
+                JsValue::Undefined | JsValue::Int(_) => true,
+                JsValue::Float(value) => value.is_finite() && value.fract() == 0.0,
+                JsValue::Null
+                | JsValue::Bool(_)
+                | JsValue::BigInt(_)
+                | JsValue::ShortBigInt(_)
+                | JsValue::String(_)
+                | JsValue::Symbol(_)
+                | JsValue::Object(_) => false,
             };
             if !valid {
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "not an integral number",
@@ -453,7 +457,7 @@ impl Runtime {
             }
         }
         std::hint::spin_loop();
-        Ok(Completion::Return(Value::Undefined))
+        Ok(Completion::Return(JsValue::Undefined))
     }
 
     fn call_atomics_wait(
@@ -485,13 +489,13 @@ impl Runtime {
     fn atomics_store_converted(
         &self,
         access: &AtomicAccess,
-        stored_value: Value,
+        stored_value: &JsValue,
         bytes: [u8; 8],
     ) -> Result<Completion, RuntimeError> {
         let width = usize::from(access.snapshot.element.byte_length());
         let offset = atomic_absolute_byte_offset(access)?;
         with_atomics_seq_cst(|| self.write_buffer_word(&access.buffer, offset, &bytes[..width]))?;
-        Ok(Completion::Return(stored_value))
+        Ok(Completion::Return(self.dup_jsvalue(stored_value)?))
     }
     fn atomics_wait_converted(
         &self,
@@ -503,7 +507,7 @@ impl Runtime {
         // QuickJS deliberately checks the host policy after every observable
         // conversion, even when the current memory value would be unequal.
         if !self.can_block() {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "cannot block in this thread",
@@ -529,9 +533,9 @@ impl Runtime {
             waiter::WaitOutcome::Ok => "ok",
             waiter::WaitOutcome::TimedOut => "timed-out",
         };
-        Ok(Completion::Return(Value::String(JsString::from_static(
-            result,
-        ))))
+        Ok(Completion::Return(self.into_jsvalue(Value::String(
+            JsString::from_static(result),
+        ))?))
     }
     fn atomics_notify_converted(
         &self,
@@ -539,7 +543,7 @@ impl Runtime {
         count: i32,
     ) -> Result<Completion, RuntimeError> {
         if count == 0 || !access.buffer.is_shared() {
-            return Ok(Completion::Return(Value::Int(0)));
+            return Ok(Completion::Return(JsValue::Int(0)));
         }
         let backing_id = access
             .buffer
@@ -554,7 +558,7 @@ impl Runtime {
         );
         let notified = i32::try_from(notified)
             .map_err(|_| RuntimeError::Invariant("Atomics.notify waiter count overflowed i32"))?;
-        Ok(Completion::Return(Value::Int(notified)))
+        Ok(Completion::Return(JsValue::Int(notified)))
     }
 }
 

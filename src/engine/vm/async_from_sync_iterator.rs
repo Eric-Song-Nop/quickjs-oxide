@@ -12,9 +12,11 @@ use crate::engine::api::runtime_error::RuntimeError;
 
 use crate::engine::builtins::native::{GeneratorResumeKind, NativeFunctionId};
 use crate::engine::heap::{ContextId, InternalCallableData, ObjectData};
-use crate::engine::object::{CallableRef, ObjectRef};
+use crate::engine::object::CallableRef;
+use crate::engine::object::ObjectRef;
 #[cfg(test)]
 use crate::engine::object::{PropertyKey, WellKnownSymbol};
+#[cfg(test)]
 use crate::engine::value::Value;
 use crate::engine::value::conversion::NativeConversion;
 use crate::engine::vm::Completion;
@@ -34,16 +36,20 @@ impl Runtime {
         let async_key = PropertyKey::from(self.well_known_symbol(WellKnownSymbol::AsyncIterator));
         let async_method =
             match self.get_value_property_in_realm(realm, iterable.clone(), &async_key)? {
-                Completion::Return(value) => value,
-                Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
+                Completion::Return(value) => self.root_and_release_jsvalue(value)?,
+                Completion::Throw(value) => {
+                    return Ok(NativeConversion::Throw(value));
+                }
             };
 
         let iterator = if matches!(async_method, Value::Undefined | Value::Null) {
             let sync_key = PropertyKey::from(self.well_known_symbol(WellKnownSymbol::Iterator));
             let sync_method =
                 match self.get_value_property_in_realm(realm, iterable.clone(), &sync_key)? {
-                    Completion::Return(value) => value,
-                    Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
+                    Completion::Return(value) => self.root_and_release_jsvalue(value)?,
+                    Completion::Throw(value) => {
+                        return Ok(NativeConversion::Throw(value));
+                    }
                 };
             let sync_method =
                 match self.async_from_sync_callable(realm, sync_method, "not a function")? {
@@ -51,21 +57,27 @@ impl Runtime {
                     NativeConversion::Throw(value) => return Ok(NativeConversion::Throw(value)),
                 };
             let sync_iterator = match self.call_internal(realm, &sync_method, iterable, &[])? {
-                Completion::Return(Value::Object(iterator)) => iterator,
-                Completion::Return(_) => {
-                    return Ok(NativeConversion::Throw(self.new_native_error(
-                        realm,
-                        NativeErrorKind::Type,
-                        "not an object",
-                    )?));
+                Completion::Return(value) => match self.root_and_release_jsvalue(value)? {
+                    Value::Object(iterator) => iterator,
+                    _ => {
+                        return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+                            realm,
+                            NativeErrorKind::Type,
+                            "not an object",
+                        )?));
+                    }
+                },
+                Completion::Throw(value) => {
+                    return Ok(NativeConversion::Throw(value));
                 }
-                Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
             };
             let next_key =
                 self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Next)?;
             let next = match self.get_property_in_realm(realm, &sync_iterator, &next_key)? {
-                Completion::Return(value) => value,
-                Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
+                Completion::Return(value) => self.root_and_release_jsvalue(value)?,
+                Completion::Throw(value) => {
+                    return Ok(NativeConversion::Throw(value));
+                }
             };
             Value::Object(self.new_async_from_sync_iterator(realm, &sync_iterator, &next)?)
         } else {
@@ -78,26 +90,51 @@ impl Runtime {
                 NativeConversion::Throw(value) => return Ok(NativeConversion::Throw(value)),
             };
             match self.call_internal(realm, &async_method, iterable, &[])? {
-                Completion::Return(Value::Object(iterator)) => Value::Object(iterator),
-                Completion::Return(_) => {
-                    return Ok(NativeConversion::Throw(self.new_native_error(
-                        realm,
-                        NativeErrorKind::Type,
-                        "not an object",
-                    )?));
+                Completion::Return(value) => match self.root_and_release_jsvalue(value)? {
+                    Value::Object(iterator) => Value::Object(iterator),
+                    _ => {
+                        return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+                            realm,
+                            NativeErrorKind::Type,
+                            "not an object",
+                        )?));
+                    }
+                },
+                Completion::Throw(value) => {
+                    return Ok(NativeConversion::Throw(value));
                 }
-                Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
             }
         };
 
         let next_key = self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Next)?;
         let next = match self.get_value_property_in_realm(realm, iterator.clone(), &next_key)? {
-            Completion::Return(value) => value,
-            Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
+            Completion::Return(value) => self.root_and_release_jsvalue(value)?,
+            Completion::Throw(value) => {
+                return Ok(NativeConversion::Throw(value));
+            }
         };
         Ok(NativeConversion::Value((iterator, next)))
     }
 
+    fn async_from_sync_callable_jsvalue(
+        &self,
+        realm: ContextId,
+        value: &crate::engine::value::JsValue,
+    ) -> Result<NativeConversion<CallableRef>, RuntimeError> {
+        if let crate::engine::value::JsValue::Object(id) = value {
+            let object = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
+            if let Some(callable) = self.as_callable(&object)? {
+                return Ok(NativeConversion::Value(callable));
+            }
+        }
+        Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+            realm,
+            NativeErrorKind::Type,
+            "not a function",
+        )?))
+    }
+
+    #[cfg(test)]
     fn async_from_sync_callable(
         &self,
         realm: ContextId,
@@ -105,14 +142,14 @@ impl Runtime {
         message: &'static str,
     ) -> Result<NativeConversion<CallableRef>, RuntimeError> {
         let Value::Object(object) = value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 message,
             )?));
         };
         let Some(callable) = self.as_callable(&object)? else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 message,
@@ -121,11 +158,14 @@ impl Runtime {
         Ok(NativeConversion::Value(callable))
     }
 
-    pub(super) fn new_async_from_sync_iterator(
+    /// Internal-value form of [`Runtime::new_async_from_sync_iterator`]. The
+    /// borrowed value already owns its edges; the wrapper retains its own copy
+    /// transactionally, so no producer edge exists.
+    pub(super) fn new_async_from_sync_iterator_jsvalue(
         &self,
         realm: ContextId,
-        sync_iterator: &ObjectRef,
-        next: &Value,
+        sync_iterator: crate::engine::heap::ObjectId,
+        next: &crate::engine::value::JsValue,
     ) -> Result<ObjectRef, RuntimeError> {
         let prototype = self
             .0
@@ -139,7 +179,7 @@ impl Runtime {
             ))?
             .async_from_sync_iterator_prototype;
         let prototype = ObjectRef::from_borrowed_handle(self.clone(), prototype)?;
-        let raw_next = self.raw_property_value(next)?;
+        let raw_next = next.as_raw();
         let mut state = self.0.state.borrow_mut();
         let shape = state.get_or_create_shape(Some(prototype.object_id()), &[])?;
         let retained_atoms = match state.retain_raw_value_atoms(std::iter::once(&raw_next)) {
@@ -155,7 +195,7 @@ impl Runtime {
             .allocate_object(ObjectData::async_from_sync_iterator(
                 shape,
                 Vec::new(),
-                sync_iterator.object_id(),
+                sync_iterator,
                 raw_next,
             )) {
             Ok(object) => object,
@@ -168,8 +208,22 @@ impl Runtime {
         };
         let cleanup = state.heap.release_shape(shape)?;
         state.apply_cleanup(cleanup)?;
-        drop(state);
         Ok(ObjectRef::from_owned_handle(self.clone(), object))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
+    pub(super) fn new_async_from_sync_iterator(
+        &self,
+        realm: ContextId,
+        sync_iterator: &ObjectRef,
+        next: &Value,
+    ) -> Result<ObjectRef, RuntimeError> {
+        let next = self.unroot_value(next)?;
+        let result =
+            self.new_async_from_sync_iterator_jsvalue(realm, sync_iterator.object_id(), &next);
+        self.release_jsvalue(next)?;
+        result
     }
 
     pub(crate) fn call_async_from_sync_iterator_resume(
@@ -179,14 +233,16 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        FromSyncStep::start(
-            self,
-            realm,
-            NativeFunctionId::AsyncFromSyncIteratorResume(kind),
-            &invocation,
-            arguments,
-        )?
-        .finish(self, realm)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            FromSyncStep::start(
+                self,
+                realm,
+                NativeFunctionId::AsyncFromSyncIteratorResume(kind),
+                invocation,
+                arguments,
+            )?
+            .finish(self, realm)
+        })
     }
 
     pub(crate) fn call_async_from_sync_iterator_unwrap(
@@ -195,11 +251,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Async-from-Sync unwrap did not receive a call invocation",
             ));
         };
+        invocation.release(self)?;
         let active = self.active_function()?;
         let internal = self
             .0
@@ -218,12 +276,14 @@ impl Runtime {
         let value = arguments
             .readable
             .first()
-            .cloned()
+            .map(|value| self.dup_jsvalue(value))
+            .transpose()?
             .ok_or(RuntimeError::Invariant(
                 "Async-from-Sync unwrap argv was not padded",
             ))?;
-        Ok(Completion::Return(Value::Object(
-            self.new_iterator_result(realm, value, done)?,
+        let result = self.new_iterator_result_jsvalue(realm, value, done)?;
+        Ok(Completion::Return(crate::engine::value::JsValue::Object(
+            result.into_handle(),
         )))
     }
 
@@ -233,14 +293,16 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        FromSyncStep::start(
-            self,
-            realm,
-            NativeFunctionId::AsyncFromSyncIteratorClose,
-            &invocation,
-            arguments,
-        )?
-        .finish(self, realm)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            FromSyncStep::start(
+                self,
+                realm,
+                NativeFunctionId::AsyncFromSyncIteratorClose,
+                invocation,
+                arguments,
+            )?
+            .finish(self, realm)
+        })
     }
 }
 
@@ -304,7 +366,7 @@ mod tests {
             .unwrap();
         (
             snapshot.state,
-            runtime.root_raw_value(&snapshot.result).unwrap(),
+            runtime.root_raw_value(snapshot.result.clone()).unwrap(),
         )
     }
 

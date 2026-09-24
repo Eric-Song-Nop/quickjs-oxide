@@ -1,5 +1,5 @@
 //! Mechanical adapters for object builtins domain requests.
-use super::{DirectCallTarget, Resume, Step, Value};
+use super::{DirectCallTarget, JsValue, Resume, Step};
 
 impl From<crate::engine::builtins::BuiltinPrototypeStep> for Step {
     fn from(step: crate::engine::builtins::BuiltinPrototypeStep) -> Self {
@@ -99,7 +99,7 @@ impl From<crate::engine::builtins::PropertyStep> for Step {
                 Self::Define {
                     object: Some(object),
                     key: Some(key),
-                    descriptor: Some(descriptor),
+                    descriptor: Some(descriptor.into()),
                     resume: Some(Resume::Property(resume)),
                 }
             }
@@ -158,7 +158,7 @@ impl From<crate::engine::builtins::PredicateStep> for Step {
                 Self::Define {
                     object: Some(object),
                     key: Some(key),
-                    descriptor: Some(descriptor),
+                    descriptor: Some(descriptor.into()),
                     resume: Some(Resume::Predicate(resume)),
                 }
             }
@@ -210,7 +210,7 @@ impl From<crate::engine::builtins::DefinitionsStep> for Step {
                 let object = resume.take_read_object();
                 let key = resume.take_read_key();
                 Self::Read {
-                    receiver: Some(Value::Object(object.clone())),
+                    receiver: Some(JsValue::Object(object.clone().into_handle())),
                     object: Some(object),
                     key: Some(key),
                     resume: Some(Resume::Definitions(resume)),
@@ -230,7 +230,7 @@ impl From<crate::engine::builtins::DefinitionsStep> for Step {
                 Self::Define {
                     object: Some(object),
                     key: Some(key),
-                    descriptor: Some(descriptor),
+                    descriptor: Some(descriptor.into()),
                     resume: Some(Resume::Definitions(resume)),
                 }
             }
@@ -315,7 +315,7 @@ impl From<crate::engine::builtins::ObjectIterationStep> for Step {
                 Self::Define {
                     object: Some(object),
                     key: Some(key),
-                    descriptor: Some(descriptor),
+                    descriptor: Some(descriptor.into()),
                     resume: Some(Resume::ObjectIteration(resume)),
                 }
             }
@@ -345,17 +345,20 @@ impl From<crate::engine::builtins::ObjectCopyStep> for Step {
         match step {
             T::Complete(result) => Self::Complete(Some(result)),
 
-            T::PreparedRead(prepared) => Self::PreparedRead {
-                read: Some(prepared.read),
-                key: Some(prepared.key),
-                resume: Some(Resume::ObjectCopy(prepared.resume)),
-            },
+            T::PreparedRead(prepared) => {
+                let (read, key, resume) = prepared.into_parts();
+                Self::PreparedRead {
+                    read: Some(read),
+                    key: Some(key),
+                    resume: Some(Resume::ObjectCopy(resume)),
+                }
+            }
             T::Read {
                 object,
                 key,
                 resume,
             } => Self::Read {
-                receiver: Some(Value::Object(object.clone())),
+                receiver: Some(JsValue::Object(object.clone().into_handle())),
                 object: Some(object),
                 key: Some(key),
                 resume: Some(Resume::ObjectCopy(resume)),
@@ -399,7 +402,7 @@ impl From<crate::engine::builtins::JsonParseStep> for Step {
                 let object = resume.take_read_object();
                 let key = resume.take_read_key();
                 Self::Read {
-                    receiver: Some(Value::Object(object.clone())),
+                    receiver: Some(JsValue::Object(object.clone().into_handle())),
                     object: Some(object),
                     key: Some(key),
                     resume: Some(Resume::JsonParse(resume)),
@@ -462,7 +465,7 @@ impl From<crate::engine::builtins::JsonParseStep> for Step {
                 Self::Define {
                     object: Some(object),
                     key: Some(key),
-                    descriptor: Some(descriptor),
+                    descriptor: Some(descriptor.into()),
                     resume: Some(Resume::JsonParse(resume)),
                 }
             }

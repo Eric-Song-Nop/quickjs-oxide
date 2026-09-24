@@ -30,9 +30,20 @@ impl Heap {
             NodeData::Shape(_)
             | NodeData::VarRef(_)
             | NodeData::Context(_)
-            | NodeData::FunctionBytecode(_) => Err(HeapError::Invariant(
+            | NodeData::FunctionBytecode(_)
+            | NodeData::String(_)
+            | NodeData::BigInt(_) => Err(HeapError::Invariant(
                 "typed object lookup reached another node payload",
             )),
+        }
+    }
+
+    /// Trusted shared read for a live `ObjectId` held by an owning root.
+    #[inline]
+    pub(crate) fn object_fast(&self, id: ObjectId) -> &ObjectData {
+        match &self.live_node_fast(RawId::Object(id)).data {
+            NodeData::Object(object) => object,
+            _ => unreachable!("trusted object handle reached another node payload"),
         }
     }
 
@@ -111,9 +122,20 @@ impl Heap {
             NodeData::Object(_)
             | NodeData::VarRef(_)
             | NodeData::Context(_)
-            | NodeData::FunctionBytecode(_) => Err(HeapError::Invariant(
+            | NodeData::FunctionBytecode(_)
+            | NodeData::String(_)
+            | NodeData::BigInt(_) => Err(HeapError::Invariant(
                 "typed shape lookup reached another node payload",
             )),
+        }
+    }
+
+    /// Trusted shared read for a live `ShapeId` reachable from a live object.
+    #[inline]
+    pub(crate) fn shape_fast(&self, id: ShapeId) -> &Shape {
+        match &self.live_node_fast(RawId::Shape(id)).data {
+            NodeData::Shape(shape) => shape,
+            _ => unreachable!("trusted shape handle reached another node payload"),
         }
     }
 
@@ -129,7 +151,9 @@ impl Heap {
             NodeData::Object(_)
             | NodeData::VarRef(_)
             | NodeData::Context(_)
-            | NodeData::FunctionBytecode(_) => Err(HeapError::Invariant(
+            | NodeData::FunctionBytecode(_)
+            | NodeData::String(_)
+            | NodeData::BigInt(_) => Err(HeapError::Invariant(
                 "typed mutable shape lookup reached another node payload",
             )),
         }
@@ -142,7 +166,9 @@ impl Heap {
             NodeData::Object(_)
             | NodeData::Shape(_)
             | NodeData::VarRef(_)
-            | NodeData::FunctionBytecode(_) => Err(HeapError::Invariant(
+            | NodeData::FunctionBytecode(_)
+            | NodeData::String(_)
+            | NodeData::BigInt(_) => Err(HeapError::Invariant(
                 "typed context lookup reached another node payload",
             )),
         }
@@ -409,7 +435,26 @@ impl Heap {
         id: ObjectId,
         value: RawValue,
     ) -> Result<(), HeapError> {
-        let next_len = {
+        let next_len = self.fresh_array_next_length(id)?;
+
+        self.append_array_dense_value(id, value)?;
+        let replacement = if let Ok(length) = i32::try_from(next_len) {
+            RawValue::Int(length)
+        } else {
+            RawValue::Float(f64::from(next_len))
+        };
+        let object = self
+            .object_mut(id)
+            .expect("fresh Array disappeared after retaining its appended value");
+        let Some(PropertySlot::Data(length)) = object.slots.first_mut() else {
+            unreachable!("fresh Array length slot changed after preflight")
+        };
+        *length = replacement;
+        Ok(())
+    }
+
+    fn fresh_array_next_length(&self, id: ObjectId) -> Result<u32, HeapError> {
+        Ok({
             let object = self.object(id)?;
             let ObjectPayload::Array { dense: Some(dense) } = &object.payload else {
                 return Err(HeapError::Invariant(
@@ -446,21 +491,47 @@ impl Heap {
             dense_len.checked_add(1).ok_or(HeapError::Overflow {
                 operation: "growing fresh Array length",
             })?
-        };
+        })
+    }
 
-        self.append_array_dense_value(id, value)?;
-        let replacement = if let Ok(length) = i32::try_from(next_len) {
-            RawValue::Int(length)
-        } else {
-            RawValue::Float(f64::from(next_len))
+    /// Adopt an owned element, including its atom edge, with no retain/release
+    /// pair. On error nothing is published and the exact input owner is returned.
+    pub(crate) fn append_fresh_array_dense_value_owned(
+        &mut self,
+        id: ObjectId,
+        value: RawValue,
+    ) -> Result<(), (HeapError, RawValue)> {
+        let prepared = (|| {
+            if !is_map_storable_value(&value) {
+                return Err(HeapError::Invariant(
+                    "fast Array contains an internal value sentinel",
+                ));
+            }
+            let next_len = self.fresh_array_next_length(id)?;
+            let ObjectPayload::Array { dense: Some(dense) } = &mut self.object_mut(id)?.payload
+            else {
+                unreachable!("validated dense Array changed before reservation")
+            };
+            dense.try_reserve(1).map_err(|_| HeapError::Allocation {
+                operation: "growing fast Array storage",
+            })?;
+            Ok(next_len)
+        })();
+        let next_len = match prepared {
+            Ok(length) => length,
+            Err(error) => return Err((error, value)),
         };
-        let object = self
-            .object_mut(id)
-            .expect("fresh Array disappeared after retaining its appended value");
+        let object = self.object_mut(id).expect("validated fresh Array");
+        let ObjectPayload::Array { dense: Some(dense) } = &mut object.payload else {
+            unreachable!("validated dense Array changed before publication")
+        };
+        dense.push(value);
         let Some(PropertySlot::Data(length)) = object.slots.first_mut() else {
-            unreachable!("fresh Array length slot changed after preflight")
+            unreachable!("validated fresh Array length slot")
         };
-        *length = replacement;
+        *length = i32::try_from(next_len)
+            .map(RawValue::Int)
+            .unwrap_or_else(|_| RawValue::Float(f64::from(next_len)));
         Ok(())
     }
 
@@ -729,23 +800,23 @@ impl Heap {
                 "in-place property append reached a shared shape",
             ));
         }
-        let index =
-            self.shape(shape_id)?
-                .unique_append_index(atom)
-                .map_err(|error| match error {
-                    ShapeError::NullAtom => {
-                        HeapError::Invariant("in-place property append used a null atom")
-                    }
-                    ShapeError::DuplicateAtom(_) => {
-                        HeapError::Invariant("in-place property append duplicated a shape atom")
-                    }
-                    ShapeError::MissingAtom(_) => HeapError::Invariant(
-                        "in-place property append reported an impossible missing atom",
-                    ),
-                    ShapeError::PropertyIndexOverflow => HeapError::Overflow {
-                        operation: "appending an in-place shape property",
-                    },
-                })?;
+        let index = self
+            .shape(shape_id)?
+            .unique_append_index(AtomIdx::from_raw(atom.raw()))
+            .map_err(|error| match error {
+                ShapeError::NullAtom => {
+                    HeapError::Invariant("in-place property append used a null atom")
+                }
+                ShapeError::DuplicateAtom(_) => {
+                    HeapError::Invariant("in-place property append duplicated a shape atom")
+                }
+                ShapeError::MissingAtom(_) => HeapError::Invariant(
+                    "in-place property append reported an impossible missing atom",
+                ),
+                ShapeError::PropertyIndexOverflow => HeapError::Overflow {
+                    operation: "appending an in-place shape property",
+                },
+            })?;
         self.append_unique_object_property_at_index(
             id,
             shape_id,
@@ -833,7 +904,7 @@ impl Heap {
             Ok(shape) => shape,
             Err(_) => unreachable!("authenticated unique shape disappeared before append"),
         };
-        shape.append_unique_property(atom, flags, index);
+        shape.append_unique_property(AtomIdx::from_raw(atom.raw()), flags, index);
         let object = match self.object_mut(id) {
             Ok(object) => object,
             Err(_) => unreachable!("authenticated object disappeared before slot append"),
@@ -1680,7 +1751,8 @@ impl Heap {
         }
         if let ObjectPayload::Promise(data) = &object.payload {
             if !is_promise_storable_value(&data.result)
-                || (data.state == PromiseState::Pending && data.result != RawValue::Undefined)
+                || (data.state == PromiseState::Pending
+                    && !matches!(data.result, RawValue::Undefined))
                 || (data.state != PromiseState::Pending
                     && (!data.fulfill_reactions.is_empty() || !data.reject_reactions.is_empty()))
                 || data
@@ -1833,7 +1905,7 @@ impl Heap {
                                 "generator frame binding contains an internal-only value",
                             ));
                         }
-                        GeneratorFrameBinding::Private(atom) if atom.is_null() => {
+                        GeneratorFrameBinding::Private(index) if index.is_null() => {
                             return Err(HeapError::Invariant(
                                 "generator private binding contains the null atom",
                             ));
@@ -1960,7 +2032,7 @@ impl Heap {
                     ));
                 }
             }
-            records.validate()?;
+            records.validate(self)?;
         }
         if let ObjectPayload::MapIterator {
             object: source,
@@ -2005,7 +2077,7 @@ impl Heap {
                     ));
                 }
             }
-            records.validate()?;
+            records.validate(self)?;
         }
         if let ObjectPayload::SetIterator {
             object: source,

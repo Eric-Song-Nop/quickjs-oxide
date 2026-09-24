@@ -5,8 +5,8 @@ use super::{
 };
 use crate::engine::api::{runtime::Runtime, runtime_error::RuntimeError};
 use crate::engine::heap::ContextId;
-use crate::engine::object::{CompleteOrdinaryPropertyDescriptor, ObjectRef, PropertyKey};
-use crate::engine::value::{Value, conversion::NativeConversion};
+use crate::engine::object::{ObjectRef, PropertyKey};
+use crate::engine::value::{JsValue, Value, conversion::NativeConversion};
 use crate::engine::vm::{Completion, call::DirectCallTarget};
 
 pub(crate) enum ProxyBooleanKind {
@@ -107,7 +107,9 @@ fn method(
     step: MethodStep,
 ) -> Result<ProxyBooleanStep, RuntimeError> {
     Ok(match step {
-        MethodStep::Throw(value) => ProxyBooleanStep::Complete(NativeConversion::Throw(value)),
+        MethodStep::Throw(value) => {
+            ProxyBooleanStep::Complete(NativeConversion::Throw(value.take()))
+        }
         MethodStep::Read { mut resume } => {
             let object = resume.take_read_object();
             let key = resume.take_read_key();
@@ -117,7 +119,7 @@ fn method(
                 key,
                 receiver,
                 ProxyBooleanResume(Box::new(ProxyBooleanResumeState {
-                    pending_effect: ProxyBooleanStepPending::default(),
+                    pending_effect: ProxyBooleanStepPending::new(runtime.clone()),
                     realm,
                     phase: Phase::Method { resume, kind },
                 })),
@@ -131,7 +133,7 @@ fn method(
                 None => {
                     let object = rooted.target.clone();
                     let resume = ProxyBooleanResume(Box::new(ProxyBooleanResumeState {
-                        pending_effect: ProxyBooleanStepPending::default(),
+                        pending_effect: ProxyBooleanStepPending::new(runtime.clone()),
                         realm,
                         phase: Phase::Forward {
                             _rooted: rooted,
@@ -163,12 +165,17 @@ fn method(
                     if let ProxyBooleanKind::Has(key) | ProxyBooleanKind::Delete(key) = &kind {
                         arguments.push(runtime.property_key_value(key)?);
                     }
+                    let receiver = runtime.into_jsvalue(Value::Object(rooted.handler.clone()))?;
+                    let arguments = arguments
+                        .into_iter()
+                        .map(|value| runtime.into_jsvalue(value))
+                        .collect::<Result<Vec<_>, _>>()?;
                     ProxyBooleanStep::request_call(
                         target,
-                        Value::Object(rooted.handler.clone()),
+                        receiver,
                         arguments,
                         ProxyBooleanResume(Box::new(ProxyBooleanResumeState {
-                            pending_effect: ProxyBooleanStepPending::default(),
+                            pending_effect: ProxyBooleanStepPending::new(runtime.clone()),
                             realm,
                             phase: Phase::Trap { rooted, kind },
                         })),
@@ -199,7 +206,8 @@ impl ProxyBooleanResume {
                 resume.resume(runtime, Completion::Return(value))?,
             ),
             Phase::Trap { rooted, kind } => {
-                let result = runtime.value_to_boolean(&value)?;
+                let result = runtime.value_to_boolean_jsvalue(&value)?;
+                runtime.release_jsvalue(value)?;
                 match kind {
                     ProxyBooleanKind::Has(_) if result => {
                         Ok(ProxyBooleanStep::Complete(NativeConversion::Value(true)))
@@ -208,7 +216,7 @@ impl ProxyBooleanResume {
                         rooted.target.clone(),
                         key.clone(),
                         Self(Box::new(ProxyBooleanResumeState {
-                            pending_effect: ProxyBooleanStepPending::default(),
+                            pending_effect: ProxyBooleanStepPending::new(runtime.clone()),
                             realm: self.0.realm,
                             phase: Phase::HasInvariant { rooted, key },
                         })),
@@ -222,7 +230,7 @@ impl ProxyBooleanResume {
                         rooted.target.clone(),
                         key.clone(),
                         Self(Box::new(ProxyBooleanResumeState {
-                            pending_effect: ProxyBooleanStepPending::default(),
+                            pending_effect: ProxyBooleanStepPending::new(runtime.clone()),
                             realm: self.0.realm,
                             phase: Phase::DeleteInvariant { rooted, key },
                         })),
@@ -231,7 +239,7 @@ impl ProxyBooleanResume {
                         Ok(ProxyBooleanStep::request_extensible(
                             rooted.target.clone(),
                             Self(Box::new(ProxyBooleanResumeState {
-                                pending_effect: ProxyBooleanStepPending::default(),
+                                pending_effect: ProxyBooleanStepPending::new(runtime.clone()),
                                 realm: self.0.realm,
                                 phase: Phase::RequiredExtensibility {
                                     _rooted: rooted,
@@ -245,7 +253,7 @@ impl ProxyBooleanResume {
                     ProxyBooleanKind::Extensible => Ok(ProxyBooleanStep::request_extensible(
                         rooted.target.clone(),
                         Self(Box::new(ProxyBooleanResumeState {
-                            pending_effect: ProxyBooleanStepPending::default(),
+                            pending_effect: ProxyBooleanStepPending::new(runtime.clone()),
                             realm: self.0.realm,
                             phase: Phase::ExtensibleInvariant {
                                 _rooted: rooted,
@@ -301,12 +309,17 @@ impl ProxyBooleanResume {
     pub(crate) fn descriptor(
         self,
         runtime: &Runtime,
-        descriptor: NativeConversion<Option<CompleteOrdinaryPropertyDescriptor>>,
+        descriptor: NativeConversion<
+            Option<crate::engine::object::OwnedCompletePropertyDescriptor>,
+        >,
     ) -> Result<ProxyBooleanStep, RuntimeError> {
         let (rooted, key, deleting) = match self.0.phase {
             Phase::HasInvariant { rooted, key } => (rooted, key, false),
             Phase::DeleteInvariant { rooted, key } => (rooted, key, true),
             _ => {
+                if let NativeConversion::Throw(value) = descriptor {
+                    let _ = runtime.release_jsvalue(value);
+                }
                 return Err(RuntimeError::Invariant(
                     "Proxy boolean continuation received a descriptor reply",
                 ));
@@ -331,7 +344,7 @@ impl ProxyBooleanResume {
             return Ok(ProxyBooleanStep::request_extensible(
                 rooted.target.clone(),
                 Self(Box::new(ProxyBooleanResumeState {
-                    pending_effect: ProxyBooleanStepPending::default(),
+                    pending_effect: ProxyBooleanStepPending::new(runtime.clone()),
                     realm: self.0.realm,
                     phase: Phase::RequiredExtensibility {
                         _rooted: rooted,
@@ -382,7 +395,7 @@ pub(super) fn finish(
                 let receiver = resume.take_read_receiver();
                 resume.resume(
                     runtime,
-                    runtime.internal_get(realm, &object, &key, receiver)?,
+                    runtime.internal_get_jsvalue(realm, &object, &key, receiver)?,
                 )?
             }
             ProxyBooleanStep::Call { mut resume } => {
@@ -392,10 +405,10 @@ pub(super) fn finish(
                 {
                     let result = match target {
                         DirectCallTarget::Callable(callable) => {
-                            runtime.call_internal(realm, &callable, receiver, &arguments)?
+                            runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?
                         }
                         DirectCallTarget::NonCallableProxy(object) => {
-                            runtime.call_proxy(realm, &object, receiver, &arguments)?
+                            runtime.call_proxy_jsvalue(realm, &object, receiver, arguments)?
                         }
                     };
                     resume.resume(runtime, result)?
@@ -418,119 +431,68 @@ pub(super) fn finish(
                 let key = resume.take_descriptor_key();
                 resume.descriptor(
                     runtime,
-                    runtime.internal_get_own_property(realm, &object, &key)?,
+                    runtime.internal_get_own_property_owned(realm, &object, &key)?,
                 )?
             }
         };
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn take_read(step: ProxyBooleanStep) -> ProxyBooleanResume {
-        let ProxyBooleanStep::Read { resume, .. } = step else {
-            panic!("expected method read")
-        };
-        resume
-    }
-    fn take_call(step: ProxyBooleanStep) -> ProxyBooleanResume {
-        let ProxyBooleanStep::Call { resume, .. } = step else {
-            panic!("expected trap call")
-        };
-        resume
-    }
-    fn take_descriptor(step: ProxyBooleanStep) -> ProxyBooleanResume {
-        let ProxyBooleanStep::Descriptor { resume, .. } = step else {
-            panic!("expected descriptor query")
-        };
-        resume
-    }
-    fn take_extensible(step: ProxyBooleanStep) -> ProxyBooleanResume {
-        let ProxyBooleanStep::Extensible { resume, .. } = step else {
-            panic!("expected extensibility query")
-        };
-        resume
-    }
-
-    #[test]
-    fn delete_keeps_symbol_key_across_both_invariant_queries_and_abandonment() {
-        for after_descriptor in [false, true] {
-            let runtime = Runtime::new();
-            let weak = std::rc::Rc::downgrade(&runtime.0);
-            let mut context = runtime.new_context();
-            let Value::Object(proxy) = context.eval("new Proxy({}, {})").unwrap() else {
-                panic!("expected Proxy")
-            };
-            let callable = context.eval("(function(){return true})").unwrap();
-            let symbol = runtime.new_symbol(None).unwrap();
-            let key = PropertyKey::from(symbol);
-            let atom = key.atom();
-            let resume = take_read(
-                ProxyBooleanStep::start(
-                    &runtime,
-                    context.realm,
-                    proxy,
-                    ProxyBooleanKind::Delete(key),
-                )
-                .unwrap(),
-            );
-            let resume = take_call(
-                resume
-                    .resume(&runtime, Completion::Return(callable))
-                    .unwrap(),
-            );
-            let mut resume = take_descriptor(
-                resume
-                    .resume(&runtime, Completion::Return(Value::Bool(true)))
-                    .unwrap(),
-            );
-            if after_descriptor {
-                resume = take_extensible(
-                    resume
-                        .descriptor(
-                            &runtime,
-                            NativeConversion::Value(Some(
-                                CompleteOrdinaryPropertyDescriptor::Data {
-                                    value: Value::Int(1),
-                                    writable: true,
-                                    enumerable: true,
-                                    configurable: true,
-                                },
-                            )),
-                        )
-                        .unwrap(),
-                );
-            }
-            runtime.run_gc().unwrap();
-            assert!(runtime.0.state.borrow().atoms.is_live(atom));
-            drop(resume);
-            runtime.run_gc().unwrap();
-            assert!(!runtime.0.state.borrow().atoms.is_live(atom));
-            drop(context);
-            drop(runtime);
-            assert!(weak.upgrade().is_none());
-        }
-    }
-}
-
-#[derive(Default)]
 struct ProxyBooleanStepPending {
+    runtime: Runtime,
     delete_object: Option<ObjectRef>,
     delete_key: Option<PropertyKey>,
     prevent_extensions_object: Option<ObjectRef>,
     read_object: Option<ObjectRef>,
     read_key: Option<PropertyKey>,
-    read_receiver: Option<Value>,
+    read_receiver: Option<JsValue>,
     call_target: Option<DirectCallTarget>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
     has_object: Option<ObjectRef>,
     has_key: Option<PropertyKey>,
     extensible_object: Option<ObjectRef>,
     descriptor_object: Option<ObjectRef>,
     descriptor_key: Option<PropertyKey>,
+}
+impl ProxyBooleanStepPending {
+    fn new(runtime: Runtime) -> Self {
+        Self {
+            runtime,
+            delete_object: None,
+            delete_key: None,
+            prevent_extensions_object: None,
+            read_object: None,
+            read_key: None,
+            read_receiver: None,
+            call_target: None,
+            call_receiver: None,
+            call_arguments: None,
+            has_object: None,
+            has_key: None,
+            extensible_object: None,
+            descriptor_object: None,
+            descriptor_key: None,
+        }
+    }
+}
+impl Drop for ProxyBooleanStepPending {
+    /// Release the internal edges still held when the request is abandoned.
+    /// Consumption goes through `Option::take`; releases are defer-safe and
+    /// nothrow, and never run JavaScript.
+    fn drop(&mut self) {
+        if let Some(value) = self.read_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.call_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(values) = self.call_arguments.take() {
+            for value in values {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+    }
 }
 impl ProxyBooleanStep {
     pub(crate) fn request_delete(
@@ -552,7 +514,7 @@ impl ProxyBooleanStep {
     pub(crate) fn request_read(
         object: ObjectRef,
         key: PropertyKey,
-        receiver: Value,
+        receiver: JsValue,
         mut resume: ProxyBooleanResume,
     ) -> Self {
         resume.0.pending_effect.read_object = Some(object);
@@ -562,8 +524,8 @@ impl ProxyBooleanStep {
     }
     pub(crate) fn request_call(
         target: DirectCallTarget,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: ProxyBooleanResume,
     ) -> Self {
         resume.0.pending_effect.call_target = Some(target);
@@ -630,7 +592,7 @@ impl ProxyBooleanResume {
             .take()
             .expect("ProxyBooleanStep Read key")
     }
-    pub(crate) fn take_read_receiver(&mut self) -> Value {
+    pub(crate) fn take_read_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .read_receiver
@@ -644,14 +606,14 @@ impl ProxyBooleanResume {
             .take()
             .expect("ProxyBooleanStep Call target")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver
             .take()
             .expect("ProxyBooleanStep Call receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .pending_effect
             .call_arguments
@@ -698,3 +660,96 @@ const _: () = assert!(std::mem::size_of::<ProxyBooleanStep>() <= 64);
 
 // S11 all-domain protocol bound; inline completion stays allocation-free.
 const _: () = assert!(std::mem::size_of::<ProxyBooleanStep>() <= 64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn take_read(step: ProxyBooleanStep) -> ProxyBooleanResume {
+        let ProxyBooleanStep::Read { resume, .. } = step else {
+            panic!("expected method read")
+        };
+        resume
+    }
+    fn take_call(step: ProxyBooleanStep) -> ProxyBooleanResume {
+        let ProxyBooleanStep::Call { resume, .. } = step else {
+            panic!("expected trap call")
+        };
+        resume
+    }
+    fn take_descriptor(step: ProxyBooleanStep) -> ProxyBooleanResume {
+        let ProxyBooleanStep::Descriptor { resume, .. } = step else {
+            panic!("expected descriptor query")
+        };
+        resume
+    }
+    fn take_extensible(step: ProxyBooleanStep) -> ProxyBooleanResume {
+        let ProxyBooleanStep::Extensible { resume, .. } = step else {
+            panic!("expected extensibility query")
+        };
+        resume
+    }
+
+    #[test]
+    fn delete_keeps_symbol_key_across_both_invariant_queries_and_abandonment() {
+        for after_descriptor in [false, true] {
+            let runtime = Runtime::new();
+            let weak = std::rc::Rc::downgrade(&runtime.0);
+            let mut context = runtime.new_context();
+            let Value::Object(proxy) = context.eval("new Proxy({}, {})").unwrap() else {
+                panic!("expected Proxy")
+            };
+            let callable = context.eval("(function(){return true})").unwrap();
+            let symbol = runtime.new_symbol(None).unwrap();
+            let key = PropertyKey::from(symbol);
+            let atom = key.atom();
+            let resume = take_read(
+                ProxyBooleanStep::start(
+                    &runtime,
+                    context.realm,
+                    proxy,
+                    ProxyBooleanKind::Delete(key),
+                )
+                .unwrap(),
+            );
+            let resume = take_call(
+                resume
+                    .resume(
+                        &runtime,
+                        Completion::Return(runtime.into_jsvalue(callable).unwrap()),
+                    )
+                    .unwrap(),
+            );
+            let mut resume = take_descriptor(
+                resume
+                    .resume(&runtime, Completion::Return(JsValue::Bool(true)))
+                    .unwrap(),
+            );
+            if after_descriptor {
+                resume = take_extensible(
+                    resume
+                        .descriptor(
+                            &runtime,
+                            NativeConversion::Value(Some(
+                                crate::engine::object::OwnedCompletePropertyDescriptor::from_public(&runtime, &crate::engine::object::CompleteOrdinaryPropertyDescriptor::Data {
+                                    value: Value::Int(1),
+                                    writable: true,
+                                    enumerable: true,
+                                    configurable: true,
+                                }).unwrap(),
+                            )),
+                        )
+                        .unwrap(),
+                );
+            }
+            runtime.run_gc().unwrap();
+            assert!(runtime.0.state.borrow().atoms.is_live(atom));
+            drop(resume);
+            runtime.run_gc().unwrap();
+            assert!(!runtime.0.state.borrow().atoms.is_live(atom));
+            drop(context);
+            drop(runtime);
+            assert!(weak.upgrade().is_none());
+        }
+    }
+}

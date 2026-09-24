@@ -17,7 +17,7 @@ use crate::engine::heap::{ContextId, ObjectPayload};
 use crate::engine::object::ObjectRef;
 use crate::engine::value::conversion::NativeConversion;
 
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
 
@@ -40,12 +40,6 @@ fn date_input_fields(fields: &DateFields) -> DateInputFields {
     [
         fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
     ]
-}
-
-fn date_argument(arguments: &NativeArguments, index: usize) -> Result<&Value, RuntimeError> {
-    arguments.readable.get(index).ok_or(RuntimeError::Invariant(
-        "Date native argument vector was not padded to readable arity",
-    ))
 }
 
 impl Runtime {
@@ -81,7 +75,7 @@ impl Runtime {
             DateNativeKind::TimeValue => self.call_date_time_value(realm, this_value),
             DateNativeKind::String(method) => self.call_date_string(realm, this_value, method),
             DateNativeKind::ToPrimitive => {
-                self.call_date_to_primitive(realm, this_value.clone(), arguments)
+                self.call_date_to_primitive(realm, this_value, arguments)
             }
             DateNativeKind::TimezoneOffset => self.call_date_timezone_offset(realm, this_value),
             DateNativeKind::GetField(field) => self.call_date_get_field(realm, this_value, field),
@@ -90,7 +84,7 @@ impl Runtime {
                 self.call_date_set_field(realm, this_value, field, arguments)
             }
             DateNativeKind::SetYear => self.call_date_set_year(realm, this_value, arguments),
-            DateNativeKind::ToJson => self.call_date_to_json(realm, this_value.clone()),
+            DateNativeKind::ToJson => self.call_date_to_json(realm, this_value),
             DateNativeKind::Constructor
             | DateNativeKind::Now
             | DateNativeKind::Parse
@@ -98,18 +92,19 @@ impl Runtime {
         }
     }
 
-    fn date_this_time_value<'a>(
+    fn date_this_time_value_jsvalue(
         &self,
         realm: ContextId,
-        this_value: &'a Value,
-    ) -> Result<NativeConversion<(&'a ObjectRef, f64)>, RuntimeError> {
-        let Value::Object(object) = this_value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        this_value: &JsValue,
+    ) -> Result<NativeConversion<(ObjectRef, f64)>, RuntimeError> {
+        let JsValue::Object(id) = this_value else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "not a Date object",
             )?));
         };
+        let object = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
         let value = {
             let state = self.0.state.borrow();
             match &state.heap.object(object.object_id())?.payload {
@@ -153,7 +148,7 @@ impl Runtime {
             }
         };
         let Some(value) = value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "not a Date object",
@@ -172,19 +167,25 @@ impl Runtime {
             .borrow_mut()
             .heap
             .set_date_value(object.object_id(), value)?;
-        Ok(Completion::Return(Value::number(value)))
+        Ok(Completion::Return(
+            crate::engine::value::number::operations::Number::compact(value).into(),
+        ))
     }
 
     fn call_date_time_value(
         &self,
         realm: ContextId,
-        this_value: &Value,
+        this_value: &JsValue,
     ) -> Result<Completion, RuntimeError> {
-        let (_, value) = match self.date_this_time_value(realm, this_value)? {
+        let (_, value) = match self.date_this_time_value_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        Ok(Completion::Return(Value::number(value)))
+        Ok(Completion::Return(
+            crate::engine::value::number::operations::Number::compact(value).into(),
+        ))
     }
 
     /// `toGMTString` is not a ninth formatter native. The installer must
@@ -194,12 +195,14 @@ impl Runtime {
     fn call_date_string(
         &self,
         realm: ContextId,
-        this_value: &Value,
+        this_value: &JsValue,
         method: DateStringMethod,
     ) -> Result<Completion, RuntimeError> {
-        let (_, value) = match self.date_this_time_value(realm, this_value)? {
+        let (_, value) = match self.date_this_time_value_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
         let kind = date_format_kind(method);
         let fields = get_date_fields(value, kind.uses_local_time(), false, |instant| {
@@ -208,97 +211,111 @@ impl Runtime {
         let output = match format_date_string(fields.as_ref(), kind) {
             Ok(output) => output,
             Err(_) => {
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Range,
                     "Date value is NaN",
                 )?));
             }
         };
-        Ok(Completion::Return(Value::String(JsString::try_from_utf8(
-            &output,
-        )?)))
+        Ok(Completion::Return(self.unroot_value(&Value::String(
+            JsString::try_from_utf8(&output)?,
+        ))?))
     }
 
     fn call_date_get_field(
         &self,
         realm: ContextId,
-        this_value: &Value,
+        this_value: &JsValue,
         field: DateGetFieldKind,
     ) -> Result<Completion, RuntimeError> {
-        let (_, value) = match self.date_this_time_value(realm, this_value)? {
+        let (_, value) = match self.date_this_time_value_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
         let Some(fields) = get_date_fields(value, field.uses_local_time(), false, |instant| {
             self.date_timezone_offset_minutes(instant)
         }) else {
-            return Ok(Completion::Return(Value::number(f64::NAN)));
+            return Ok(Completion::Return(
+                crate::engine::value::number::operations::Number::compact(f64::NAN).into(),
+            ));
         };
         let mut value = fields[usize::from(field.field_index())];
         if field.is_legacy_year() {
             value -= 1900.0;
         }
-        Ok(Completion::Return(Value::number(value)))
+        Ok(Completion::Return(
+            crate::engine::value::number::operations::Number::compact(value).into(),
+        ))
     }
 
     fn call_date_timezone_offset(
         &self,
         realm: ContextId,
-        this_value: &Value,
+        this_value: &JsValue,
     ) -> Result<Completion, RuntimeError> {
-        let (_, value) = match self.date_this_time_value(realm, this_value)? {
+        let (_, value) = match self.date_this_time_value_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
         if value.is_nan() {
-            return Ok(Completion::Return(Value::number(f64::NAN)));
+            return Ok(Completion::Return(
+                crate::engine::value::number::operations::Number::compact(f64::NAN).into(),
+            ));
         }
         let offset = self.date_timezone_offset_minutes(value.trunc() as i64);
-        Ok(Completion::Return(Value::number(f64::from(offset))))
+        Ok(Completion::Return(
+            crate::engine::value::number::operations::Number::compact(f64::from(offset)).into(),
+        ))
     }
 
     fn call_date_set_time(
         &self,
         realm: ContextId,
-        this_value: &Value,
+        this_value: &JsValue,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::finish(
-            self,
-            realm,
-            operation::DatePrototypeStep::start(
-                self,
-                realm,
-                DateNativeKind::SetTime,
-                &NativeInvocation::Call {
-                    this_value: this_value.clone(),
-                },
-                arguments,
-            )?,
-        )
+        operation::finish(self, realm, {
+            let invocation = NativeInvocation::Call {
+                this_value: self.dup_jsvalue(this_value)?,
+            };
+            self.dispatch_borrowed_invocation(invocation, |invocation| {
+                operation::DatePrototypeStep::start(
+                    self,
+                    realm,
+                    DateNativeKind::SetTime,
+                    invocation,
+                    arguments,
+                )
+            })?
+        })
     }
 
     fn call_date_set_field(
         &self,
         realm: ContextId,
-        this_value: &Value,
+        this_value: &JsValue,
         field: DateSetFieldKind,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::finish(
-            self,
-            realm,
-            operation::DatePrototypeStep::start(
-                self,
-                realm,
-                DateNativeKind::SetField(field),
-                &NativeInvocation::Call {
-                    this_value: this_value.clone(),
-                },
-                arguments,
-            )?,
-        )
+        operation::finish(self, realm, {
+            let invocation = NativeInvocation::Call {
+                this_value: self.dup_jsvalue(this_value)?,
+            };
+            self.dispatch_borrowed_invocation(invocation, |invocation| {
+                operation::DatePrototypeStep::start(
+                    self,
+                    realm,
+                    DateNativeKind::SetField(field),
+                    invocation,
+                    arguments,
+                )
+            })?
+        })
     }
 
     fn finish_date_set_year(
@@ -335,67 +352,70 @@ impl Runtime {
     fn call_date_set_year(
         &self,
         realm: ContextId,
-        this_value: &Value,
+        this_value: &JsValue,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::finish(
-            self,
-            realm,
-            operation::DatePrototypeStep::start(
-                self,
-                realm,
-                DateNativeKind::SetYear,
-                &NativeInvocation::Call {
-                    this_value: this_value.clone(),
-                },
-                arguments,
-            )?,
-        )
+        operation::finish(self, realm, {
+            let invocation = NativeInvocation::Call {
+                this_value: self.dup_jsvalue(this_value)?,
+            };
+            self.dispatch_borrowed_invocation(invocation, |invocation| {
+                operation::DatePrototypeStep::start(
+                    self,
+                    realm,
+                    DateNativeKind::SetYear,
+                    invocation,
+                    arguments,
+                )
+            })?
+        })
     }
 
     fn call_date_to_primitive(
         &self,
         realm: ContextId,
-        this_value: Value,
+        this_value: &JsValue,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::finish(
-            self,
-            realm,
-            operation::DatePrototypeStep::start(
-                self,
-                realm,
-                DateNativeKind::ToPrimitive,
-                &NativeInvocation::Call {
-                    this_value: this_value.clone(),
-                },
-                arguments,
-            )?,
-        )
+        operation::finish(self, realm, {
+            let invocation = NativeInvocation::Call {
+                this_value: self.dup_jsvalue(this_value)?,
+            };
+            self.dispatch_borrowed_invocation(invocation, |invocation| {
+                operation::DatePrototypeStep::start(
+                    self,
+                    realm,
+                    DateNativeKind::ToPrimitive,
+                    invocation,
+                    arguments,
+                )
+            })?
+        })
     }
 
     fn call_date_to_json(
         &self,
         realm: ContextId,
-        this_value: Value,
+        this_value: &JsValue,
     ) -> Result<Completion, RuntimeError> {
         let arguments = NativeArguments {
             readable: Vec::new(),
             actual_arg_count: 0,
         };
-        operation::finish(
-            self,
-            realm,
-            operation::DatePrototypeStep::start(
-                self,
-                realm,
-                DateNativeKind::ToJson,
-                &NativeInvocation::Call {
-                    this_value: this_value.clone(),
-                },
-                &arguments,
-            )?,
-        )
+        operation::finish(self, realm, {
+            let invocation = NativeInvocation::Call {
+                this_value: self.dup_jsvalue(this_value)?,
+            };
+            self.dispatch_borrowed_invocation(invocation, |invocation| {
+                operation::DatePrototypeStep::start(
+                    self,
+                    realm,
+                    DateNativeKind::ToJson,
+                    invocation,
+                    &arguments,
+                )
+            })?
+        })
     }
 }
 

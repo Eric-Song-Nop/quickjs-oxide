@@ -19,8 +19,8 @@ pub(in crate::engine::vm) fn complete_local_add(
     // the constant as the left operand so concatenation order cannot swap.
     enum Operands {
         Locals(u16, u16),
-        LocalConstant(Value),
-        ConstantLocal(Value),
+        LocalConstant(JsValue),
+        ConstantLocal(JsValue),
     }
     let (store, operands, prepend) = match &frame.executable.code[start..] {
         [
@@ -33,7 +33,7 @@ pub(in crate::engine::vm) fn complete_local_add(
             Instruction::PushConst(index),
             ..,
         ] => {
-            let Some(constant) = constant_string(&frame.executable, *index) else {
+            let Some(constant) = constant_string(runtime, &frame.executable, *index) else {
                 return Ok(PrimitiveCompletion::Declined);
             };
             (*left, Operands::LocalConstant(constant), false)
@@ -43,7 +43,7 @@ pub(in crate::engine::vm) fn complete_local_add(
             Instruction::GetLocal(right) | Instruction::GetLocalCheck(right),
             ..,
         ] => {
-            let Some(constant) = constant_string(&frame.executable, *index) else {
+            let Some(constant) = constant_string(runtime, &frame.executable, *index) else {
                 return Ok(PrimitiveCompletion::Declined);
             };
             (*right, Operands::ConstantLocal(constant), true)
@@ -56,11 +56,11 @@ pub(in crate::engine::vm) fn complete_local_add(
     // All preflight remains non-mutating; checked/captured/TDZ fallbacks retain
     // the canonical first operand PC and original operand stack.
     enum PreparedAdd {
-        Exhausted(Value, Value),
-        Result(Result<Value, Error>),
+        Exhausted(JsValue, JsValue),
+        Result(Result<JsValue, Error>),
         Appended,
     }
-    let consume = |left: &mut Value, right: &Value| {
+    let consume = |left: &mut JsValue, right: &JsValue| {
         frame.fault_pc = start + 2;
         frame.resume_pc = frame.fault_pc;
         #[cfg(feature = "profiling")]
@@ -70,48 +70,88 @@ pub(in crate::engine::vm) fn complete_local_add(
         }
         let Some(next) = next_operation.checked_add(1) else {
             // Reconstruct canonical operands only on this cold error.
-            return Ok::<_, Error>(PreparedAdd::Exhausted(left.clone(), right.clone()));
+            return Ok::<_, Error>(PreparedAdd::Exhausted(
+                runtime
+                    .dup_jsvalue(left)
+                    .map_err(runtime_error_to_vm_error)?,
+                runtime
+                    .dup_jsvalue(right)
+                    .map_err(runtime_error_to_vm_error)?,
+            ));
         };
         *next_operation = next;
-        if let Value::String(string) = left {
+        if let JsValue::String(id) = left {
             let suffix = match right {
-                Value::String(value) => std::borrow::Cow::Borrowed(value),
-                value => match value.to_js_string() {
-                    Ok(value) => std::borrow::Cow::Owned(value),
-                    Err(error) => return Ok(PreparedAdd::Result(Err(error))),
+                JsValue::String(right) => super::super::numeric::string_payload(runtime, *right)?,
+                value => match super::super::numeric::to_js_string_jsvalue(runtime, value) {
+                    Ok(suffix) => suffix,
+                    // A JavaScript-visible ToString failure (for example a
+                    // Symbol operand) must surface as a completion throw after
+                    // the canonical Add PC is published, not as an engine error.
+                    Err(error)
+                        if crate::engine::api::error::NativeErrorKind::from_javascript_error(
+                            error.kind(),
+                        )
+                        .is_some() =>
+                    {
+                        return Ok(PreparedAdd::Result(Err(error)));
+                    }
+                    Err(error) => return Err(error),
                 },
             };
-            // A prepend never appends into the shared constant buffer; only an
-            // append may extend a uniquely-owned local in place.
+            // Keep the local's arena identity only when both its owning edge
+            // and its payload buffer are unique. Cloning the left payload here
+            // would itself disable the existing Rc uniqueness optimization.
             if !prepend {
-                match string.try_concat_in_place(&suffix) {
+                let appended = {
+                    let mut state = runtime.0.state.borrow_mut();
+                    match state
+                        .heap
+                        .unique_string_mut(*id)
+                        .map_err(|error| runtime_error_to_vm_error(error.into()))?
+                    {
+                        Some(string) => string.try_concat_in_place(&suffix).map_err(Error::from),
+                        None => Ok(false),
+                    }
+                };
+                match appended {
                     Ok(true) => return Ok(PreparedAdd::Appended),
-                    Err(error) => return Ok(PreparedAdd::Result(Err(error.into()))),
                     Ok(false) => {}
+                    Err(error) => return Ok(PreparedAdd::Result(Err(error))),
                 }
             }
-            // Reuse the conversion already completed above even when a
-            // shared/rope lhs cannot append into its own buffer.
+            let string = super::super::numeric::string_payload(runtime, *id)?;
             return Ok(PreparedAdd::Result(
-                string
-                    .try_concat(&suffix)
-                    .map(Value::String)
-                    .map_err(Error::from),
+                super::super::numeric::allocate_string_jsvalue(
+                    runtime,
+                    string.try_concat(&suffix).map_err(Error::from)?,
+                ),
             ));
         }
         Ok(PreparedAdd::Result(
-            super::super::numeric::add_primitives_ref(left, right),
+            super::super::numeric::add_primitives_ref(runtime, left, right),
         ))
     };
+    let mut constant_operand = None;
     let prepared = match operands {
         Operands::Locals(left, right) => transaction.with_local_add_inputs(left, right, consume)?,
         Operands::LocalConstant(right) => {
-            transaction.with_local_add_constant(store, &right, consume)?
+            let prepared = transaction.with_local_add_constant(store, &right, consume)?;
+            constant_operand = Some(right);
+            prepared
         }
-        Operands::ConstantLocal(constant) => {
-            transaction.with_local_add_constant_left(store, constant, consume)?
+        Operands::ConstantLocal(mut constant) => {
+            let prepared =
+                transaction.with_local_add_constant_left(store, &mut constant, consume)?;
+            constant_operand = Some(constant);
+            prepared
         }
     };
+    if let Some(constant) = constant_operand {
+        runtime
+            .release_jsvalue(constant)
+            .map_err(runtime_error_to_vm_error)?;
+    }
     let Some(prepared) = prepared else {
         return Ok(PrimitiveCompletion::Declined);
     };
@@ -150,7 +190,7 @@ pub(in crate::engine::vm) fn complete_local_add(
                 }
                 return Ok(PrimitiveCompletion::Throw(
                     runtime
-                        .new_native_error_from_error(frame.executable.realm, kind, &error)
+                        .new_native_error_from_error_jsvalue(frame.executable.realm, kind, &error)
                         .map_err(runtime_error_to_vm_error)?,
                 ));
             }
@@ -180,7 +220,7 @@ pub(in crate::engine::vm) fn complete_local_add(
                 return Err(error);
             }
         };
-        drop(old);
+        super::super::bindings::release_frame_binding(runtime, old)?;
     }
     (frame.fault_pc, frame.resume_pc) = (start + span - 1, start + span);
     #[cfg(feature = "profiling")]
@@ -203,13 +243,17 @@ pub(in crate::engine::vm) fn complete_local_add(
 /// Extract the canonical String operand. A non-String constant declines the
 /// fused span; the canonical PushConst/GetLocal sequence then runs unchanged.
 fn constant_string(
+    runtime: &Runtime,
     executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
     index: u32,
-) -> Option<Value> {
+) -> Option<JsValue> {
     use crate::engine::heap::{BytecodeConstant, RawValue};
     match executable.constant(index) {
         Some(BytecodeConstant::Value(RawValue::String(value))) => {
-            Some(Value::String(value.clone()))
+            // The published bytecode node owns the constant-pool edge; duplicate
+            // the handle so the operand carries its own independent owner.
+            runtime.retain_live_string_handle(*value).ok()?;
+            Some(JsValue::String(*value))
         }
         _ => None,
     }
@@ -218,6 +262,7 @@ fn constant_string(
 #[cfg(test)]
 mod tests {
     use crate::engine::api::{Runtime, Value};
+    use crate::engine::value::JsValue;
     #[cfg(feature = "profiling")]
     #[test]
     fn local_string_append_reaches_unique_storage_and_preserves_failure_binding() {
@@ -245,7 +290,7 @@ mod tests {
         assert!(
             matches!(
                 completion,
-                crate::engine::vm::Completion::Return(Value::Bool(true))
+                crate::engine::vm::Completion::Return(crate::engine::value::JsValue::Bool(true))
             ),
             "{completion:?}"
         );
@@ -334,8 +379,8 @@ mod tests {
         else {
             panic!("bytecode")
         };
-        let a = context.eval("'a'").unwrap();
-        let b = context.eval("'b'").unwrap();
+        let a = runtime.unroot_value(&context.eval("'a'").unwrap()).unwrap();
+        let b = runtime.unroot_value(&context.eval("'b'").unwrap()).unwrap();
         let mut execution = RunningExecution::new(
             &runtime,
             ExecutionLimits {
@@ -346,8 +391,8 @@ mod tests {
         .unwrap();
         let entry = BytecodeCallRequest {
             callable,
-            receiver: Value::Undefined,
-            new_target: Value::Undefined,
+            receiver: JsValue::Undefined,
+            new_target: JsValue::Undefined,
             arguments: vec![],
             bytecode,
             closure_slots,
@@ -377,11 +422,19 @@ mod tests {
             };
             execution
                 .slots
-                .replace_local(&frame.window, *left, FrameBinding::Direct(a.clone()))
+                .replace_local(
+                    &frame.window,
+                    *left,
+                    FrameBinding::Direct(runtime.dup_jsvalue(&a).unwrap()),
+                )
                 .unwrap();
             execution
                 .slots
-                .replace_local(&frame.window, *right, FrameBinding::Direct(b.clone()))
+                .replace_local(
+                    &frame.window,
+                    *right,
+                    FrameBinding::Direct(runtime.dup_jsvalue(&b).unwrap()),
+                )
                 .unwrap();
             frame.fault_pc = start;
             frame.resume_pc = start;
@@ -396,6 +449,8 @@ mod tests {
         assert_eq!(execution.slots.depth(&frame.window), 2);
         assert_eq!(execution.slots.peek(&frame.window, 1).unwrap(), &a);
         assert_eq!(execution.slots.peek(&frame.window, 0).unwrap(), &b);
+        runtime.release_jsvalue(a).unwrap();
+        runtime.release_jsvalue(b).unwrap();
     }
 
     #[test]

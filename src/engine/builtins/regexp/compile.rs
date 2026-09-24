@@ -7,7 +7,7 @@ use crate::engine::api::runtime_error::RuntimeError;
 use crate::engine::heap::{ContextId, RegExpObjectData};
 use crate::engine::object::ObjectRef;
 use crate::engine::value::conversion::NativeConversion;
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
 use crate::engine::vm::{Completion, ToPrimitiveHint};
 use crate::regexp::CompiledRegExp;
@@ -27,20 +27,22 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let mut step = RegExpCompileStep::start(self, realm, &invocation, arguments)?;
-        loop {
-            step = match step {
-                RegExpCompileStep::Complete(result) => return Ok(result),
-                RegExpCompileStep::Primitive { value, resume } => {
-                    let result = if matches!(value, Value::Object(_)) {
-                        self.to_primitive(realm, value, ToPrimitiveHint::String)?
-                    } else {
-                        Completion::Return(value)
-                    };
-                    resume.resume(self, result)?
-                }
-            };
-        }
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            let mut step = RegExpCompileStep::start(self, realm, invocation, arguments)?;
+            loop {
+                step = match step {
+                    RegExpCompileStep::Complete(result) => return Ok(result),
+                    RegExpCompileStep::Primitive { value, resume } => {
+                        let result = if matches!(value, JsValue::Object(_)) {
+                            self.to_primitive_jsvalue(realm, value, ToPrimitiveHint::String)?
+                        } else {
+                            Completion::Return(value)
+                        };
+                        resume.resume(self, result)?
+                    }
+                };
+            }
+        })
     }
     fn finish_regexp_compile(
         &self,
@@ -66,14 +68,16 @@ impl Runtime {
         {
             return Ok(Completion::Throw(value));
         }
-        Ok(Completion::Return(Value::Object(regexp.clone())))
+        Ok(Completion::Return(JsValue::Object(
+            regexp.clone().into_handle(),
+        )))
     }
 }
 
 pub(crate) enum RegExpCompileStep {
     Complete(Completion),
     Primitive {
-        value: Value,
+        value: JsValue,
         resume: RegExpCompileResume,
     },
 }
@@ -93,8 +97,19 @@ const _: () = assert!(std::mem::size_of::<RegExpCompileResume>() <= 8);
 pub(crate) struct RegExpCompileResumeState {
     realm: ContextId,
     regexp: ObjectRef,
-    flags: Value,
+    flags: JsValue,
+    converted: JsValue,
     phase: CompilePhase,
+}
+impl Drop for RegExpCompileResumeState {
+    fn drop(&mut self) {
+        for value in [&mut self.flags, &mut self.converted] {
+            let _ = self
+                .regexp
+                .runtime()
+                .release_jsvalue(std::mem::replace(value, JsValue::Undefined));
+        }
+    }
 }
 enum CompilePhase {
     Pattern,
@@ -112,26 +127,31 @@ impl RegExpCompileStep {
                 "RegExp.prototype.compile did not receive a generic invocation",
             ));
         };
-        let Some(_) = runtime.genuine_regexp(this_value)? else {
+        let Some(_) = runtime.genuine_regexp_jsvalue(this_value)? else {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(realm, NativeErrorKind::Type, "RegExp object expected")?,
+                runtime.new_native_error_jsvalue(
+                    realm,
+                    NativeErrorKind::Type,
+                    "RegExp object expected",
+                )?,
             )));
         };
-        let Value::Object(regexp) = this_value else {
+        let JsValue::Object(regexp_id) = this_value else {
             return Err(RuntimeError::Invariant(
                 "genuine RegExp snapshot accepted a primitive receiver",
             ));
         };
+        let regexp = ObjectRef::from_borrowed_handle(runtime.clone(), *regexp_id)?;
         let pattern = arguments.readable.first().ok_or(RuntimeError::Invariant(
             "RegExp compile pattern argv was not padded",
         ))?;
         let flags = arguments.readable.get(1).ok_or(RuntimeError::Invariant(
             "RegExp compile flags argv was not padded",
         ))?;
-        if let Some(genuine) = runtime.genuine_regexp(pattern)? {
-            if !matches!(flags, Value::Undefined) {
+        if let Some(genuine) = runtime.genuine_regexp_jsvalue(pattern)? {
+            if !matches!(flags, JsValue::Undefined) {
                 return Ok(Self::Complete(Completion::Throw(
-                    runtime.new_native_error(
+                    runtime.new_native_error_jsvalue(
                         realm,
                         NativeErrorKind::Type,
                         "flags must be undefined",
@@ -140,22 +160,23 @@ impl RegExpCompileStep {
             }
             return Ok(Self::Complete(runtime.finish_regexp_compile(
                 realm,
-                regexp,
+                &regexp,
                 genuine.pattern,
                 genuine.program,
             )?));
         }
         let resume = RegExpCompileResume(Box::new(RegExpCompileResumeState {
             realm,
-            regexp: regexp.clone(),
-            flags: flags.clone(),
+            regexp,
+            flags: runtime.dup_jsvalue(flags)?,
+            converted: JsValue::Undefined,
             phase: CompilePhase::Pattern,
         }));
-        if matches!(pattern, Value::Undefined) {
+        if matches!(pattern, JsValue::Undefined) {
             resume.pattern(runtime, JsString::from_static(""))
         } else {
             Ok(Self::Primitive {
-                value: pattern.clone(),
+                value: runtime.dup_jsvalue(pattern)?,
                 resume,
             })
         }
@@ -167,7 +188,7 @@ impl RegExpCompileResume {
         runtime: &Runtime,
         pattern: JsString,
     ) -> Result<RegExpCompileStep, RuntimeError> {
-        if matches!(self.0.flags, Value::Undefined) {
+        if matches!(self.0.flags, JsValue::Undefined) {
             let program = Runtime::compile_regexp_program(&pattern, &JsString::from_static(""))?;
             Ok(RegExpCompileStep::Complete(runtime.finish_regexp_compile(
                 self.0.realm,
@@ -177,7 +198,7 @@ impl RegExpCompileResume {
             )?))
         } else {
             Ok(RegExpCompileStep::Primitive {
-                value: self.0.flags.clone(),
+                value: runtime.dup_jsvalue(&self.0.flags)?,
                 resume: {
                     let updated_0 = CompilePhase::Flags(pattern);
                     self.0.phase = updated_0;
@@ -187,7 +208,7 @@ impl RegExpCompileResume {
         }
     }
     pub(crate) fn resume(
-        self,
+        mut self,
         runtime: &Runtime,
         result: Completion,
     ) -> Result<RegExpCompileStep, RuntimeError> {
@@ -197,18 +218,20 @@ impl RegExpCompileResume {
                 return Ok(RegExpCompileStep::Complete(Completion::Throw(value)));
             }
         };
-        if matches!(value, Value::Object(_)) {
+        let previous = std::mem::replace(&mut self.0.converted, value);
+        runtime.release_jsvalue(previous)?;
+        if matches!(self.0.converted, JsValue::Object(_)) {
             return Err(RuntimeError::Invariant(
                 "RegExp compile conversion returned an object",
             ));
         }
-        let value = match runtime.native_to_js_string(self.0.realm, &value)? {
+        let value = match runtime.string_from_primitive_jsvalue(self.0.realm, &self.0.converted)? {
             NativeConversion::Value(value) => value,
             NativeConversion::Throw(value) => {
                 return Ok(RegExpCompileStep::Complete(Completion::Throw(value)));
             }
         };
-        match self.0.phase {
+        match std::mem::replace(&mut self.0.phase, CompilePhase::Pattern) {
             CompilePhase::Pattern => self.pattern(runtime, value),
             CompilePhase::Flags(pattern) => {
                 let program = Runtime::compile_regexp_program(&pattern, &value)?;

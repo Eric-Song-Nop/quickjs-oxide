@@ -6,7 +6,7 @@ use super::{
 use crate::engine::{
     api::{Error, ErrorKind, runtime::Runtime},
     object::object_literal::element::LiteralDefinitionStep,
-    value::Value,
+    value::JsValue,
 };
 
 #[inline(never)]
@@ -17,15 +17,22 @@ pub(super) fn define_element(
 ) -> Result<CallStep, Error> {
     let frame = execution.frames.current_mut(id)?;
     let realm = frame.executable.realm;
-    let Value::Object(object) = execution.slots.peek(&frame.window, 2)? else {
-        return super::property_driver::throw_error(
-            runtime,
-            realm,
-            Error::new(ErrorKind::Type, "not an object"),
-        );
+    let object = match execution.slots.peek(&frame.window, 2)? {
+        JsValue::Object(id) => {
+            crate::engine::object::ObjectRef::from_borrowed_handle(runtime.clone(), *id)
+                .map_err(|error| Error::internal(error.to_string()))?
+        }
+        _ => {
+            return super::property_driver::throw_error(
+                runtime,
+                realm,
+                Error::new(ErrorKind::Type, "not an object"),
+            );
+        }
     };
-    let object = object.clone();
-    let key = execution.slots.peek(&frame.window, 1)?.clone();
+    let key = runtime
+        .dup_jsvalue(execution.slots.peek(&frame.window, 1)?)
+        .map_err(runtime_error_to_vm_error)?;
     let depth = execution.slots.depth(&frame.window);
     let value = execution.slots.pop(&mut frame.window)?;
     let step = match LiteralDefinitionStep::start(runtime, realm, object, key, value) {

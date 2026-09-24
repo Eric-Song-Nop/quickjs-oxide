@@ -275,14 +275,22 @@ fn prepared_read_owns_selected_getter_without_repeating_lookup() {
         .prepare_ordinary_read(&object, &key, receiver)
         .unwrap();
     assert_eq!(context.eval("calls").unwrap(), Value::Int(0));
-    context
-        .eval("delete object.x; Object.defineProperty(object,'x',{get(){calls+=100;return 9}})")
-        .unwrap();
+    drop(
+        context
+            .eval("delete object.x; Object.defineProperty(object,'x',{get(){calls+=100;return 9}})")
+            .unwrap(),
+    );
     let OrdinaryRead::Call { getter, receiver } = read else {
         panic!("expected getter")
     };
     assert_eq!(
-        context.call(&getter, receiver, &[]).unwrap(),
+        context
+            .call(
+                &getter,
+                runtime.root_and_release_jsvalue(receiver).unwrap(),
+                &[]
+            )
+            .unwrap(),
         Value::Int(42)
     );
     assert_eq!(context.eval("calls").unwrap(), Value::Int(1));

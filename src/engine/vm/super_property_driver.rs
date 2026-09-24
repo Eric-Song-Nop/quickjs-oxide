@@ -5,7 +5,7 @@ use super::{
 };
 use crate::engine::{
     api::{Error, ErrorKind, runtime::Runtime},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,10 +15,10 @@ pub(super) enum Kind {
     Write,
 }
 pub(super) struct Input {
-    receiver: Value,
-    base: Value,
-    pub key: Value,
-    value: Option<Value>,
+    receiver: JsValue,
+    base: JsValue,
+    pub key: JsValue,
+    value: Option<JsValue>,
     kind: Kind,
     depth: usize,
 }
@@ -31,6 +31,16 @@ impl Input {
     pub(super) fn operand_count(&self) -> usize {
         if self.kind == Kind::Write { 4 } else { 3 }
     }
+
+    /// Release the owned internal edges an abandoned conversion still holds.
+    pub(super) fn release_edges(self, runtime: &Runtime) {
+        let _ = runtime.release_jsvalue(self.receiver);
+        let _ = runtime.release_jsvalue(self.base);
+        let _ = runtime.release_jsvalue(self.key);
+        if let Some(value) = self.value {
+            let _ = runtime.release_jsvalue(value);
+        }
+    }
 }
 pub(super) fn start(
     runtime: &Runtime,
@@ -40,16 +50,6 @@ pub(super) fn start(
 ) -> Result<Progress, Error> {
     let frame = execution.frames.current_mut(id)?;
     let realm = frame.executable.realm;
-    let count = if kind == Kind::Write { 4 } else { 3 };
-    for offset in 0..count {
-        runtime
-            .validate_value_domain(
-                execution.slots.peek(&frame.window, offset)?,
-                "super property input",
-            )
-            .map_err(runtime_error_to_vm_error)?;
-    }
-    let depth = execution.slots.depth(&frame.window);
     let value = if kind == Kind::Write {
         Some(execution.slots.pop(&mut frame.window)?)
     } else {
@@ -58,12 +58,13 @@ pub(super) fn start(
     let key = execution.slots.pop(&mut frame.window)?;
     let base = execution.slots.pop(&mut frame.window)?;
     let receiver = execution.slots.pop(&mut frame.window)?;
+    let depth = execution.slots.depth(&frame.window);
     // PutSuperValue rejects the base before converting a raw key, after RHS.
     // At a call site QuickJS uses ordinary GetArrayEl's nullish precheck.
-    let error = if kind == Kind::Write && !matches!(base, Value::Object(_)) {
+    let error = if kind == Kind::Write && !matches!(base, JsValue::Object(_)) {
         Some("not an object")
-    } else if kind == Kind::Call && matches!(base, Value::Null | Value::Undefined) {
-        Some(if matches!(base, Value::Null) {
+    } else if kind == Kind::Call && matches!(base, JsValue::Null | JsValue::Undefined) {
+        Some(if matches!(base, JsValue::Null) {
             "cannot read property of null"
         } else {
             "cannot read property of undefined"
@@ -72,6 +73,20 @@ pub(super) fn start(
         None
     };
     if let Some(message) = error {
+        if let Some(value) = value {
+            runtime
+                .release_jsvalue(value)
+                .map_err(runtime_error_to_vm_error)?;
+        }
+        runtime
+            .release_jsvalue(key)
+            .map_err(runtime_error_to_vm_error)?;
+        runtime
+            .release_jsvalue(base)
+            .map_err(runtime_error_to_vm_error)?;
+        runtime
+            .release_jsvalue(receiver)
+            .map_err(runtime_error_to_vm_error)?;
         return super::property_driver::throw_error(
             runtime,
             realm,
@@ -87,12 +102,34 @@ pub(super) fn start(
         kind,
         depth,
     });
-    if matches!(input.key, Value::Object(_)) {
+    if matches!(input.key, JsValue::Object(_)) {
         Ok(Progress::Convert(input))
     } else {
         converted(runtime, execution, id, input).map(Progress::Call)
     }
 }
+/// Release the owned internal edges of a conversion that ends before the
+/// read/write handler takes them over.
+fn release_abandoned_operands(
+    runtime: &Runtime,
+    receiver: JsValue,
+    base: JsValue,
+    value: Option<JsValue>,
+) -> Result<(), Error> {
+    if let Some(assigned) = value {
+        runtime
+            .release_jsvalue(assigned)
+            .map_err(runtime_error_to_vm_error)?;
+    }
+    runtime
+        .release_jsvalue(receiver)
+        .map_err(runtime_error_to_vm_error)?;
+    runtime
+        .release_jsvalue(base)
+        .map_err(runtime_error_to_vm_error)?;
+    Ok(())
+}
+
 // The pending super-property conversion transfers its existing box directly to this consuming handler.
 #[allow(clippy::boxed_local)]
 pub(super) fn converted(
@@ -112,35 +149,48 @@ pub(super) fn converted(
         kind,
         depth,
     } = *input;
-    if matches!(key, Value::Object(_)) {
+    if matches!(key, JsValue::Object(_)) {
         return Err(Error::internal("super key conversion returned an object"));
     }
-    let key = match runtime
-        .native_to_property_key(realm, key)
-        .map_err(runtime_error_to_vm_error)?
-    {
-        NativeConversion::Value(key) => key,
-        NativeConversion::Throw(value) => return Ok(CallStep::Complete(Completion::Throw(value))),
+    let conversion = runtime.native_to_property_key_jsvalue(realm, key);
+    let key = match conversion {
+        Ok(NativeConversion::Value(key)) => key,
+        Ok(NativeConversion::Throw(thrown)) => {
+            release_abandoned_operands(runtime, receiver, base, value)?;
+            return Ok(CallStep::Complete(Completion::Throw(thrown)));
+        }
+        Err(error) => {
+            release_abandoned_operands(runtime, receiver, base, value)?;
+            return Err(runtime_error_to_vm_error(error));
+        }
     };
     if kind == Kind::Write {
-        let Value::Object(base) = base else {
+        let JsValue::Object(base) = base else {
             return Err(Error::internal("super write lost its validated base"));
         };
+        let base = crate::engine::object::ObjectRef::from_owned_handle(runtime.clone(), base);
         let value = value.ok_or_else(|| Error::internal("super write lost its value"))?;
         return super::proxy_get_driver::start_write(
             runtime, execution, id, base, key, value, receiver, strict, depth,
         );
     }
-    if let Value::Object(object) = base {
-        let getter_receiver = if kind == Kind::Call {
-            Value::Object(object.clone())
-        } else {
-            receiver.clone()
-        };
+    if let JsValue::Object(object) = base {
+        let object = crate::engine::object::ObjectRef::from_owned_handle(runtime.clone(), object);
         if kind == Kind::Call {
             let frame = execution.frames.current_mut(id)?;
             execution.slots.push(&mut frame.window, receiver)?;
+            let getter_receiver = JsValue::Object(object.clone().into_handle());
+            return super::proxy_get_driver::start_owned_read(
+                runtime,
+                execution,
+                id,
+                object,
+                key,
+                getter_receiver,
+                depth,
+            );
         }
+        let getter_receiver = receiver;
         return super::proxy_get_driver::start_owned_read(
             runtime,
             execution,
@@ -153,9 +203,15 @@ pub(super) fn converted(
     }
     if kind == Kind::Read {
         let suffix = match base {
-            Value::Null => "' of null",
-            Value::Undefined => "' of undefined",
+            JsValue::Null => "' of null",
+            JsValue::Undefined => "' of undefined",
             _ => {
+                runtime
+                    .release_jsvalue(receiver)
+                    .map_err(runtime_error_to_vm_error)?;
+                runtime
+                    .release_jsvalue(base)
+                    .map_err(runtime_error_to_vm_error)?;
                 return super::property_driver::throw_error(
                     runtime,
                     realm,
@@ -166,9 +222,15 @@ pub(super) fn converted(
         let error = runtime
             .native_atom_error(ErrorKind::Type, "cannot read property '", &key, suffix)
             .map_err(runtime_error_to_vm_error)?;
+        runtime
+            .release_jsvalue(receiver)
+            .map_err(runtime_error_to_vm_error)?;
+        runtime
+            .release_jsvalue(base)
+            .map_err(runtime_error_to_vm_error)?;
         return super::property_driver::throw_error(runtime, realm, error);
     }
-    let read = runtime.prepare_value_property_read(realm, base, &key);
+    let read = runtime.prepare_value_property_read_borrowed_jsvalue(realm, &base, &key);
     let read = match read {
         Ok(read) => read,
         Err(error) => {

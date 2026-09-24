@@ -4,7 +4,7 @@ use crate::engine::{
     builtins::native::TypedArrayElementKind,
     heap::ContextId,
     object::{CallableRef, ObjectRef, PropertyKey},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion, ToPrimitiveHint,
         call::{
@@ -47,22 +47,28 @@ enum Allocation {
         prototype: ObjectRef,
         element: TypedArrayElementKind,
     },
-    Static(Value),
+    Static(JsValue),
 }
 enum Input {
-    Values(Vec<Value>),
+    Values {
+        runtime: Runtime,
+        values: Vec<JsValue>,
+    },
     Object(ObjectRef),
 }
 struct Factory {
+    runtime: Runtime,
+    source: JsValue,
     allocation: Allocation,
     mapper: Option<CallableRef>,
-    this_arg: Value,
+    this_arg: JsValue,
 }
 struct Population {
+    runtime: Runtime,
     source: Input,
     target: ObjectRef,
     mapper: Option<CallableRef>,
-    this_arg: Value,
+    this_arg: JsValue,
     length: u64,
     index: u64,
 }
@@ -70,8 +76,7 @@ enum ProtoPurpose {
     Length(u64),
     Buffer {
         source: ObjectRef,
-        offset: Option<Value>,
-        length: Option<Value>,
+        arguments: BufferArguments,
     },
     Typed {
         source: ObjectRef,
@@ -88,7 +93,7 @@ enum Phase {
         prototype: ObjectRef,
         element: TypedArrayElementKind,
         source: ObjectRef,
-        length: Option<Value>,
+        arguments: BufferArguments,
     },
     BufferLength {
         prototype: ObjectRef,
@@ -97,7 +102,6 @@ enum Phase {
         offset: u64,
     },
     Iterator {
-        source: Value,
         factory: Factory,
     },
     Collect(Factory),
@@ -118,6 +122,52 @@ enum Phase {
     Mapped(Population),
     Element(Population),
 }
+struct BufferArguments {
+    runtime: Runtime,
+    offset: Option<JsValue>,
+    length: Option<JsValue>,
+}
+impl Drop for BufferArguments {
+    fn drop(&mut self) {
+        for value in [self.offset.take(), self.length.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
+}
+impl Drop for Factory {
+    fn drop(&mut self) {
+        for value in [
+            std::mem::replace(&mut self.source, JsValue::Undefined),
+            std::mem::replace(&mut self.this_arg, JsValue::Undefined),
+        ] {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Allocation::Static(value) =
+            std::mem::replace(&mut self.allocation, Allocation::Static(JsValue::Undefined))
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
+}
+impl Drop for Input {
+    fn drop(&mut self) {
+        if let Self::Values { runtime, values } = self {
+            for value in values.drain(..) {
+                let _ = runtime.release_jsvalue(value);
+            }
+        }
+    }
+}
+impl Drop for Population {
+    fn drop(&mut self) {
+        let _ = self
+            .runtime
+            .release_jsvalue(std::mem::replace(&mut self.this_arg, JsValue::Undefined));
+    }
+}
 impl TypedCreateStep {
     pub(crate) fn constructor(
         runtime: &Runtime,
@@ -131,14 +181,11 @@ impl TypedCreateStep {
                 "TypedArray constructor did not receive a constructor invocation",
             ));
         };
-        let first = arguments
-            .readable
-            .first()
-            .ok_or(RuntimeError::Invariant(
-                "TypedArray constructor argv was not padded",
-            ))?
-            .clone();
-        let purpose = if let Value::Object(source) = first {
+        let first = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "TypedArray constructor argv was not padded",
+        ))?;
+        let purpose = if let JsValue::Object(source) = first {
+            let source = ObjectRef::from_borrowed_handle(runtime.clone(), *source)?;
             if !source.belongs_to(runtime) {
                 return Err(RuntimeError::WrongRuntime("TypedArray constructor source"));
             }
@@ -146,38 +193,28 @@ impl TypedCreateStep {
                 .snapshot_buffer_access_if_branded(&source)?
                 .is_some()
             {
-                let offset = if arguments.actual_arg_count > 1 {
-                    Some(
-                        arguments
-                            .readable
-                            .get(1)
-                            .ok_or(RuntimeError::Invariant(
-                                "TypedArray byteOffset argv was not padded",
-                            ))?
-                            .clone(),
-                    )
-                } else {
-                    None
+                let mut buffer_arguments = BufferArguments {
+                    runtime: runtime.clone(),
+                    offset: None,
+                    length: None,
                 };
-                let length = if arguments.actual_arg_count > 2
-                    && !matches!(arguments.readable.get(2), Some(Value::Undefined))
+                if arguments.actual_arg_count > 1 {
+                    buffer_arguments.offset =
+                        Some(runtime.dup_jsvalue(arguments.readable.get(1).ok_or(
+                            RuntimeError::Invariant("TypedArray byteOffset argv was not padded"),
+                        )?)?);
+                }
+                if arguments.actual_arg_count > 2
+                    && !matches!(arguments.readable.get(2), Some(JsValue::Undefined))
                 {
-                    Some(
-                        arguments
-                            .readable
-                            .get(2)
-                            .ok_or(RuntimeError::Invariant(
-                                "TypedArray length argv was not padded",
-                            ))?
-                            .clone(),
-                    )
-                } else {
-                    None
-                };
+                    buffer_arguments.length =
+                        Some(runtime.dup_jsvalue(arguments.readable.get(2).ok_or(
+                            RuntimeError::Invariant("TypedArray length argv was not padded"),
+                        )?)?);
+                }
                 ProtoPurpose::Buffer {
                     source,
-                    offset,
-                    length,
+                    arguments: buffer_arguments,
                 }
             } else if let Some(snapshot) = runtime.typed_array_snapshot_if_branded(&source)? {
                 let length = u64::from(runtime.typed_array_state_from_snapshot(snapshot)?.length);
@@ -186,7 +223,7 @@ impl TypedCreateStep {
                 ProtoPurpose::Object(source)
             }
         } else {
-            let length = match runtime.native_to_index(realm, &first)? {
+            let length = match primitive_index(runtime, realm, runtime.dup_jsvalue(first)?)? {
                 NativeConversion::Value(value) => value,
                 NativeConversion::Throw(value) => {
                     return Ok(Self::Complete(Completion::Throw(value)));
@@ -195,9 +232,9 @@ impl TypedCreateStep {
             ProtoPurpose::Length(length)
         };
         Ok(Self::request_prototype(
-            new_target.clone(),
+            runtime.dup_jsvalue(new_target)?,
             TypedCreateResume(Box::new(TypedCreateResumeState {
-                pending_effect: TypedCreateStepPending::default(),
+                pending_effect: TypedCreateStepPending::new(runtime.clone()),
                 realm,
                 phase: Phase::Prototype { element, purpose },
             })),
@@ -214,55 +251,54 @@ impl TypedCreateStep {
                 "TypedArray.from received a constructor invocation",
             ));
         };
-        let source = arguments
-            .readable
-            .first()
-            .ok_or(RuntimeError::Invariant(
-                "TypedArray.from argv was not padded",
-            ))?
-            .clone();
+        let source = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "TypedArray.from argv was not padded",
+        ))?;
         let mapper = if arguments.actual_arg_count > 1
-            && !matches!(arguments.readable[1], Value::Undefined)
+            && !matches!(arguments.readable[1], JsValue::Undefined)
         {
             let callable = match &arguments.readable[1] {
-                Value::Object(object) => runtime.as_callable(object)?,
+                JsValue::Object(id) => runtime.as_callable_object(*id)?,
                 _ => None,
             };
             let Some(callable) = callable else {
                 return Ok(Self::Complete(Completion::Throw(
-                    runtime.new_native_error(realm, NativeErrorKind::Type, "not a function")?,
+                    runtime.new_native_error_jsvalue(
+                        realm,
+                        NativeErrorKind::Type,
+                        "not a function",
+                    )?,
                 )));
             };
             Some(callable)
         } else {
             None
         };
-        let this_arg = if arguments.actual_arg_count > 2 {
-            arguments.readable[2].clone()
-        } else {
-            Value::Undefined
-        };
         let message = match source {
-            Value::Undefined => Some("cannot read property 'Symbol.iterator' of undefined"),
-            Value::Null => Some("cannot read property 'Symbol.iterator' of null"),
+            JsValue::Undefined => Some("cannot read property 'Symbol.iterator' of undefined"),
+            JsValue::Null => Some("cannot read property 'Symbol.iterator' of null"),
             _ => None,
         };
         if let Some(message) = message {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(realm, NativeErrorKind::Type, message)?,
+                runtime.new_native_error_jsvalue(realm, NativeErrorKind::Type, message)?,
             )));
         }
-        TypedCreateResume::iterator(
-            runtime,
-            realm,
-            source,
-            Factory {
-                allocation: Allocation::Static(this_value.clone()),
-                mapper,
-                this_arg,
-            },
-        )
+        let mut factory = Factory {
+            runtime: runtime.clone(),
+            source: JsValue::Undefined,
+            allocation: Allocation::Static(JsValue::Undefined),
+            mapper,
+            this_arg: JsValue::Undefined,
+        };
+        factory.allocation = Allocation::Static(runtime.dup_jsvalue(this_value)?);
+        factory.source = runtime.dup_jsvalue(source)?;
+        if arguments.actual_arg_count > 2 {
+            factory.this_arg = runtime.dup_jsvalue(&arguments.readable[2])?;
+        }
+        TypedCreateResume::iterator(runtime, realm, factory)
     }
+
     pub(crate) fn of(
         runtime: &Runtime,
         realm: ContextId,
@@ -276,44 +312,45 @@ impl TypedCreateStep {
         };
         let length = u64::try_from(arguments.actual_arg_count)
             .map_err(|_| RuntimeError::Invariant("TypedArray.of argc overflowed u64"))?;
-        let mut values = Vec::new();
+        let mut source = Input::Values {
+            runtime: runtime.clone(),
+            values: Vec::new(),
+        };
+        let Input::Values { values, .. } = &mut source else {
+            unreachable!()
+        };
         if values
             .try_reserve_exact(arguments.actual_arg_count)
             .is_err()
         {
             return out_of_memory(runtime, realm);
         }
-        values.extend(
-            arguments.readable[..arguments.actual_arg_count]
-                .iter()
-                .cloned(),
-        );
-        TypedCreateResume::allocate(
-            runtime,
-            realm,
-            Input::Values(values),
-            Factory {
-                allocation: Allocation::Static(this_value.clone()),
-                mapper: None,
-                this_arg: Value::Undefined,
-            },
-            length,
-        )
+        for value in &arguments.readable[..arguments.actual_arg_count] {
+            values.push(runtime.dup_jsvalue(value)?);
+        }
+        let factory = Factory {
+            runtime: runtime.clone(),
+            source: JsValue::Undefined,
+            allocation: Allocation::Static(runtime.dup_jsvalue(this_value)?),
+            mapper: None,
+            this_arg: JsValue::Undefined,
+        };
+        TypedCreateResume::allocate(runtime, realm, source, factory, length)
     }
 }
+
 impl TypedCreateResume {
     fn iterator(
-        _runtime: &Runtime,
+        runtime: &Runtime,
         realm: ContextId,
-        source: Value,
         factory: Factory,
     ) -> Result<TypedCreateStep, RuntimeError> {
         Ok(TypedCreateStep::request_method(
-            source.clone(),
+            runtime.dup_jsvalue(&factory.source)?,
             Self(Box::new(TypedCreateResumeState {
-                pending_effect: TypedCreateStepPending::default(),
+                pending_effect: TypedCreateStepPending::new(runtime.clone()),
                 realm,
-                phase: Phase::Iterator { source, factory },
+                phase: Phase::Iterator { factory },
             })),
         ))
     }
@@ -328,7 +365,7 @@ impl TypedCreateResume {
                 return Ok(TypedCreateStep::Complete(Completion::Throw(value)));
             }
         };
-        let Phase::Iterator { source, factory } = self.0.phase else {
+        let Phase::Iterator { mut factory } = self.0.phase else {
             return Err(RuntimeError::Invariant(
                 "TypedArray iterator method reply in wrong phase",
             ));
@@ -339,27 +376,32 @@ impl TypedCreateResume {
                 Allocation::Static(_) => TypedArrayElementKind::Uint8,
             };
             Ok(TypedCreateStep::request_collect(
-                source,
+                std::mem::replace(&mut factory.source, JsValue::Undefined),
                 method,
                 element,
                 Self(Box::new(TypedCreateResumeState {
-                    pending_effect: TypedCreateStepPending::default(),
+                    pending_effect: TypedCreateStepPending::new(runtime.clone()),
                     realm: self.0.realm,
                     phase: Phase::Collect(factory),
                 })),
             ))
         } else {
-            let source = match runtime.native_to_object(self.0.realm, source)? {
+            let source = match runtime.native_to_object_jsvalue(
+                self.0.realm,
+                std::mem::replace(&mut factory.source, JsValue::Undefined),
+            )? {
                 NativeConversion::Value(value) => value,
                 NativeConversion::Throw(value) => {
                     return Ok(TypedCreateStep::Complete(Completion::Throw(value)));
                 }
             };
+            let key =
+                runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Length)?;
             Ok(TypedCreateStep::request_read(
-                Value::Object(source.clone()),
-                runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Length)?,
+                JsValue::Object(source.clone().into_handle()),
+                key,
                 Self(Box::new(TypedCreateResumeState {
-                    pending_effect: TypedCreateStepPending::default(),
+                    pending_effect: TypedCreateStepPending::new(runtime.clone()),
                     realm: self.0.realm,
                     phase: Phase::Length { source, factory },
                 })),
@@ -387,52 +429,54 @@ impl TypedCreateResume {
             }
         };
         match purpose {
-            ProtoPurpose::Length(length) => complete_object(runtime.new_typed_array_for_length(
-                self.0.realm,
-                &prototype,
-                element,
-                length,
-            )?),
+            ProtoPurpose::Length(length) => complete_object(
+                runtime,
+                runtime.new_typed_array_for_length(self.0.realm, &prototype, element, length)?,
+            ),
             ProtoPurpose::Typed { source, length } => {
                 let snapshot = runtime.typed_array_snapshot(&source)?;
-                complete_object(runtime.typed_array_copy_into_new(
-                    self.0.realm,
-                    &prototype,
-                    element,
-                    &source,
-                    snapshot,
-                    length,
-                )?)
+                complete_object(
+                    runtime,
+                    runtime.typed_array_copy_into_new(
+                        self.0.realm,
+                        &prototype,
+                        element,
+                        &source,
+                        snapshot,
+                        length,
+                    )?,
+                )
             }
             ProtoPurpose::Object(source) => Self::iterator(
                 runtime,
                 self.0.realm,
-                Value::Object(source),
                 Factory {
+                    runtime: runtime.clone(),
+                    source: JsValue::Object(source.into_handle()),
                     allocation: Allocation::Intrinsic { prototype, element },
                     mapper: None,
-                    this_arg: Value::Undefined,
+                    this_arg: JsValue::Undefined,
                 },
             ),
             ProtoPurpose::Buffer {
                 source,
-                offset,
-                length,
+                mut arguments,
             } => {
+                let offset = arguments.offset.take();
                 let resume = Self(Box::new(TypedCreateResumeState {
-                    pending_effect: TypedCreateStepPending::default(),
+                    pending_effect: TypedCreateStepPending::new(runtime.clone()),
                     realm: self.0.realm,
                     phase: Phase::Offset {
                         prototype,
                         element,
                         source,
-                        length,
+                        arguments,
                     },
                 }));
                 if let Some(value) = offset {
                     Ok(TypedCreateStep::request_primitive(value, resume))
                 } else {
-                    resume.resume(runtime, Completion::Return(Value::Int(0)))
+                    resume.resume(runtime, Completion::Return(JsValue::Int(0)))
                 }
             }
         }
@@ -440,7 +484,7 @@ impl TypedCreateResume {
     pub(crate) fn collected(
         self,
         runtime: &Runtime,
-        result: NativeConversion<Vec<Value>>,
+        result: NativeConversion<Vec<JsValue>>,
     ) -> Result<TypedCreateStep, RuntimeError> {
         let values = match result {
             NativeConversion::Value(value) => value,
@@ -448,26 +492,23 @@ impl TypedCreateResume {
                 return Ok(TypedCreateStep::Complete(Completion::Throw(value)));
             }
         };
+        let length = values.len() as u64;
+        let source = Input::Values {
+            runtime: runtime.clone(),
+            values,
+        };
         let Phase::Collect(factory) = self.0.phase else {
             return Err(RuntimeError::Invariant(
                 "TypedArray collected reply in wrong phase",
             ));
         };
-        let length = u64::try_from(values.len())
-            .map_err(|_| RuntimeError::Invariant("TypedArray iterable length overflowed u64"))?;
-        Self::allocate(
-            runtime,
-            self.0.realm,
-            Input::Values(values),
-            factory,
-            length,
-        )
+        Self::allocate(runtime, self.0.realm, source, factory, length)
     }
     fn allocate(
         runtime: &Runtime,
         realm: ContextId,
         source: Input,
-        factory: Factory,
+        mut factory: Factory,
         length: u64,
     ) -> Result<TypedCreateStep, RuntimeError> {
         match &factory.allocation {
@@ -480,26 +521,31 @@ impl TypedCreateResume {
                         }
                     };
                 Population {
+                    runtime: runtime.clone(),
                     source,
                     target,
-                    mapper: factory.mapper,
-                    this_arg: factory.this_arg,
+                    mapper: factory.mapper.take(),
+                    this_arg: std::mem::replace(&mut factory.this_arg, JsValue::Undefined),
                     length,
                     index: 0,
                 }
                 .next(runtime, realm)
             }
             Allocation::Static(constructor) => {
-                if !matches!(constructor, Value::Object(_)) {
+                if !matches!(constructor, JsValue::Object(_)) {
                     return Ok(TypedCreateStep::Complete(Completion::Throw(
-                        runtime.new_native_error(realm, NativeErrorKind::Type, "not a function")?,
+                        runtime.new_native_error_jsvalue(
+                            realm,
+                            NativeErrorKind::Type,
+                            "not a function",
+                        )?,
                     )));
                 }
                 Ok(TypedCreateStep::request_create(
-                    constructor.clone(),
+                    runtime.dup_jsvalue(constructor)?,
                     length,
                     Self(Box::new(TypedCreateResumeState {
-                        pending_effect: TypedCreateStepPending::default(),
+                        pending_effect: TypedCreateStepPending::new(runtime.clone()),
                         realm,
                         phase: Phase::Create {
                             source,
@@ -524,7 +570,7 @@ impl TypedCreateResume {
         };
         let Phase::Create {
             source,
-            factory,
+            mut factory,
             length,
         } = self.0.phase
         else {
@@ -533,10 +579,11 @@ impl TypedCreateResume {
             ));
         };
         Population {
+            runtime: runtime.clone(),
             source,
             target,
-            mapper: factory.mapper,
-            this_arg: factory.this_arg,
+            mapper: factory.mapper.take(),
+            this_arg: std::mem::replace(&mut factory.this_arg, JsValue::Undefined),
             length,
             index: 0,
         }
@@ -578,9 +625,9 @@ impl TypedCreateResume {
                 prototype,
                 element,
                 source,
-                length,
+                mut arguments,
             } => {
-                let offset = match runtime.native_to_index(self.0.realm, &value)? {
+                let offset = match primitive_index(runtime, self.0.realm, value)? {
                     NativeConversion::Value(value) => value,
                     NativeConversion::Throw(value) => {
                         return Ok(TypedCreateStep::Complete(Completion::Throw(value)));
@@ -588,18 +635,18 @@ impl TypedCreateResume {
                 };
                 if offset % u64::from(element.byte_length()) != 0 {
                     return Ok(TypedCreateStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Range,
                             "invalid offset",
                         )?,
                     )));
                 }
-                if let Some(value) = length {
+                if let Some(value) = arguments.length.take() {
                     Ok(TypedCreateStep::request_primitive(
                         value,
                         Self(Box::new(TypedCreateResumeState {
-                            pending_effect: TypedCreateStepPending::default(),
+                            pending_effect: TypedCreateStepPending::new(runtime.clone()),
                             realm: self.0.realm,
                             phase: Phase::BufferLength {
                                 prototype,
@@ -610,14 +657,17 @@ impl TypedCreateResume {
                         })),
                     ))
                 } else {
-                    complete_object(runtime.new_typed_array_constructor_view_from_coerced(
-                        self.0.realm,
-                        &prototype,
-                        element,
-                        &source,
-                        offset,
-                        None,
-                    )?)
+                    complete_object(
+                        runtime,
+                        runtime.new_typed_array_constructor_view_from_coerced(
+                            self.0.realm,
+                            &prototype,
+                            element,
+                            &source,
+                            offset,
+                            None,
+                        )?,
+                    )
                 }
             }
             Phase::BufferLength {
@@ -626,32 +676,37 @@ impl TypedCreateResume {
                 source,
                 offset,
             } => {
-                let length = match runtime.native_to_index(self.0.realm, &value)? {
+                let length = match primitive_index(runtime, self.0.realm, value)? {
                     NativeConversion::Value(value) => value,
                     NativeConversion::Throw(value) => {
                         return Ok(TypedCreateStep::Complete(Completion::Throw(value)));
                     }
                 };
-                complete_object(runtime.new_typed_array_constructor_view_from_coerced(
-                    self.0.realm,
-                    &prototype,
-                    element,
-                    &source,
-                    offset,
-                    Some(length),
-                )?)
+                complete_object(
+                    runtime,
+                    runtime.new_typed_array_constructor_view_from_coerced(
+                        self.0.realm,
+                        &prototype,
+                        element,
+                        &source,
+                        offset,
+                        Some(length),
+                    )?,
+                )
             }
             Phase::Length { source, factory } => Ok(TypedCreateStep::request_primitive(
                 value,
                 Self(Box::new(TypedCreateResumeState {
-                    pending_effect: TypedCreateStepPending::default(),
+                    pending_effect: TypedCreateStepPending::new(runtime.clone()),
                     realm: self.0.realm,
                     phase: Phase::LengthPrimitive { source, factory },
                 })),
             )),
             Phase::LengthPrimitive { source, factory } => {
-                let length = match runtime.native_to_length(self.0.realm, &value)? {
-                    NativeConversion::Value(value) => value,
+                let number = runtime.number_from_primitive_jsvalue(self.0.realm, &value);
+                runtime.release_jsvalue(value)?;
+                let length = match number? {
+                    NativeConversion::Value(value) => Runtime::length_from_number(value),
                     NativeConversion::Throw(value) => {
                         return Ok(TypedCreateStep::Complete(Completion::Throw(value)));
                     }
@@ -666,9 +721,12 @@ impl TypedCreateResume {
             }
             Phase::Index(population) => population.map(runtime, self.0.realm, value),
             Phase::Mapped(population) => population.convert(runtime, self.0.realm, value),
-            _ => Err(RuntimeError::Invariant(
-                "TypedArray create value reply in wrong phase",
-            )),
+            _ => {
+                runtime.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant(
+                    "TypedArray create value reply in wrong phase",
+                ))
+            }
         }
     }
 }
@@ -676,24 +734,28 @@ impl Population {
     fn next(self, runtime: &Runtime, realm: ContextId) -> Result<TypedCreateStep, RuntimeError> {
         if self.index == self.length {
             return Ok(TypedCreateStep::Complete(Completion::Return(
-                Value::Object(self.target),
+                JsValue::Object(self.target.clone().into_handle()),
             )));
         }
         match &self.source {
-            Input::Object(source) => Ok(TypedCreateStep::request_read(
-                Value::Object(source.clone()),
-                runtime.property_key_for_index(self.index)?,
-                TypedCreateResume(Box::new(TypedCreateResumeState {
-                    pending_effect: TypedCreateStepPending::default(),
-                    realm,
-                    phase: Phase::Index(self),
-                })),
-            )),
-            Input::Values(values) => {
-                let value = values[usize::try_from(self.index).map_err(|_| {
-                    RuntimeError::Invariant("TypedArray materialized index overflowed usize")
-                })?]
-                .clone();
+            Input::Object(source) => {
+                let key = runtime.property_key_for_index(self.index)?;
+                Ok(TypedCreateStep::request_read(
+                    JsValue::Object(source.clone().into_handle()),
+                    key,
+                    TypedCreateResume(Box::new(TypedCreateResumeState {
+                        pending_effect: TypedCreateStepPending::new(runtime.clone()),
+                        realm,
+                        phase: Phase::Index(self),
+                    })),
+                ))
+            }
+            Input::Values { values, .. } => {
+                let value = runtime.dup_jsvalue(
+                    &values[usize::try_from(self.index).map_err(|_| {
+                        RuntimeError::Invariant("TypedArray materialized index overflowed usize")
+                    })?],
+                )?;
                 self.map(runtime, realm, value)
             }
         }
@@ -702,21 +764,31 @@ impl Population {
         self,
         runtime: &Runtime,
         realm: ContextId,
-        value: Value,
+        value: JsValue,
     ) -> Result<TypedCreateStep, RuntimeError> {
         if let Some(mapper) = &self.mapper {
             let mut arguments = Vec::new();
             if arguments.try_reserve_exact(2).is_err() {
+                runtime.release_jsvalue(value)?;
                 return out_of_memory(runtime, realm);
             }
+            let receiver = match runtime.dup_jsvalue(&self.this_arg) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = runtime.release_jsvalue(value);
+                    return Err(error);
+                }
+            };
             arguments.push(value);
-            arguments.push(Value::number(self.index as f64));
+            arguments.push(
+                crate::engine::value::number::operations::Number::compact(self.index as f64).into(),
+            );
             Ok(TypedCreateStep::request_call(
                 DirectCallTarget::Callable(mapper.clone()),
-                self.this_arg.clone(),
+                receiver,
                 arguments,
                 TypedCreateResume(Box::new(TypedCreateResumeState {
-                    pending_effect: TypedCreateStepPending::default(),
+                    pending_effect: TypedCreateStepPending::new(runtime.clone()),
                     realm,
                     phase: Phase::Mapped(self),
                 })),
@@ -729,29 +801,52 @@ impl Population {
         self,
         runtime: &Runtime,
         realm: ContextId,
-        value: Value,
+        value: JsValue,
     ) -> Result<TypedCreateStep, RuntimeError> {
-        let element = runtime.typed_array_snapshot(&self.target)?.element;
+        let element = match runtime.typed_array_snapshot(&self.target) {
+            Ok(snapshot) => snapshot.element,
+            Err(error) => {
+                let _ = runtime.release_jsvalue(value);
+                return Err(error);
+            }
+        };
         Ok(TypedCreateStep::request_element(
             element,
             value,
             TypedCreateResume(Box::new(TypedCreateResumeState {
-                pending_effect: TypedCreateStepPending::default(),
+                pending_effect: TypedCreateStepPending::new(runtime.clone()),
                 realm,
                 phase: Phase::Element(self),
             })),
         ))
     }
 }
-fn complete_object(result: NativeConversion<ObjectRef>) -> Result<TypedCreateStep, RuntimeError> {
+fn primitive_index(
+    runtime: &Runtime,
+    realm: ContextId,
+    value: JsValue,
+) -> Result<NativeConversion<u64>, RuntimeError> {
+    let number = runtime.number_from_primitive_jsvalue(realm, &value);
+    runtime.release_jsvalue(value)?;
+    match number? {
+        NativeConversion::Value(number) => runtime.index_from_number(realm, number),
+        NativeConversion::Throw(value) => Ok(NativeConversion::Throw(value)),
+    }
+}
+fn complete_object(
+    runtime: &Runtime,
+    result: NativeConversion<ObjectRef>,
+) -> Result<TypedCreateStep, RuntimeError> {
     Ok(TypedCreateStep::Complete(match result {
-        NativeConversion::Value(value) => Completion::Return(Value::Object(value)),
+        NativeConversion::Value(value) => {
+            Completion::Return(runtime.into_jsvalue(Value::Object(value))?)
+        }
         NativeConversion::Throw(value) => Completion::Throw(value),
     }))
 }
 fn out_of_memory(runtime: &Runtime, realm: ContextId) -> Result<TypedCreateStep, RuntimeError> {
     Ok(TypedCreateStep::Complete(Completion::Throw(
-        runtime.new_native_error(realm, NativeErrorKind::Internal, "out of memory")?,
+        runtime.new_native_error_jsvalue(realm, NativeErrorKind::Internal, "out of memory")?,
     )))
 }
 pub(super) fn finish(
@@ -765,8 +860,8 @@ pub(super) fn finish(
             TypedCreateStep::Primitive { mut resume } => {
                 let value = resume.take_primitive_value();
                 {
-                    let result = if matches!(value, Value::Object(_)) {
-                        runtime.to_primitive(realm, value, ToPrimitiveHint::Number)?
+                    let result = if matches!(value, JsValue::Object(_)) {
+                        runtime.to_primitive_jsvalue(realm, value, ToPrimitiveHint::Number)?
                     } else {
                         Completion::Return(value)
                     };
@@ -789,7 +884,7 @@ pub(super) fn finish(
                 let key = resume.take_read_key();
                 resume.resume(
                     runtime,
-                    runtime.get_value_property_in_realm(realm, receiver, &key)?,
+                    runtime.get_value_property_in_realm_jsvalue(realm, receiver, &key)?,
                 )?
             }
             TypedCreateStep::Method { mut resume } => {
@@ -819,112 +914,109 @@ pub(super) fn finish(
             }
             TypedCreateStep::Call { mut resume } => {
                 let target = resume.take_call_target();
+                let DirectCallTarget::Callable(callable) = target else {
+                    return Err(RuntimeError::Invariant(
+                        "TypedArray create invalid call target",
+                    ));
+                };
                 let receiver = resume.take_call_receiver();
                 let arguments = resume.take_call_arguments();
-                {
-                    let DirectCallTarget::Callable(callable) = target else {
-                        return Err(RuntimeError::Invariant(
-                            "TypedArray create invalid call target",
-                        ));
-                    };
-                    resume.resume(
-                        runtime,
-                        runtime.call_internal(realm, &callable, receiver, &arguments)?,
-                    )?
-                }
+                resume.resume(
+                    runtime,
+                    runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?,
+                )?
             }
             TypedCreateStep::Element { mut resume } => {
                 let element = resume.take_element_element();
                 let value = resume.take_element_value();
                 resume.element(
                     runtime,
-                    runtime.typed_array_convert_element(realm, element, &value)?,
+                    super::element::ElementStep::start(runtime, realm, element, value)?
+                        .finish_sync(runtime, realm)?,
                 )?
             }
         };
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn materialized_factory_values_survive_processed_writes_and_abandonment() {
-        let runtime = Runtime::new();
-        let weak = std::rc::Rc::downgrade(&runtime.0);
-        let mut context = runtime.new_context();
-        let Value::Object(target) = context.eval("new Uint8Array(2)").unwrap() else {
-            panic!("expected view");
-        };
-        let target_id = target.object_id();
-        let buffer_id = runtime.typed_array_snapshot(&target).unwrap().buffer;
-        let first = runtime.new_object(None).unwrap();
-        let second = runtime.new_object(None).unwrap();
-        let first_id = first.object_id();
-        let second_id = second.object_id();
-        let realm = context.realm;
-        let population = Population {
-            source: Input::Values(vec![Value::Object(first), Value::Object(second)]),
-            target,
-            mapper: None,
-            this_arg: Value::Undefined,
-            length: 2,
-            index: 0,
-        };
-        let TypedCreateStep::Element { mut resume } = population.next(&runtime, realm).unwrap()
-        else {
-            panic!("expected first conversion");
-        };
-        let _ = resume.take_element_element();
-        drop(resume.take_element_value());
-        let step = resume
-            .element(&runtime, NativeConversion::Value([0; 8]))
-            .unwrap();
-        assert!(matches!(step, TypedCreateStep::Element { .. }));
-        runtime.run_gc().unwrap();
-        for id in [first_id, second_id, target_id, buffer_id] {
-            assert!(runtime.0.state.borrow().heap.object(id).is_ok());
-        }
-        drop(step);
-        runtime.run_gc().unwrap();
-        for id in [first_id, second_id, target_id, buffer_id] {
-            assert!(runtime.0.state.borrow().heap.object(id).is_err());
-        }
-        drop(context);
-        drop(runtime);
-        assert!(weak.upgrade().is_none());
-    }
-}
-
-#[derive(Default)]
 struct TypedCreateStepPending {
-    primitive_value: Option<Value>,
-    prototype_new_target: Option<Value>,
-    read_receiver: Option<Value>,
+    runtime: Runtime,
+    primitive_value: Option<JsValue>,
+    prototype_new_target: Option<JsValue>,
+    read_receiver: Option<JsValue>,
     read_key: Option<PropertyKey>,
-    method_source: Option<Value>,
-    collect_source: Option<Value>,
+    method_source: Option<JsValue>,
+    collect_source: Option<JsValue>,
     collect_method: Option<CallableRef>,
     collect_element: Option<TypedArrayElementKind>,
-    create_constructor: Option<Value>,
+    create_constructor: Option<JsValue>,
     create_length: Option<u64>,
     call_target: Option<DirectCallTarget>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
     element_element: Option<TypedArrayElementKind>,
-    element_value: Option<Value>,
+    element_value: Option<JsValue>,
+}
+impl TypedCreateStepPending {
+    fn new(runtime: Runtime) -> Self {
+        Self {
+            runtime,
+            primitive_value: None,
+            prototype_new_target: None,
+            read_receiver: None,
+            read_key: None,
+            method_source: None,
+            collect_source: None,
+            collect_method: None,
+            collect_element: None,
+            create_constructor: None,
+            create_length: None,
+            call_target: None,
+            call_receiver: None,
+            call_arguments: None,
+            element_element: None,
+            element_value: None,
+        }
+    }
+}
+impl Drop for TypedCreateStepPending {
+    /// Release the internal edges still held when the request is abandoned.
+    /// Consumption goes through `Option::take`; releases are defer-safe and
+    /// nothrow.
+    fn drop(&mut self) {
+        for value in [
+            self.primitive_value.take(),
+            self.prototype_new_target.take(),
+            self.read_receiver.take(),
+            self.method_source.take(),
+            self.collect_source.take(),
+            self.create_constructor.take(),
+            self.call_receiver.take(),
+            self.element_value.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(values) = self.call_arguments.take() {
+            for value in values {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+    }
 }
 impl TypedCreateStep {
-    pub(crate) fn request_primitive(value: Value, mut resume: TypedCreateResume) -> Self {
+    pub(crate) fn request_primitive(value: JsValue, mut resume: TypedCreateResume) -> Self {
         resume.0.pending_effect.primitive_value = Some(value);
         Self::Primitive { resume }
     }
-    pub(crate) fn request_prototype(new_target: Value, mut resume: TypedCreateResume) -> Self {
+    pub(crate) fn request_prototype(new_target: JsValue, mut resume: TypedCreateResume) -> Self {
         resume.0.pending_effect.prototype_new_target = Some(new_target);
         Self::Prototype { resume }
     }
     pub(crate) fn request_read(
-        receiver: Value,
+        receiver: JsValue,
         key: PropertyKey,
         mut resume: TypedCreateResume,
     ) -> Self {
@@ -932,12 +1024,12 @@ impl TypedCreateStep {
         resume.0.pending_effect.read_key = Some(key);
         Self::Read { resume }
     }
-    pub(crate) fn request_method(source: Value, mut resume: TypedCreateResume) -> Self {
+    pub(crate) fn request_method(source: JsValue, mut resume: TypedCreateResume) -> Self {
         resume.0.pending_effect.method_source = Some(source);
         Self::Method { resume }
     }
     pub(crate) fn request_collect(
-        source: Value,
+        source: JsValue,
         method: CallableRef,
         element: TypedArrayElementKind,
         mut resume: TypedCreateResume,
@@ -948,7 +1040,7 @@ impl TypedCreateStep {
         Self::Collect { resume }
     }
     pub(crate) fn request_create(
-        constructor: Value,
+        constructor: JsValue,
         length: u64,
         mut resume: TypedCreateResume,
     ) -> Self {
@@ -958,8 +1050,8 @@ impl TypedCreateStep {
     }
     pub(crate) fn request_call(
         target: DirectCallTarget,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: TypedCreateResume,
     ) -> Self {
         resume.0.pending_effect.call_target = Some(target);
@@ -969,7 +1061,7 @@ impl TypedCreateStep {
     }
     pub(crate) fn request_element(
         element: TypedArrayElementKind,
-        value: Value,
+        value: JsValue,
         mut resume: TypedCreateResume,
     ) -> Self {
         resume.0.pending_effect.element_element = Some(element);
@@ -978,21 +1070,21 @@ impl TypedCreateStep {
     }
 }
 impl TypedCreateResume {
-    pub(crate) fn take_primitive_value(&mut self) -> Value {
+    pub(crate) fn take_primitive_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .primitive_value
             .take()
             .expect("TypedCreateStep Primitive value")
     }
-    pub(crate) fn take_prototype_new_target(&mut self) -> Value {
+    pub(crate) fn take_prototype_new_target(&mut self) -> JsValue {
         self.0
             .pending_effect
             .prototype_new_target
             .take()
             .expect("TypedCreateStep Prototype new_target")
     }
-    pub(crate) fn take_read_receiver(&mut self) -> Value {
+    pub(crate) fn take_read_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .read_receiver
@@ -1006,14 +1098,14 @@ impl TypedCreateResume {
             .take()
             .expect("TypedCreateStep Read key")
     }
-    pub(crate) fn take_method_source(&mut self) -> Value {
+    pub(crate) fn take_method_source(&mut self) -> JsValue {
         self.0
             .pending_effect
             .method_source
             .take()
             .expect("TypedCreateStep Method source")
     }
-    pub(crate) fn take_collect_source(&mut self) -> Value {
+    pub(crate) fn take_collect_source(&mut self) -> JsValue {
         self.0
             .pending_effect
             .collect_source
@@ -1034,7 +1126,7 @@ impl TypedCreateResume {
             .take()
             .expect("TypedCreateStep Collect element")
     }
-    pub(crate) fn take_create_constructor(&mut self) -> Value {
+    pub(crate) fn take_create_constructor(&mut self) -> JsValue {
         self.0
             .pending_effect
             .create_constructor
@@ -1055,14 +1147,14 @@ impl TypedCreateResume {
             .take()
             .expect("TypedCreateStep Call target")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver
             .take()
             .expect("TypedCreateStep Call receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .pending_effect
             .call_arguments
@@ -1076,7 +1168,7 @@ impl TypedCreateResume {
             .take()
             .expect("TypedCreateStep Element element")
     }
-    pub(crate) fn take_element_value(&mut self) -> Value {
+    pub(crate) fn take_element_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .element_value
@@ -1088,3 +1180,63 @@ const _: () = assert!(std::mem::size_of::<TypedCreateStep>() <= 64);
 
 // S11 all-domain protocol bound; inline completion stays allocation-free.
 const _: () = assert!(std::mem::size_of::<TypedCreateStep>() <= 64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn materialized_factory_values_survive_processed_writes_and_abandonment() {
+        let runtime = Runtime::new();
+        let weak = std::rc::Rc::downgrade(&runtime.0);
+        let mut context = runtime.new_context();
+        let Value::Object(target) = context.eval("new Uint8Array(2)").unwrap() else {
+            panic!("expected view");
+        };
+        let target_id = target.object_id();
+        let buffer_id = runtime.typed_array_snapshot(&target).unwrap().buffer;
+        let first = runtime.new_object(None).unwrap();
+        let second = runtime.new_object(None).unwrap();
+        let first_id = first.object_id();
+        let second_id = second.object_id();
+        let realm = context.realm;
+        let population = Population {
+            runtime: runtime.clone(),
+            source: Input::Values {
+                runtime: runtime.clone(),
+                values: vec![
+                    JsValue::Object(first.into_handle()),
+                    JsValue::Object(second.into_handle()),
+                ],
+            },
+            target,
+            mapper: None,
+            this_arg: JsValue::Undefined,
+            length: 2,
+            index: 0,
+        };
+        let TypedCreateStep::Element { mut resume } = population.next(&runtime, realm).unwrap()
+        else {
+            panic!("expected first conversion");
+        };
+        let _ = resume.take_element_element();
+        runtime
+            .release_jsvalue(resume.take_element_value())
+            .unwrap();
+        let step = resume
+            .element(&runtime, NativeConversion::Value([0; 8]))
+            .unwrap();
+        assert!(matches!(step, TypedCreateStep::Element { .. }));
+        runtime.run_gc().unwrap();
+        for id in [first_id, second_id, target_id, buffer_id] {
+            assert!(runtime.0.state.borrow().heap.object(id).is_ok());
+        }
+        drop(step);
+        runtime.run_gc().unwrap();
+        for id in [first_id, second_id, target_id, buffer_id] {
+            assert!(runtime.0.state.borrow().heap.object(id).is_err());
+        }
+        drop(context);
+        drop(runtime);
+        assert!(weak.upgrade().is_none());
+    }
+}

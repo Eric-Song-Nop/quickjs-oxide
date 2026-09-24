@@ -31,7 +31,7 @@ use crate::engine::{
         AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, DescriptorField, ObjectRef,
         OrdinaryPropertyDescriptor, PropertyKey, WellKnownSymbol,
     },
-    value::{JsString, Value, conversion::NativeConversion},
+    value::{JsString, JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
@@ -432,24 +432,20 @@ impl Runtime {
         let to_string_key =
             self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::ToString)?;
         let to_string = match self.get_property_in_realm(realm, &array_prototype, &to_string_key)? {
-            Completion::Return(value @ Value::Object(_)) => value,
-            Completion::Return(_) | Completion::Throw(_) => {
+            Completion::Return(value) => value,
+            Completion::Throw(value) => {
+                let _ = self.release_jsvalue(value);
                 return Err(RuntimeError::Invariant(
                     "Array.prototype.toString was unavailable during TypedArray bootstrap",
                 ));
             }
         };
-        if !self.define_own_property(
-            &base_prototype,
-            &to_string_key,
-            &OrdinaryPropertyDescriptor {
-                value: DescriptorField::Present(to_string),
-                writable: DescriptorField::Present(true),
-                enumerable: DescriptorField::Present(false),
-                configurable: DescriptorField::Present(true),
-                ..OrdinaryPropertyDescriptor::new()
-            },
-        )? {
+        let mut alias = crate::engine::object::OwnedPropertyDescriptor::new(self);
+        alias.value = DescriptorField::Present(to_string);
+        alias.writable = DescriptorField::Present(true);
+        alias.enumerable = DescriptorField::Present(false);
+        alias.configurable = DescriptorField::Present(true);
+        if !self.define_ordinary_owned_property(&base_prototype, &to_string_key, &alias)? {
             return Err(RuntimeError::Invariant(
                 "TypedArray toString alias definition was rejected",
             ));
@@ -458,25 +454,21 @@ impl Runtime {
         let values_key =
             self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Values)?;
         let values = match self.get_property_in_realm(realm, &base_prototype, &values_key)? {
-            Completion::Return(value @ Value::Object(_)) => value,
-            Completion::Return(_) | Completion::Throw(_) => {
+            Completion::Return(value) => value,
+            Completion::Throw(value) => {
+                let _ = self.release_jsvalue(value);
                 return Err(RuntimeError::Invariant(
                     "TypedArray values was unavailable during iterator alias bootstrap",
                 ));
             }
         };
         let iterator = PropertyKey::from(self.well_known_symbol(WellKnownSymbol::Iterator));
-        if !self.define_own_property(
-            &base_prototype,
-            &iterator,
-            &OrdinaryPropertyDescriptor {
-                value: DescriptorField::Present(values),
-                writable: DescriptorField::Present(true),
-                enumerable: DescriptorField::Present(false),
-                configurable: DescriptorField::Present(true),
-                ..OrdinaryPropertyDescriptor::new()
-            },
-        )? {
+        let mut alias = crate::engine::object::OwnedPropertyDescriptor::new(self);
+        alias.value = DescriptorField::Present(values);
+        alias.writable = DescriptorField::Present(true);
+        alias.enumerable = DescriptorField::Present(false);
+        alias.configurable = DescriptorField::Present(true);
+        if !self.define_ordinary_owned_property(&base_prototype, &iterator, &alias)? {
             return Err(RuntimeError::Invariant(
                 "TypedArray iterator alias definition was rejected",
             ));
@@ -539,11 +531,9 @@ impl Runtime {
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
         match kind {
-            TypedArrayNativeKind::BaseConstructor => Ok(Completion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Type,
-                "cannot be called",
-            )?)),
+            TypedArrayNativeKind::BaseConstructor => Ok(Completion::Throw(
+                self.new_native_error_jsvalue(realm, NativeErrorKind::Type, "cannot be called")?,
+            )),
             TypedArrayNativeKind::Constructor(element) => {
                 self.call_typed_array_constructor(realm, element, invocation, arguments)
             }
@@ -631,7 +621,7 @@ impl Runtime {
     ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
         let width = u64::from(element.byte_length());
         if byte_offset % width != 0 {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "invalid offset",
@@ -640,7 +630,7 @@ impl Runtime {
 
         let backing = self.snapshot_buffer_access(buffer.object_id())?.state;
         if backing.detached {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer is detached",
@@ -656,7 +646,7 @@ impl Runtime {
                     "ToIndex TypedArray end offset overflowed u64",
                 ))?;
             if end > u64::from(backing.byte_length) {
-                return Ok(NativeConversion::Throw(self.new_native_error(
+                return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Range,
                     "invalid length",
@@ -671,7 +661,7 @@ impl Runtime {
             )
         } else {
             if byte_offset > u64::from(backing.byte_length) {
-                return Ok(NativeConversion::Throw(self.new_native_error(
+                return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Range,
                     "invalid offset",
@@ -684,7 +674,7 @@ impl Runtime {
                 None
             } else {
                 if u64::from(available) % width != 0 {
-                    return Ok(NativeConversion::Throw(self.new_native_error(
+                    return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                         realm,
                         NativeErrorKind::Range,
                         "invalid length",
@@ -713,7 +703,7 @@ impl Runtime {
                 "TypedArray species did not receive a getter invocation",
             ));
         };
-        Ok(Completion::Return(this_value.clone()))
+        Ok(Completion::Return(self.dup_jsvalue(this_value)?))
     }
 
     pub(in crate::engine::builtins) fn call_typed_array_getter(
@@ -728,21 +718,24 @@ impl Runtime {
             ));
         };
         if kind == TypedArrayNativeKind::ToStringTag {
-            let Value::Object(object) = this_value else {
-                return Ok(Completion::Return(Value::Undefined));
+            let JsValue::Object(id) = this_value else {
+                return Ok(Completion::Return(JsValue::Undefined));
             };
-            let Some(snapshot) = self.typed_array_snapshot_if_branded(object)? else {
-                return Ok(Completion::Return(Value::Undefined));
+            let object = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
+            let Some(snapshot) = self.typed_array_snapshot_if_branded(&object)? else {
+                return Ok(Completion::Return(JsValue::Undefined));
             };
-            return Ok(Completion::Return(Value::String(JsString::from_static(
-                snapshot.element.name(),
-            ))));
+            return Ok(Completion::Return(self.into_jsvalue(Value::String(
+                JsString::from_static(snapshot.element.name()),
+            ))?));
         }
-        let object = match self.require_typed_array_borrowed(realm, this_value)? {
+        let object = match self.require_typed_array_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        let state = self.typed_array_state(object)?;
+        let state = self.typed_array_state(&object)?;
         let result = match kind {
             TypedArrayNativeKind::Buffer => Value::Object(ObjectRef::from_borrowed_handle(
                 self.clone(),
@@ -761,7 +754,7 @@ impl Runtime {
                 ));
             }
         };
-        Ok(Completion::Return(result))
+        Ok(Completion::Return(self.into_jsvalue(result)?))
     }
 
     pub(in crate::engine::builtins) fn call_typed_array_iterator(
@@ -775,17 +768,21 @@ impl Runtime {
                 "TypedArray iterator factory received a constructor invocation",
             ));
         };
-        let object = match self.require_typed_array_borrowed(realm, this_value)? {
+        let object = match self.require_typed_array_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        match self.typed_array_validated_length(realm, object)? {
+        match self.typed_array_validated_length(realm, &object)? {
             NativeConversion::Value(_) => {}
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         }
-        Ok(Completion::Return(Value::Object(
-            self.new_array_iterator(realm, object, kind)?,
-        )))
+        Ok(Completion::Return(self.into_jsvalue(Value::Object(
+            self.new_array_iterator(realm, &object, kind)?,
+        ))?))
     }
 
     fn call_typed_array_from(
@@ -838,7 +835,7 @@ impl Runtime {
     ) -> Result<Completion, RuntimeError> {
         let source_state = self.typed_array_state_from_snapshot(source_snapshot)?;
         if source_state.out_of_bounds {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "out of bound",
@@ -849,7 +846,7 @@ impl Runtime {
             .checked_add(u64::from(source_state.length))
             .is_none_or(|end| end > u64::from(target_length))
         {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "out of bound",
@@ -882,51 +879,37 @@ impl Runtime {
             // element types, including its known overlap result.
             for index in 0..u64::from(source_state.length) {
                 let value = self
-                    .typed_array_read_index(source, index)?
-                    .unwrap_or(Value::Undefined);
-                match self.typed_array_set_index(realm, target, offset + index, &value)? {
-                    NativeConversion::Value(()) => {}
-                    NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+                    .typed_array_read_index_jsvalue(source, index)?
+                    .unwrap_or(JsValue::Undefined);
+                match write::TypedWriteStep::set(self, target.clone(), Some(offset + index), value)?
+                    .finish_sync(self, realm)?
+                {
+                    NativeConversion::Value(_) => {}
+                    NativeConversion::Throw(value) => {
+                        return Ok(Completion::Throw(value));
+                    }
                 }
             }
         }
-        Ok(Completion::Return(Value::Undefined))
+        Ok(Completion::Return(JsValue::Undefined))
     }
 
-    fn require_typed_array(
+    fn require_typed_array_jsvalue(
         &self,
         realm: ContextId,
-        value: Value,
+        value: &JsValue,
     ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
-        self.require_typed_array_borrowed(realm, &value)
-            .map(|result| match result {
-                NativeConversion::Value(object) => NativeConversion::Value(object.clone()),
-                NativeConversion::Throw(value) => NativeConversion::Throw(value),
-            })
-    }
-    fn require_typed_array_borrowed<'a>(
-        &self,
-        realm: ContextId,
-        value: &'a Value,
-    ) -> Result<NativeConversion<&'a ObjectRef>, RuntimeError> {
-        let Value::Object(object) = value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Type,
-                "not a TypedArray",
-            )?));
-        };
-        if !object.belongs_to(self) {
-            return Err(RuntimeError::WrongRuntime("TypedArray"));
+        if let JsValue::Object(id) = value {
+            let object = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
+            if self.typed_array_snapshot_if_branded(&object)?.is_some() {
+                return Ok(NativeConversion::Value(object));
+            }
         }
-        if self.typed_array_snapshot_if_branded(object)?.is_none() {
-            return Ok(NativeConversion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Type,
-                "not a TypedArray",
-            )?));
-        }
-        Ok(NativeConversion::Value(object))
+        Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+            realm,
+            NativeErrorKind::Type,
+            "not a TypedArray",
+        )?))
     }
 
     fn typed_array_default_prototype(
@@ -966,7 +949,7 @@ impl Runtime {
         let Some(buffer) =
             self.new_array_buffer_object(&array_buffer_prototype, byte_length, None)?
         else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Internal,
                 "out of memory",
@@ -1020,14 +1003,14 @@ impl Runtime {
         Ok(ObjectRef::from_owned_handle(self.clone(), object))
     }
 
-    fn typed_array_invalid_length(&self, realm: ContextId) -> Result<Value, RuntimeError> {
-        self.new_native_error(realm, NativeErrorKind::Range, "invalid array buffer length")
+    fn typed_array_invalid_length(&self, realm: ContextId) -> Result<JsValue, RuntimeError> {
+        self.new_native_error_jsvalue(realm, NativeErrorKind::Range, "invalid array buffer length")
     }
 
     fn typed_array_iterator_method(
         &self,
         realm: ContextId,
-        source: Value,
+        source: JsValue,
     ) -> Result<NativeConversion<Option<CallableRef>>, RuntimeError> {
         collect::finish_method(
             self,
@@ -1039,14 +1022,14 @@ impl Runtime {
     fn collect_typed_array_iterator(
         &self,
         realm: ContextId,
-        source: Value,
+        source: JsValue,
         method: &CallableRef,
         element: TypedArrayElementKind,
-    ) -> Result<NativeConversion<Vec<Value>>, RuntimeError> {
+    ) -> Result<NativeConversion<Vec<JsValue>>, RuntimeError> {
         collect::finish_collect(
             self,
             realm,
-            collect::TypedCollectStep::start(realm, source, method.clone(), element),
+            collect::TypedCollectStep::start(self, realm, source, method.clone(), element)?,
         )
     }
 
@@ -1211,7 +1194,7 @@ impl Runtime {
     ) -> Result<NativeConversion<u32>, RuntimeError> {
         let state = self.typed_array_state(object)?;
         if state.out_of_bounds {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer is detached or resized",
@@ -1299,6 +1282,38 @@ impl Runtime {
         Ok(Some(typed_array_decode(snapshot.element, bytes)))
     }
 
+    pub(crate) fn typed_array_read_index_jsvalue(
+        &self,
+        object: &ObjectRef,
+        index: u64,
+    ) -> Result<Option<JsValue>, RuntimeError> {
+        let snapshot = self.typed_array_snapshot(object)?;
+        let bytes = match self.ordinary_typed_array_word(snapshot, index, None)? {
+            OrdinaryTypedWord::Missing => return Ok(None),
+            OrdinaryTypedWord::Word(bytes) => bytes,
+            OrdinaryTypedWord::Shared => {
+                let access = self.snapshot_buffer_access(snapshot.buffer)?;
+                let Some((absolute, width)) =
+                    typed_array_word_range(snapshot, access.state, index)?
+                else {
+                    return Ok(None);
+                };
+                self.read_buffer_word(&access, absolute, width)?
+            }
+        };
+        // Decoding backing bytes creates a new numeric value. Publish BigInt
+        // once here; subsequent callback buffers retain this exact node.
+        if snapshot.element.is_bigint() {
+            return Ok(Some(
+                self.into_jsvalue(typed_array_decode(snapshot.element, bytes))?,
+            ));
+        }
+        Ok(Some(typed_array_decode_number_jsvalue(
+            snapshot.element,
+            bytes,
+        )))
+    }
+
     pub(crate) fn typed_array_get_index_descriptor(
         &self,
         object: &ObjectRef,
@@ -1314,13 +1329,13 @@ impl Runtime {
         }))
     }
 
-    pub(crate) fn typed_array_convert_element(
+    pub(crate) fn typed_array_convert_element_jsvalue(
         &self,
         realm: ContextId,
         element: TypedArrayElementKind,
-        value: &Value,
+        value: JsValue,
     ) -> Result<NativeConversion<[u8; 8]>, RuntimeError> {
-        element::ElementStep::start(self, realm, element, value.clone())?.finish_sync(self, realm)
+        element::ElementStep::start(self, realm, element, value)?.finish_sync(self, realm)
     }
 
     /// Convert a primitive descriptor value for the public context-free
@@ -1336,33 +1351,7 @@ impl Runtime {
                 Value::Bool(value) => {
                     crate::engine::value::bigint::JsBigInt::from(i64::from(*value))
                 }
-                Value::String(value) => {
-                    let units = value.utf16_units().collect::<Vec<_>>();
-                    let source = String::from_utf16(&units).map_err(|_| {
-                        RuntimeError::Engine(Error::new(
-                            ErrorKind::Syntax,
-                            "invalid bigint literal",
-                        ))
-                    })?;
-                    crate::engine::value::bigint::JsBigInt::parse_js_string(&source).map_err(
-                        |error| {
-                            let kind = match error {
-                                crate::engine::value::bigint::BigIntError::InvalidSyntax => {
-                                    ErrorKind::Syntax
-                                }
-                                crate::engine::value::bigint::BigIntError::InvalidRadix(_)
-                                | crate::engine::value::bigint::BigIntError::BigIntTooLarge
-                                | crate::engine::value::bigint::BigIntError::AllocationTooLarge
-                                | crate::engine::value::bigint::BigIntError::DivisionByZero
-                                | crate::engine::value::bigint::BigIntError::NegativeExponent
-                                | crate::engine::value::bigint::BigIntError::ShiftTooLarge => {
-                                    ErrorKind::Range
-                                }
-                            };
-                            RuntimeError::Engine(Error::new(kind, error.to_string()))
-                        },
-                    )?
-                }
+                Value::String(value) => typed_array_parse_primitive_bigint(value)?,
                 Value::Undefined
                 | Value::Null
                 | Value::Int(_)
@@ -1378,6 +1367,45 @@ impl Runtime {
             return typed_array_encode_bigint(&bigint);
         }
         let number = value.to_number().map_err(RuntimeError::Engine)?;
+        Ok(typed_array_encode_number(element, number))
+    }
+
+    /// Context-free conversion of an already admitted internal primitive.
+    /// The caller retains/releases the input edge; numeric decoding allocates
+    /// no arena value, and string parsing is shared with the public boundary.
+    pub(crate) fn typed_array_convert_primitive_element_jsvalue(
+        &self,
+        element: TypedArrayElementKind,
+        value: &JsValue,
+    ) -> Result<[u8; 8], RuntimeError> {
+        if element.is_bigint() {
+            let bigint = match value {
+                JsValue::ShortBigInt(value) => crate::engine::value::bigint::JsBigInt::from(*value),
+                JsValue::BigInt(id) => self.0.state.borrow().heap.bigint(*id)?.clone(),
+                JsValue::Bool(value) => {
+                    crate::engine::value::bigint::JsBigInt::from(i64::from(*value))
+                }
+                JsValue::String(id) => {
+                    let string = self.0.state.borrow().heap.string(*id)?.clone();
+                    typed_array_parse_primitive_bigint(&string)?
+                }
+                _ => {
+                    return Err(RuntimeError::Engine(Error::new(
+                        ErrorKind::Type,
+                        "cannot convert to bigint",
+                    )));
+                }
+            };
+            return typed_array_encode_bigint(&bigint);
+        }
+        if matches!(value, JsValue::Object(_)) {
+            return Err(RuntimeError::Engine(Error::new(
+                ErrorKind::Internal,
+                "object ToPrimitive requires an execution context",
+            )));
+        }
+        let number =
+            crate::engine::vm::to_number_jsvalue(self, value).map_err(RuntimeError::Engine)?;
         Ok(typed_array_encode_number(element, number))
     }
 
@@ -1428,7 +1456,7 @@ impl Runtime {
         heap: &mut crate::engine::heap::Heap,
         object: ObjectId,
         index: u32,
-    ) -> Option<Value> {
+    ) -> Option<JsValue> {
         let data = heap.object(object).ok()?;
         let snapshot = typed_array_snapshot_from_payload(&data.payload)?;
         if snapshot.element.is_bigint() {
@@ -1439,23 +1467,23 @@ impl Runtime {
         else {
             return None;
         };
-        Some(typed_array_decode(snapshot.element, bytes))
+        Some(typed_array_decode_number_jsvalue(snapshot.element, bytes))
     }
 
     /// Resident VM leaf: every decline precedes the only byte write. The
     /// owning input may be dropped after success without running heap cleanup.
     pub(crate) fn try_typed_array_number_write(
         &self,
-        base: &Value,
+        base: &JsValue,
         index: u32,
         number: f64,
     ) -> bool {
         use crate::engine::heap::SlotReleaseReadiness;
-        let Value::Object(object) = base else {
+        let JsValue::Object(object) = base else {
             return false;
         };
         if !matches!(
-            self.slot_value_release_readiness(base),
+            self.slot_value_release_readiness_jsvalue(base),
             Ok(SlotReleaseReadiness::Ready)
         ) {
             return false;
@@ -1463,7 +1491,7 @@ impl Runtime {
         let Ok(mut state) = self.0.state.try_borrow_mut() else {
             return false;
         };
-        let Ok(data) = state.heap.object(object.object_id()) else {
+        let Ok(data) = state.heap.object(*object) else {
             return false;
         };
         let Some(snapshot) = typed_array_snapshot_from_payload(&data.payload) else {
@@ -1481,23 +1509,6 @@ impl Runtime {
                 Some(&bytes)
             ),
             Ok(OrdinaryTypedWord::Word(_))
-        )
-    }
-
-    pub(crate) fn typed_array_set_index(
-        &self,
-        realm: ContextId,
-        object: &ObjectRef,
-        index: u64,
-        value: &Value,
-    ) -> Result<NativeConversion<()>, RuntimeError> {
-        Ok(
-            match write::TypedWriteStep::set(self, object.clone(), Some(index), value.clone())?
-                .finish_sync(self, realm)?
-            {
-                NativeConversion::Value(_) => NativeConversion::Value(()),
-                NativeConversion::Throw(value) => NativeConversion::Throw(value),
-            },
         )
     }
 
@@ -1659,40 +1670,69 @@ fn typed_array_encode_number(element: TypedArrayElementKind, number: f64) -> [u8
 }
 
 fn typed_array_decode(element: TypedArrayElementKind, bytes: [u8; 8]) -> Value {
+    use crate::engine::value::number::operations::Number;
     match element {
-        TypedArrayElementKind::Uint8Clamped | TypedArrayElementKind::Uint8 => {
-            Value::Int(i32::from(bytes[0]))
-        }
-        TypedArrayElementKind::Int8 => Value::Int(i32::from(bytes[0] as i8)),
-        TypedArrayElementKind::Int16 => {
-            Value::Int(i32::from(i16::from_ne_bytes([bytes[0], bytes[1]])))
-        }
-        TypedArrayElementKind::Uint16 => {
-            Value::Int(i32::from(u16::from_ne_bytes([bytes[0], bytes[1]])))
-        }
-        TypedArrayElementKind::Int32 => {
-            Value::Int(i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        }
-        TypedArrayElementKind::Uint32 => Runtime::array_length_value(u32::from_ne_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-        ])),
         TypedArrayElementKind::BigInt64 => Value::BigInt(
             crate::engine::value::bigint::JsBigInt::from(i64::from_ne_bytes(bytes)),
         ),
         TypedArrayElementKind::BigUint64 => Value::BigInt(
             crate::engine::value::bigint::JsBigInt::from(u64::from_ne_bytes(bytes)),
         ),
+        _ => match typed_array_decode_number(element, bytes) {
+            Number::Int(value) => Value::Int(value),
+            Number::Float(value) => Value::Float(value),
+        },
+    }
+}
+
+#[inline]
+fn typed_array_decode_number_jsvalue(element: TypedArrayElementKind, bytes: [u8; 8]) -> JsValue {
+    use crate::engine::value::number::operations::Number;
+    match typed_array_decode_number(element, bytes) {
+        Number::Int(value) => JsValue::Int(value),
+        Number::Float(value) => JsValue::Float(value),
+    }
+}
+
+#[inline]
+fn typed_array_decode_number(
+    element: TypedArrayElementKind,
+    bytes: [u8; 8],
+) -> crate::engine::value::number::operations::Number {
+    use crate::engine::value::number::operations::Number;
+    match element {
+        TypedArrayElementKind::Uint8Clamped | TypedArrayElementKind::Uint8 => {
+            Number::Int(i32::from(bytes[0]))
+        }
+        TypedArrayElementKind::Int8 => Number::Int(i32::from(bytes[0] as i8)),
+        TypedArrayElementKind::Int16 => {
+            Number::Int(i32::from(i16::from_ne_bytes([bytes[0], bytes[1]])))
+        }
+        TypedArrayElementKind::Uint16 => {
+            Number::Int(i32::from(u16::from_ne_bytes([bytes[0], bytes[1]])))
+        }
+        TypedArrayElementKind::Int32 => {
+            Number::Int(i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        TypedArrayElementKind::Uint32 => Number::compact(f64::from(u32::from_ne_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        TypedArrayElementKind::BigInt64 | TypedArrayElementKind::BigUint64 => {
+            unreachable!("BigInt TypedArray values use the BigInt decoder")
+        }
         TypedArrayElementKind::Float16 => {
-            Value::number(crate::engine::value::number::from_float16_bits(
+            Number::compact(crate::engine::value::number::from_float16_bits(
                 u16::from_ne_bytes([bytes[0], bytes[1]]),
             ))
         }
         TypedArrayElementKind::Float32 => {
-            Value::number(f64::from(f32::from_bits(u32::from_ne_bytes([
+            Number::compact(f64::from(f32::from_bits(u32::from_ne_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3],
             ]))))
         }
-        TypedArrayElementKind::Float64 => Value::number(f64::from_bits(u64::from_ne_bytes(bytes))),
+        TypedArrayElementKind::Float64 => {
+            Number::compact(f64::from_bits(u64::from_ne_bytes(bytes)))
+        }
     }
 }
 
@@ -1716,3 +1756,24 @@ fn typed_array_to_uint8_clamp(number: f64) -> u8 {
 pub(crate) use sort::{TypedSortResume, TypedSortStep};
 
 pub(crate) use uint8_codec::{Uint8CodecResume, Uint8CodecStep};
+
+fn typed_array_parse_primitive_bigint(
+    value: &JsString,
+) -> Result<crate::engine::value::bigint::JsBigInt, RuntimeError> {
+    let units = value.utf16_units().collect::<Vec<_>>();
+    let source = String::from_utf16(&units).map_err(|_| {
+        RuntimeError::Engine(Error::new(ErrorKind::Syntax, "invalid bigint literal"))
+    })?;
+    crate::engine::value::bigint::JsBigInt::parse_js_string(&source).map_err(|error| {
+        let kind = match error {
+            crate::engine::value::bigint::BigIntError::InvalidSyntax => ErrorKind::Syntax,
+            crate::engine::value::bigint::BigIntError::InvalidRadix(_)
+            | crate::engine::value::bigint::BigIntError::BigIntTooLarge
+            | crate::engine::value::bigint::BigIntError::AllocationTooLarge
+            | crate::engine::value::bigint::BigIntError::DivisionByZero
+            | crate::engine::value::bigint::BigIntError::NegativeExponent
+            | crate::engine::value::bigint::BigIntError::ShiftTooLarge => ErrorKind::Range,
+        };
+        RuntimeError::Engine(Error::new(kind, error.to_string()))
+    })
+}

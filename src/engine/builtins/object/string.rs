@@ -4,8 +4,8 @@ use crate::engine::builtins::native::NativeFunctionId;
 use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
-    object::{PropertyKey, WellKnownSymbol},
-    value::{JsString, Value, conversion::NativeConversion},
+    object::{ObjectRef, PropertyKey, WellKnownSymbol},
+    value::{JsString, JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion,
         call::{DirectCallTarget, NativeInvocation},
@@ -44,22 +44,37 @@ impl std::ops::DerefMut for ObjectStringResume {
 }
 const _: () = assert!(std::mem::size_of::<ObjectStringResume>() <= 8);
 pub(crate) struct ObjectStringResumeState {
+    runtime: Runtime,
     pending_effect: ObjectStringStepPending,
     realm: ContextId,
-    receiver: Value,
+    receiver: JsValue,
     phase: Phase,
+}
+impl Drop for ObjectStringResumeState {
+    /// Release the internal edges still owned when the request is abandoned.
+    /// Drained fields are `None`/`Undefined` here; releases are defer-safe.
+    fn drop(&mut self) {
+        if let Some(value) = self.pending_effect.read_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.pending_effect.call_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        let receiver = std::mem::replace(&mut self.receiver, JsValue::Undefined);
+        let _ = self.runtime.release_jsvalue(receiver);
+    }
 }
 enum Phase {
     Tag(JsString),
     LocaleMethod,
     LocaleResult,
 }
-fn tag_string(tag: JsString) -> Result<ObjectStringStep, RuntimeError> {
+fn tag_string(runtime: &Runtime, tag: JsString) -> Result<ObjectStringStep, RuntimeError> {
     let value = JsString::from_static("[object ")
         .try_concat(&tag)?
         .try_concat(&JsString::from_static("]"))?;
     Ok(ObjectStringStep::Complete(Completion::Return(
-        Value::String(value),
+        runtime.unroot_value(&Value::String(value))?,
     )))
 }
 impl ObjectStringStep {
@@ -74,14 +89,17 @@ impl ObjectStringStep {
                 "Object string conversion did not receive a call",
             ));
         };
+        let this_value = runtime.dup_jsvalue(this_value)?;
         match kind {
             ObjectStringKind::Tag => {
                 match this_value {
-                    Value::Undefined => return tag_string(JsString::from_static("Undefined")),
-                    Value::Null => return tag_string(JsString::from_static("Null")),
+                    JsValue::Undefined => {
+                        return tag_string(runtime, JsString::from_static("Undefined"));
+                    }
+                    JsValue::Null => return tag_string(runtime, JsString::from_static("Null")),
                     _ => {}
                 }
-                let object = match runtime.native_to_object(realm, this_value.clone())? {
+                let object = match runtime.native_to_object_jsvalue(realm, this_value)? {
                     NativeConversion::Value(object) => object,
                     NativeConversion::Throw(value) => {
                         return Ok(Self::Complete(Completion::Throw(value)));
@@ -93,11 +111,12 @@ impl ObjectStringStep {
                         return Ok(Self::Complete(Completion::Throw(value)));
                     }
                 };
-                let receiver = Value::Object(object);
+                let receiver = runtime.into_jsvalue(Value::Object(object))?;
                 Ok(Self::request_read(
-                    receiver.clone(),
+                    runtime.dup_jsvalue(&receiver)?,
                     PropertyKey::from(runtime.well_known_symbol(WellKnownSymbol::ToStringTag)),
                     ObjectStringResume(Box::new(ObjectStringResumeState {
+                        runtime: runtime.clone(),
                         pending_effect: ObjectStringStepPending::default(),
                         realm,
                         receiver,
@@ -106,24 +125,26 @@ impl ObjectStringStep {
                 ))
             }
             ObjectStringKind::Locale => {
-                if matches!(this_value, Value::Null | Value::Undefined) {
-                    let message = if matches!(this_value, Value::Null) {
+                if matches!(this_value, JsValue::Null | JsValue::Undefined) {
+                    let message = if matches!(this_value, JsValue::Null) {
                         "cannot read property 'toString' of null"
                     } else {
                         "cannot read property 'toString' of undefined"
                     };
                     return Ok(Self::Complete(Completion::Throw(
-                        runtime.new_native_error(realm, NativeErrorKind::Type, message)?,
+                        runtime.new_native_error_jsvalue(realm, NativeErrorKind::Type, message)?,
                     )));
                 }
+                let seen = runtime.dup_jsvalue(&this_value)?;
                 Ok(Self::request_read(
-                    this_value.clone(),
+                    seen,
                     runtime
                         .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::ToString)?,
                     ObjectStringResume(Box::new(ObjectStringResumeState {
+                        runtime: runtime.clone(),
                         pending_effect: ObjectStringStepPending::default(),
                         realm,
-                        receiver: this_value.clone(),
+                        receiver: this_value,
                         phase: Phase::LocaleMethod,
                     })),
                 ))
@@ -143,20 +164,35 @@ impl ObjectStringResume {
                 return Ok(ObjectStringStep::Complete(Completion::Throw(value)));
             }
         };
-        match self.0.phase {
-            Phase::Tag(default_tag) => tag_string(match value {
-                Value::String(tag) => tag,
-                _ => default_tag,
-            }),
+        match std::mem::replace(&mut self.0.phase, Phase::LocaleResult) {
+            Phase::Tag(default_tag) => {
+                let tag = match &value {
+                    JsValue::String(id) => runtime
+                        .0
+                        .state
+                        .borrow()
+                        .heap
+                        .string(*id)
+                        .cloned()
+                        .map_err(RuntimeError::from),
+                    _ => Ok(default_tag),
+                };
+                runtime.release_jsvalue(value)?;
+                tag_string(runtime, tag?)
+            }
             Phase::LocaleResult => Ok(ObjectStringStep::Complete(Completion::Return(value))),
             Phase::LocaleMethod => {
-                let callable = match value {
-                    Value::Object(object) => runtime.as_callable(&object)?,
-                    _ => None,
-                };
+                let callable = (|| match &value {
+                    JsValue::Object(id) => {
+                        runtime.as_callable(&ObjectRef::from_borrowed_handle(runtime.clone(), *id)?)
+                    }
+                    _ => Ok(None),
+                })();
+                runtime.release_jsvalue(value)?;
+                let callable = callable?;
                 let Some(callable) = callable else {
                     return Ok(ObjectStringStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             "not a function",
@@ -165,12 +201,8 @@ impl ObjectStringResume {
                 };
                 Ok(ObjectStringStep::request_call(
                     DirectCallTarget::Callable(callable),
-                    self.0.receiver.clone(),
-                    {
-                        let updated_0 = Phase::LocaleResult;
-                        self.0.phase = updated_0;
-                        self
-                    },
+                    runtime.dup_jsvalue(&self.0.receiver)?,
+                    self,
                 ))
             }
         }
@@ -189,7 +221,7 @@ pub(super) fn finish(
                 let key = resume.take_read_key();
                 resume.resume(
                     runtime,
-                    runtime.get_value_property_in_realm(realm, receiver, &key)?,
+                    runtime.get_value_property_in_realm_jsvalue(realm, receiver, &key)?,
                 )?
             }
             ObjectStringStep::Call { mut resume } => {
@@ -198,10 +230,10 @@ pub(super) fn finish(
                 {
                     let result = match target {
                         DirectCallTarget::Callable(callable) => {
-                            runtime.call_internal(realm, &callable, receiver, &[])?
+                            runtime.call_internal_jsvalue(realm, &callable, receiver, Vec::new())?
                         }
                         DirectCallTarget::NonCallableProxy(proxy) => {
-                            runtime.call_proxy(realm, &proxy, receiver, &[])?
+                            runtime.call_proxy_jsvalue(realm, &proxy, receiver, Vec::new())?
                         }
                     };
                     resume.resume(runtime, result)?
@@ -213,14 +245,14 @@ pub(super) fn finish(
 
 #[derive(Default)]
 struct ObjectStringStepPending {
-    read_receiver: Option<Value>,
+    read_receiver: Option<JsValue>,
     read_key: Option<PropertyKey>,
     call_target: Option<DirectCallTarget>,
-    call_receiver: Option<Value>,
+    call_receiver: Option<JsValue>,
 }
 impl ObjectStringStep {
     pub(crate) fn request_read(
-        receiver: Value,
+        receiver: JsValue,
         key: PropertyKey,
         mut resume: ObjectStringResume,
     ) -> Self {
@@ -230,7 +262,7 @@ impl ObjectStringStep {
     }
     pub(crate) fn request_call(
         target: DirectCallTarget,
-        receiver: Value,
+        receiver: JsValue,
         mut resume: ObjectStringResume,
     ) -> Self {
         resume.0.pending_effect.call_target = Some(target);
@@ -239,7 +271,7 @@ impl ObjectStringStep {
     }
 }
 impl ObjectStringResume {
-    pub(crate) fn take_read_receiver(&mut self) -> Value {
+    pub(crate) fn take_read_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .read_receiver
@@ -260,7 +292,7 @@ impl ObjectStringResume {
             .take()
             .expect("ObjectStringStep Call target")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver

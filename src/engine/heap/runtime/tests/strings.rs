@@ -26,7 +26,7 @@ fn string_wrapper_exotic_indices_length_define_delete_and_order_match_quickjs() 
             .object(string_prototype.object_id())
             .unwrap()
             .payload,
-        ObjectPayload::Primitive(PrimitiveObjectData::String(value)) if value.is_empty()
+        ObjectPayload::Primitive(PrimitiveObjectData::String(value)) if runtime.0.state.borrow().heap.string(*value).unwrap().is_empty()
     ));
     assert_eq!(
         own_key_names(&runtime, &string_prototype),
@@ -113,7 +113,7 @@ fn string_wrapper_exotic_indices_length_define_delete_and_order_match_quickjs() 
             .object(wrapper.object_id())
             .unwrap()
             .payload,
-        ObjectPayload::Primitive(PrimitiveObjectData::String(value)) if value == &payload
+        ObjectPayload::Primitive(PrimitiveObjectData::String(value)) if runtime.0.state.borrow().heap.string(*value).unwrap() == &payload
     ));
     assert_eq!(
         runtime.get_prototype_of(&wrapper).unwrap(),
@@ -798,15 +798,19 @@ fn string_conversion_core_brand_lookup_object_routes_and_overrides_match_quickjs
             )
             .unwrap()
     );
+    let completion = runtime
+        .to_primitive(
+            context.realm,
+            Value::Object(conversion_wrapper.clone()),
+            ToPrimitiveHint::String,
+        )
+        .unwrap();
+    let Completion::Return(value) = completion else {
+        panic!("expected return completion");
+    };
     assert_eq!(
-        runtime
-            .to_primitive(
-                context.realm,
-                Value::Object(conversion_wrapper.clone()),
-                ToPrimitiveHint::String,
-            )
-            .unwrap(),
-        Completion::Return(Value::String(JsString::from_static("override")))
+        runtime.root_and_release_jsvalue(value).unwrap(),
+        Value::String(JsString::from_static("override"))
     );
     assert_eq!(
         context

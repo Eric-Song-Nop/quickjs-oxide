@@ -16,7 +16,7 @@ pub(super) enum Entry {
     General,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "profiling"))]
 pub(super) fn enter(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -59,11 +59,12 @@ pub(super) fn enter_selected(
         if !transaction.validate_call_value_domains(runtime, count, method)? {
             return Ok(Entry::General);
         }
+        let linked = transaction.peek(count)?;
         let Some((callable, selected)) =
             crate::engine::vm::frames::NativeClassification::promote_linked(
-                selected,
-                transaction.peek(count)?,
+                runtime, selected, linked,
             )
+            .map_err(runtime_error_to_vm_error)?
         else {
             return Ok(Entry::General);
         };
@@ -73,7 +74,8 @@ pub(super) fn enter_selected(
         );
         Prepared::Native(callable, selected)
     } else {
-        let selection_result = DirectSelection::select(runtime, transaction.peek(count)?);
+        let callable_value = transaction.peek(count)?;
+        let selection_result = DirectSelection::select_jsvalue(runtime, callable_value);
         if matches!(selection_result, Ok(DirectSelection::General)) {
             return Ok(Entry::General);
         }
@@ -89,7 +91,8 @@ pub(super) fn enter_selected(
             ),
             DirectSelection::Native(native) => {
                 let (callable, selected) =
-                    crate::engine::vm::frames::NativeClassification::promote_selected(native);
+                    crate::engine::vm::frames::NativeClassification::promote_selected(native)
+                        .map_err(runtime_error_to_vm_error)?;
                 Prepared::Native(callable, selected)
             }
             DirectSelection::General => return Ok(Entry::General),
@@ -112,7 +115,7 @@ pub(super) fn enter_selected(
             let minimum = selected.minimum();
             let operation = selected.take_operation();
             let (arguments, receiver) =
-                transaction.take_native_call_operands(logical_depth, count, method)?;
+                transaction.take_native_call_operands(runtime, logical_depth, count, method)?;
             drop(transaction);
             if !execution.frames.can_push_with_continuations(0)
                 || runtime.host_stack_would_overflow()
@@ -166,8 +169,8 @@ pub(super) fn enter_selected(
 fn native_observes_activation(
     runtime: &Runtime,
     target: crate::engine::builtins::native::NativeFunctionId,
-    receiver: &crate::engine::value::Value,
-    arguments: &[crate::engine::value::Value],
+    receiver: &crate::engine::value::JsValue,
+    arguments: &[crate::engine::value::JsValue],
 ) -> bool {
     use crate::engine::{
         builtins::native::{
@@ -175,7 +178,7 @@ fn native_observes_activation(
             WeakSetNativeKind as WS,
         },
         heap::ObjectPayload,
-        value::Value,
+        value::JsValue,
     };
     if matches!(target, N::NumberPredicate(_)) {
         return false;
@@ -192,15 +195,19 @@ fn native_observes_activation(
         return arguments.iter().any(|value| {
             !matches!(
                 value,
-                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null | Value::Undefined
+                JsValue::Int(_)
+                    | JsValue::Float(_)
+                    | JsValue::Bool(_)
+                    | JsValue::Null
+                    | JsValue::Undefined
             )
         });
     }
-    let Value::Object(object) = receiver else {
+    let JsValue::Object(object) = receiver else {
         return true;
     };
     let state = runtime.0.state.borrow();
-    let Ok(object) = state.heap.object(object.object_id()) else {
+    let Ok(object) = state.heap.object(*object) else {
         return true;
     };
     !match (target, &object.payload) {
@@ -210,11 +217,11 @@ fn native_observes_activation(
         (N::Set(S::Add | S::Has | S::Delete | S::Clear), ObjectPayload::Set { .. }) => true,
         (N::WeakMap(W::Get | W::Has | W::Delete), ObjectPayload::WeakMap { .. }) => true,
         (N::WeakMap(W::Set), ObjectPayload::WeakMap { .. }) => {
-            matches!(arguments.first(), Some(Value::Object(_)))
+            matches!(arguments.first(), Some(JsValue::Object(_)))
         }
         (N::WeakSet(WS::Has | WS::Delete), ObjectPayload::WeakSet { .. }) => true,
         (N::WeakSet(WS::Add), ObjectPayload::WeakSet { .. }) => {
-            matches!(arguments.first(), Some(Value::Object(_)))
+            matches!(arguments.first(), Some(JsValue::Object(_)))
         }
         _ => false,
     }
@@ -244,7 +251,7 @@ pub(super) fn finish(
     let value = execution.pending.take().unwrap();
     let mut frame = execution.frames.pop(id)?;
     let guard = frame.cold.entry_guard.take();
-    execution.slots.clear_frame(frame.window.take())?;
+    execution.slots.clear_frame(runtime, frame.window.take())?;
     if let Some(guard) = guard {
         guard.finish().map_err(runtime_error_to_vm_error)?;
     }
@@ -316,7 +323,7 @@ mod layout_tests {
         let mut context = runtime.new_context();
         // Resolve the lazy builtin once; the selected own-data path must be
         // exercised, while first-access autoinit keeps its canonical fallback.
-        context.eval("Math.min").unwrap();
+        drop(context.eval("Math.min").unwrap());
         let profile = CostProfile::start();
         assert_eq!(
             context

@@ -110,17 +110,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::finish(
-            self,
-            realm,
-            operation::ErrorStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::finish(
                 self,
                 realm,
-                operation::ErrorKind::Constructor(kind),
-                &invocation,
-                arguments,
-            )?,
-        )
+                operation::ErrorStep::start(
+                    self,
+                    realm,
+                    operation::ErrorKind::Constructor(kind),
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     /// Pinned QuickJS's internal `Promise.any` AggregateError path: retain the
@@ -151,21 +153,23 @@ impl Runtime {
         realm: ContextId,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        let arguments = NativeArguments {
-            readable: Vec::new(),
-            actual_arg_count: 0,
-        };
-        operation::finish(
-            self,
-            realm,
-            operation::ErrorStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            let arguments = NativeArguments {
+                readable: Vec::new(),
+                actual_arg_count: 0,
+            };
+            operation::finish(
                 self,
                 realm,
-                operation::ErrorKind::ToString,
-                &invocation,
-                &arguments,
-            )?,
-        )
+                operation::ErrorStep::start(
+                    self,
+                    realm,
+                    operation::ErrorKind::ToString,
+                    invocation,
+                    &arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_error_is_error(
@@ -176,16 +180,22 @@ impl Runtime {
             "Error.isError readable argv was not padded to length one",
         ))?;
         let is_error = match value {
-            Value::Object(object) => self.is_error_object(object)?,
-            Value::Undefined
-            | Value::Null
-            | Value::Bool(_)
-            | Value::Int(_)
-            | Value::Float(_)
-            | Value::BigInt(_)
-            | Value::String(_)
-            | Value::Symbol(_) => false,
+            crate::engine::value::JsValue::Object(id) => {
+                let object = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
+                self.is_error_object(&object)?
+            }
+            crate::engine::value::JsValue::Undefined
+            | crate::engine::value::JsValue::Null
+            | crate::engine::value::JsValue::Bool(_)
+            | crate::engine::value::JsValue::Int(_)
+            | crate::engine::value::JsValue::Float(_)
+            | crate::engine::value::JsValue::BigInt(_)
+            | crate::engine::value::JsValue::ShortBigInt(_)
+            | crate::engine::value::JsValue::String(_)
+            | crate::engine::value::JsValue::Symbol(_) => false,
         };
-        Ok(Completion::Return(Value::Bool(is_error)))
+        Ok(Completion::Return(crate::engine::value::JsValue::Bool(
+            is_error,
+        )))
     }
 }

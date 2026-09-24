@@ -1578,8 +1578,10 @@ fn scoped_typed_words_keep_only_view_root_and_conversion_error_realm() {
         runtime.typed_array_read_index(&view, 0).unwrap(),
         Some(Value::Int(41))
     );
-    let symbol = second.eval("Symbol()").unwrap();
-    let NativeConversion::Throw(Value::Object(error)) =
+    let symbol = runtime
+        .into_jsvalue(second.eval("Symbol()").unwrap())
+        .unwrap();
+    let NativeConversion::Throw(JsValue::Object(error)) =
         write::TypedWriteStep::set_primitive_result(
             &runtime,
             second.realm,
@@ -1591,6 +1593,7 @@ fn scoped_typed_words_keep_only_view_root_and_conversion_error_realm() {
     else {
         panic!("expected conversion error")
     };
+    let error = ObjectRef::from_owned_handle(runtime.clone(), error);
     let Value::Object(expected) = second.eval("TypeError.prototype").unwrap() else {
         panic!("expected prototype")
     };
@@ -1605,7 +1608,7 @@ fn scoped_typed_words_keep_only_view_root_and_conversion_error_realm() {
         Err(RuntimeError::WrongRuntime(_))
     ));
     drop(error);
-    drop(symbol);
+    runtime.release_jsvalue(symbol).unwrap();
     drop(view);
     runtime.run_gc().unwrap();
     for id in [view_id, buffer_id] {
@@ -1615,4 +1618,67 @@ fn scoped_typed_words_keep_only_view_root_and_conversion_error_realm() {
     drop(second);
     drop(runtime);
     assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn internal_numeric_decode_preserves_integer_boundary_and_float_payloads() {
+    use crate::engine::value::number::operations::Number;
+    fn word<const N: usize>(bytes: [u8; N]) -> [u8; 8] {
+        let mut word = [0; 8];
+        word[..N].copy_from_slice(&bytes);
+        word
+    }
+    let cases = [
+        (
+            TypedArrayElementKind::Uint32,
+            word(0x7fff_ffff_u32.to_ne_bytes()),
+            Number::Int(i32::MAX),
+        ),
+        (
+            TypedArrayElementKind::Uint32,
+            word(u32::MAX.to_ne_bytes()),
+            Number::Float(f64::from(u32::MAX)),
+        ),
+        (
+            TypedArrayElementKind::Float16,
+            word(0x8000_u16.to_ne_bytes()),
+            Number::Float(-0.0),
+        ),
+        (
+            TypedArrayElementKind::Float32,
+            word((-0.0_f32).to_ne_bytes()),
+            Number::Float(-0.0),
+        ),
+        (
+            TypedArrayElementKind::Float64,
+            (-0.0_f64).to_ne_bytes(),
+            Number::Float(-0.0),
+        ),
+        (
+            TypedArrayElementKind::Float64,
+            7.0_f64.to_ne_bytes(),
+            Number::Int(7),
+        ),
+        (
+            TypedArrayElementKind::Float64,
+            f64::INFINITY.to_ne_bytes(),
+            Number::Float(f64::INFINITY),
+        ),
+        (
+            TypedArrayElementKind::Float64,
+            0x7ff8_0000_0000_0042_u64.to_ne_bytes(),
+            Number::Float(f64::from_bits(0x7ff8_0000_0000_0042)),
+        ),
+    ];
+    for (kind, bytes, expected) in cases {
+        match (typed_array_decode_number_jsvalue(kind, bytes), expected) {
+            (JsValue::Int(actual), Number::Int(expected)) => assert_eq!(actual, expected),
+            (JsValue::Float(actual), Number::Float(expected)) => {
+                assert_eq!(actual.to_bits(), expected.to_bits())
+            }
+            (actual, expected) => {
+                panic!("{kind:?} lost numeric representation: {actual:?}, expected {expected:?}")
+            }
+        }
+    }
 }

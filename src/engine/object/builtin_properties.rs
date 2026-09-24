@@ -4,6 +4,7 @@ use super::ObjectRef;
 use super::shape::{PropertyFlags, PropertyStorageKind, ShapeEntry};
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
+use crate::engine::atom::AtomIdx;
 use crate::engine::builtins::native::NativeFunctionId;
 use crate::engine::heap::{AutoInitProperty, ContextId, HeapError, ObjectPayload, PropertySlot};
 use std::collections::HashSet;
@@ -84,7 +85,7 @@ impl Runtime {
             for (key, method) in &properties {
                 if method.flags.storage != PropertyStorageKind::Data
                     || state.atoms.array_index(key.atom())?.is_some()
-                    || shape.find(key.atom()).is_some()
+                    || shape.find(AtomIdx::from_raw(key.atom().raw())).is_some()
                     || !seen.insert(key.atom())
                 {
                     return Err(RuntimeError::Invariant(
@@ -110,7 +111,7 @@ impl Runtime {
             })?;
         for (key, method) in &properties {
             entries.push(ShapeEntry {
-                atom: key.atom(),
+                atom: AtomIdx::from_raw(key.atom().raw()),
                 flags: method.flags,
             });
             slots.push(PropertySlot::AutoInit(AutoInitProperty::NativeBuiltin {

@@ -8,10 +8,10 @@ use crate::engine::{
     },
     heap::ContextId,
     object::{
-        CallableRef, DescriptorField, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey,
-        WellKnownSymbol, operations::InternalDefineResult,
+        CallableRef, ObjectRef, OwnedPropertyDescriptor, PropertyKey, WellKnownSymbol,
+        operations::InternalDefineResult,
     },
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
@@ -75,28 +75,62 @@ impl std::ops::DerefMut for IterationResume {
 }
 const _: () = assert!(std::mem::size_of::<IterationResume>() <= 8);
 pub(crate) struct IterationResumeState {
+    runtime: Runtime,
     pending_effect: IterationStepPending,
     realm: ContextId,
     kind: IterationKind,
     result: Option<ObjectRef>,
     callback: Option<CallableRef>,
     iterator: Option<ObjectRef>,
-    next: Value,
+    next: JsValue,
+    held: Option<JsValue>,
     index: u64,
     limit: u64,
     phase: Phase,
 }
+impl Drop for IterationResumeState {
+    /// Release the internal edges the pending effect still owns when the
+    /// request is abandoned. Consumption goes through `Option::take`, so a
+    /// drained field is `None` here; releases are defer-safe and nothrow.
+    fn drop(&mut self) {
+        let next = std::mem::replace(&mut self.next, JsValue::Undefined);
+        let _ = self.runtime.release_jsvalue(next);
+        if let Some(value) = self.held.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.pending_effect.read_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.pending_effect.call_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(values) = self.pending_effect.call_arguments.take() {
+            for value in values {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+        if let Some(value) = self.pending_effect.next_method.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.pending_effect.key_value.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.pending_effect.push_value.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
+}
 enum Phase {
-    IteratorMethod(Value),
+    IteratorMethod,
     Iterator,
     NextMethod,
     Next,
     EntryKey(ObjectRef),
-    EntryValue(Value),
-    Key(Value),
-    Callback(Value),
-    Group(Value, PropertyKey),
-    GroupDefined(Value, ObjectRef),
+    EntryValue,
+    Key,
+    Callback,
+    Group(PropertyKey),
+    GroupDefined(ObjectRef),
     EntryDefined(PropertyKey),
     Push,
 }
@@ -136,12 +170,18 @@ impl IterationStep {
                 "groupBy callback argv was not padded",
             ))?;
             let callback = match value {
-                Value::Object(object) => runtime.as_callable(object)?,
+                JsValue::Object(id) => {
+                    runtime.as_callable(&ObjectRef::from_borrowed_handle(runtime.clone(), *id)?)?
+                }
                 _ => None,
             };
             let Some(callback) = callback else {
                 return Ok(Self::Complete(Completion::Throw(
-                    runtime.new_native_error(realm, NativeErrorKind::Type, "not a function")?,
+                    runtime.new_native_error_jsvalue(
+                        realm,
+                        NativeErrorKind::Type,
+                        "not a function",
+                    )?,
                 )));
             };
             Some(callback)
@@ -153,42 +193,41 @@ impl IterationStep {
         } else {
             None
         };
-        let iterable = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "Object iterator argv was not padded",
-            ))?;
-        if matches!(iterable, Value::Null | Value::Undefined) {
-            let base = if matches!(iterable, Value::Null) {
+        let iterable = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "Object iterator argv was not padded",
+        ))?;
+        if matches!(iterable, JsValue::Null | JsValue::Undefined) {
+            let base = if matches!(iterable, JsValue::Null) {
                 "null"
             } else {
                 "undefined"
             };
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(
+                runtime.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     &format!("cannot read property 'Symbol.iterator' of {base}"),
                 )?,
             )));
         }
+        let resume = IterationResume(Box::new(IterationResumeState {
+            runtime: runtime.clone(),
+            pending_effect: IterationStepPending::default(),
+            realm,
+            kind,
+            result,
+            callback,
+            iterator: None,
+            next: JsValue::Undefined,
+            held: Some(runtime.dup_jsvalue(iterable)?),
+            index: 0,
+            limit,
+            phase: Phase::IteratorMethod,
+        }));
         Ok(Self::request_read(
-            iterable.clone(),
+            runtime.dup_jsvalue(iterable)?,
             PropertyKey::from(runtime.well_known_symbol(WellKnownSymbol::Iterator)),
-            IterationResume(Box::new(IterationResumeState {
-                pending_effect: IterationStepPending::default(),
-                realm,
-                kind,
-                result,
-                callback,
-                iterator: None,
-                next: Value::Undefined,
-                index: 0,
-                limit,
-                phase: Phase::IteratorMethod(iterable),
-            })),
+            resume,
         ))
     }
 }
@@ -204,10 +243,10 @@ impl IterationResume {
             "Object iterator result not allocated",
         ))
     }
-    fn abrupt(self, value: Value) -> IterationStep {
+    fn abrupt(mut self, value: JsValue) -> IterationStep {
         let close = matches!(self.0.kind, IterationKind::Entries)
-            || matches!(self.0.phase, Phase::Callback(_) | Phase::Key(_));
-        if close && let Some(iterator) = self.0.iterator {
+            || matches!(self.0.phase, Phase::Callback | Phase::Key);
+        if close && let Some(iterator) = self.0.iterator.take() {
             IterationStep::Close {
                 iterator,
                 completion: Completion::Throw(value),
@@ -220,7 +259,7 @@ impl IterationResume {
         if !matches!(self.0.kind, IterationKind::Entries) && self.0.index >= self.0.limit {
             return Ok(IterationStep::Close {
                 iterator: self.iterator()?,
-                completion: Completion::Throw(runtime.new_native_error(
+                completion: Completion::Throw(runtime.new_native_error_jsvalue(
                     self.0.realm,
                     NativeErrorKind::Type,
                     "too many elements",
@@ -230,7 +269,7 @@ impl IterationResume {
         self.0.phase = Phase::Next;
         Ok(IterationStep::request_next(
             self.iterator()?,
-            self.0.next.clone(),
+            runtime.dup_jsvalue(&self.0.next)?,
             self,
         ))
     }
@@ -245,45 +284,62 @@ impl IterationResume {
             ));
         }
         let value = match reply {
-            ObjectIteratorStep::Throw(value) => return Ok(self.abrupt(value)),
+            ObjectIteratorStep::Throw(value) => {
+                return Ok(self.abrupt(value));
+            }
             ObjectIteratorStep::Done => {
-                return Ok(IterationStep::Complete(Completion::Return(Value::Object(
-                    self.result()?,
-                ))));
+                let result = self.result()?;
+                return Ok(IterationStep::Complete(Completion::Return(
+                    JsValue::Object(result.into_handle()),
+                )));
             }
             ObjectIteratorStep::Yield(value) => value,
         };
         match self.0.kind {
             IterationKind::Entries => {
-                let Value::Object(item) = value else {
-                    let value = runtime.new_native_error(
+                let JsValue::Object(item) = value else {
+                    runtime.release_jsvalue(value)?;
+                    let value = runtime.new_native_error_jsvalue(
                         self.0.realm,
                         NativeErrorKind::Type,
                         "not an object",
                     )?;
                     return Ok(self.abrupt(value));
                 };
+                let item = ObjectRef::from_owned_handle(runtime.clone(), item);
                 self.0.phase = Phase::EntryKey(item.clone());
                 Ok(IterationStep::request_read(
-                    Value::Object(item),
+                    JsValue::Object(item.into_handle()),
                     runtime
                         .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Literal1)?,
                     self,
                 ))
             }
             IterationKind::Group | IterationKind::MapGroup => {
+                self.0.held = Some(value);
                 let callable = self
                     .0
                     .callback
                     .clone()
                     .ok_or(RuntimeError::Invariant("groupBy callback missing"))?;
-                let arguments = vec![value.clone(), Value::number(self.0.index as f64)];
-                self.0.phase = Phase::Callback(value);
+                let receiver =
+                    JsValue::Object(runtime.global_object_for_realm(self.0.realm)?.into_handle());
+                let argument = match runtime.dup_jsvalue(self.0.held.as_ref().expect("group item"))
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        runtime.release_jsvalue(receiver)?;
+                        return Err(error);
+                    }
+                };
+                let arguments = vec![
+                    argument,
+                    crate::engine::value::number::operations::Number::compact(self.0.index as f64)
+                        .into(),
+                ];
+                self.0.phase = Phase::Callback;
                 Ok(IterationStep::request_call(
-                    callable,
-                    Value::Object(runtime.global_object_for_realm(self.0.realm)?),
-                    arguments,
-                    self,
+                    callable, receiver, arguments, self,
                 ))
             }
         }
@@ -299,14 +355,19 @@ impl IterationResume {
         };
         let phase = std::mem::replace(&mut self.0.phase, Phase::Next);
         match phase {
-            Phase::IteratorMethod(iterable) => {
+            Phase::IteratorMethod => {
                 let callable = match value {
-                    Value::Object(ref object) => runtime.as_callable(object)?,
-                    _ => None,
+                    JsValue::Object(id) => {
+                        runtime.as_callable(&ObjectRef::from_owned_handle(runtime.clone(), id))?
+                    }
+                    value => {
+                        runtime.release_jsvalue(value)?;
+                        None
+                    }
                 };
                 let Some(callable) = callable else {
                     return Ok(IterationStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             "value is not iterable",
@@ -314,6 +375,7 @@ impl IterationResume {
                     )));
                 };
                 self.0.phase = Phase::Iterator;
+                let iterable = self.0.held.take().expect("iterator source");
                 Ok(IterationStep::request_call(
                     callable,
                     iterable,
@@ -322,25 +384,30 @@ impl IterationResume {
                 ))
             }
             Phase::Iterator => {
-                let Value::Object(iterator) = value else {
+                let JsValue::Object(id) = value else {
+                    runtime.release_jsvalue(value)?;
                     return Ok(IterationStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             "not an object",
                         )?,
                     )));
                 };
+                let iterator = ObjectRef::from_owned_handle(runtime.clone(), id);
                 self.0.iterator = Some(iterator.clone());
                 self.0.phase = Phase::NextMethod;
+                let key =
+                    runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Next)?;
                 Ok(IterationStep::request_read(
-                    Value::Object(iterator),
-                    runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Next)?,
+                    JsValue::Object(iterator.into_handle()),
+                    key,
                     self,
                 ))
             }
             Phase::NextMethod => {
-                self.0.next = value;
+                let previous = std::mem::replace(&mut self.0.next, value);
+                runtime.release_jsvalue(previous)?;
                 match self.0.kind {
                     IterationKind::Group => self.0.result = Some(runtime.new_object(None)?),
                     IterationKind::MapGroup => {
@@ -351,74 +418,116 @@ impl IterationResume {
                 self.next_step(runtime)
             }
             Phase::EntryKey(item) => {
-                self.0.phase = Phase::EntryValue(value);
+                self.0.held = Some(value);
+                self.0.phase = Phase::EntryValue;
+                let key = runtime
+                    .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Literal2)?;
                 Ok(IterationStep::request_read(
-                    Value::Object(item),
-                    runtime
-                        .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Literal2)?,
+                    JsValue::Object(item.into_handle()),
+                    key,
                     self,
                 ))
             }
-            Phase::EntryValue(key) => {
-                self.0.phase = Phase::Key(value);
+            Phase::EntryValue => {
+                let key = self.0.held.replace(value).expect("entry key");
+                self.0.phase = Phase::Key;
                 Ok(IterationStep::request_key(key, self))
             }
-            Phase::Callback(item) => {
+            Phase::Callback => {
                 if matches!(self.0.kind, IterationKind::MapGroup) {
                     let key = Runtime::normalized_map_key(value);
-                    let groups = self.result()?;
-                    let group = match runtime.find_map_record(&groups, &key)? {
-                        Some((_, value)) => match runtime.root_raw_value(&value)? {
-                            Value::Object(group) => group,
-                            _ => {
-                                return Err(RuntimeError::Invariant(
+                    let groups = match self.result() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            runtime.release_jsvalue(key)?;
+                            return Err(e);
+                        }
+                    };
+                    let found = match runtime.find_map_record(&groups, &key) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            runtime.release_jsvalue(key)?;
+                            return Err(e);
+                        }
+                    };
+                    let group = match found {
+                        Some((_, raw)) => {
+                            let group = match raw {
+                                crate::engine::heap::RawValue::Object(id) => {
+                                    ObjectRef::from_borrowed_handle(runtime.clone(), id)
+                                        .map_err(RuntimeError::from)
+                                }
+                                _ => Err(RuntimeError::Invariant(
                                     "Map.groupBy result contained a non-Array group",
-                                ));
-                            }
-                        },
+                                )),
+                            };
+                            runtime.release_jsvalue(key)?;
+                            group?
+                        }
                         None => {
-                            let group = runtime.new_array(self.0.realm)?;
-                            runtime.set_map_record(&groups, key, Value::Object(group.clone()))?;
+                            let group = match runtime.new_array(self.0.realm) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    runtime.release_jsvalue(key)?;
+                                    return Err(e);
+                                }
+                            };
+                            runtime.set_map_record(
+                                &groups,
+                                key,
+                                JsValue::Object(group.clone().into_handle()),
+                            )?;
                             group
                         }
                     };
                     self.0.phase = Phase::Push;
+                    let item = self.0.held.take().expect("group item");
                     return Ok(IterationStep::request_push(group, item, self));
                 }
-                self.0.phase = Phase::Key(item);
+                self.0.phase = Phase::Key;
                 Ok(IterationStep::request_key(value, self))
             }
-            Phase::Group(item, key) => {
+            Phase::Group(key) => {
                 let group = match value {
-                    Value::Undefined => {
+                    JsValue::Undefined => {
                         let group = runtime.new_array(self.0.realm)?;
-                        self.0.phase = Phase::GroupDefined(item, group.clone());
+                        self.0.phase = Phase::GroupDefined(group.clone());
+                        let result = self.result()?;
                         return Ok(IterationStep::request_define(
-                            self.result()?,
+                            result,
                             key,
-                            descriptor(Value::Object(group)),
+                            OwnedPropertyDescriptor::data(
+                                runtime,
+                                JsValue::Object(group.into_handle()),
+                            ),
                             self,
                         ));
                     }
-                    Value::Object(group) => group,
-                    _ => {
+                    JsValue::Object(id) => ObjectRef::from_owned_handle(runtime.clone(), id),
+                    value => {
+                        runtime.release_jsvalue(value)?;
                         return Err(RuntimeError::Invariant(
                             "Object.groupBy result contained a non-Array group",
                         ));
                     }
                 };
                 self.0.phase = Phase::Push;
+                let item = self.0.held.take().expect("group item");
                 Ok(IterationStep::request_push(group, item, self))
             }
             Phase::Push => {
+                runtime.release_jsvalue(value)?;
                 self.0.index = self.0.index.checked_add(1).ok_or(RuntimeError::Invariant(
                     "Object.groupBy index overflowed Uint64",
                 ))?;
                 self.next_step(runtime)
             }
-            _ => Err(RuntimeError::Invariant(
-                "Object iterator consumer received wrong completion reply",
-            )),
+            _ => {
+                runtime.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant(
+                    "Object iterator consumer received wrong completion reply",
+                ))
+            }
         }
     }
     pub(crate) fn key(
@@ -430,11 +539,13 @@ impl IterationResume {
             Completion::Throw(value) => return Ok(self.abrupt(value)),
             Completion::Return(value) => value,
         };
-        let key = match runtime.property_key_from_primitive(self.0.realm, value)? {
+        let key = match runtime.property_key_from_primitive_jsvalue(self.0.realm, value)? {
             NativeConversion::Value(key) => key,
-            NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(self.abrupt(value));
+            }
         };
-        let Phase::Key(item) = std::mem::replace(&mut self.0.phase, Phase::Next) else {
+        let Phase::Key = std::mem::replace(&mut self.0.phase, Phase::Next) else {
             return Err(RuntimeError::Invariant(
                 "Object iterator key has wrong phase",
             ));
@@ -445,14 +556,14 @@ impl IterationResume {
                 Ok(IterationStep::request_define(
                     self.result()?,
                     key,
-                    descriptor(item),
+                    OwnedPropertyDescriptor::data(runtime, self.0.held.take().expect("entry item")),
                     self,
                 ))
             }
             IterationKind::Group => {
-                self.0.phase = Phase::Group(item, key.clone());
+                self.0.phase = Phase::Group(key.clone());
                 Ok(IterationStep::request_read(
-                    Value::Object(self.result()?),
+                    JsValue::Object(self.result()?.into_handle()),
                     key,
                     self,
                 ))
@@ -468,7 +579,9 @@ impl IterationResume {
         reply: NativeConversion<InternalDefineResult>,
     ) -> Result<IterationStep, RuntimeError> {
         let result = match reply {
-            NativeConversion::Throw(value) => return Ok(self.abrupt(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(self.abrupt(value));
+            }
             NativeConversion::Value(result) => result,
         };
         match std::mem::replace(&mut self.0.phase, Phase::Next) {
@@ -482,28 +595,23 @@ impl IterationResume {
                 }
                 self.next_step(runtime)
             }
-            Phase::GroupDefined(value, group) => {
+            Phase::GroupDefined(group) => {
                 if !matches!(result, InternalDefineResult::Defined) {
                     return Err(RuntimeError::Invariant(
                         "fresh Object.groupBy result rejected a group property",
                     ));
                 }
                 self.0.phase = Phase::Push;
-                Ok(IterationStep::request_push(group, value, self))
+                Ok(IterationStep::request_push(
+                    group,
+                    self.0.held.take().expect("group item"),
+                    self,
+                ))
             }
             _ => Err(RuntimeError::Invariant(
                 "Object iterator definition has wrong phase",
             )),
         }
-    }
-}
-fn descriptor(value: Value) -> OrdinaryPropertyDescriptor {
-    OrdinaryPropertyDescriptor {
-        value: DescriptorField::Present(value),
-        writable: DescriptorField::Present(true),
-        enumerable: DescriptorField::Present(true),
-        configurable: DescriptorField::Present(true),
-        ..OrdinaryPropertyDescriptor::new()
     }
 }
 pub(crate) fn finish(
@@ -529,7 +637,7 @@ pub(crate) fn finish(
                 let key = resume.take_read_key();
                 resume.resume(
                     runtime,
-                    runtime.get_value_property_in_realm(realm, receiver, &key)?,
+                    runtime.get_value_property_in_realm_jsvalue(realm, receiver, &key)?,
                 )?
             }
             IterationStep::Call { mut resume } => {
@@ -538,7 +646,7 @@ pub(crate) fn finish(
                 let arguments = resume.take_call_arguments();
                 resume.resume(
                     runtime,
-                    runtime.call_internal(realm, &callable, receiver, &arguments)?,
+                    runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?,
                 )?
             }
             IterationStep::Next { mut resume } => {
@@ -549,14 +657,14 @@ pub(crate) fn finish(
                     finish_next(
                         runtime,
                         realm,
-                        NextStep::start(runtime, realm, iterator, method)?,
+                        NextStep::start_jsvalue(runtime, realm, iterator, method)?,
                     )?,
                 )?
             }
             IterationStep::Key { mut resume } => {
                 let value = resume.take_key_value();
                 {
-                    let result = runtime.to_primitive(
+                    let result = runtime.to_primitive_jsvalue(
                         realm,
                         value,
                         crate::engine::vm::ToPrimitiveHint::String,
@@ -570,7 +678,7 @@ pub(crate) fn finish(
                 let descriptor = resume.take_define_descriptor();
                 resume.defined(
                     runtime,
-                    runtime.internal_define_own_property(realm, &object, &key, &descriptor)?,
+                    runtime.internal_define_owned_property(realm, &object, &key, descriptor)?,
                 )?
             }
             IterationStep::Push { mut resume } => {
@@ -582,7 +690,7 @@ pub(crate) fn finish(
                         realm,
                         ArrayPushKind::Push,
                         NativeInvocation::Call {
-                            this_value: Value::Object(object),
+                            this_value: runtime.into_jsvalue(Value::Object(object))?,
                         },
                         &NativeArguments {
                             actual_arg_count: 1,
@@ -606,25 +714,29 @@ mod tests {
         let iterable_id = iterable.object_id();
         let arguments = NativeArguments {
             actual_arg_count: 1,
-            readable: vec![Value::Object(iterable)],
+            readable: vec![runtime.into_jsvalue(Value::Object(iterable)).unwrap()],
         };
         let IterationStep::Read { mut resume } = IterationStep::start(
             &runtime,
             context.realm,
             IterationKind::Entries,
             &NativeInvocation::Call {
-                this_value: Value::Undefined,
+                this_value: JsValue::Undefined,
             },
             &arguments,
         )
         .unwrap() else {
             panic!("iterator method read expected")
         };
-        let _ = resume.take_read_receiver();
+        runtime
+            .release_jsvalue(resume.take_read_receiver())
+            .unwrap();
         let _ = resume.take_read_key();
 
         let result_id = resume.result.as_ref().unwrap().object_id();
-        drop(arguments);
+        for value in arguments.readable {
+            runtime.release_jsvalue(value).unwrap();
+        }
         runtime.run_gc().unwrap();
         for id in [iterable_id, result_id] {
             assert!(runtime.0.state.borrow().heap.object(id).is_ok());
@@ -639,23 +751,23 @@ mod tests {
 
 #[derive(Default)]
 struct IterationStepPending {
-    read_receiver: Option<Value>,
+    read_receiver: Option<JsValue>,
     read_key: Option<PropertyKey>,
     call_callable: Option<CallableRef>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
     next_iterator: Option<ObjectRef>,
-    next_method: Option<Value>,
-    key_value: Option<Value>,
+    next_method: Option<JsValue>,
+    key_value: Option<JsValue>,
     define_object: Option<ObjectRef>,
     define_key: Option<PropertyKey>,
-    define_descriptor: Option<OrdinaryPropertyDescriptor>,
+    define_descriptor: Option<OwnedPropertyDescriptor>,
     push_object: Option<ObjectRef>,
-    push_value: Option<Value>,
+    push_value: Option<JsValue>,
 }
 impl IterationStep {
     pub(crate) fn request_read(
-        receiver: Value,
+        receiver: JsValue,
         key: PropertyKey,
         mut resume: IterationResume,
     ) -> Self {
@@ -665,8 +777,8 @@ impl IterationStep {
     }
     pub(crate) fn request_call(
         callable: CallableRef,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: IterationResume,
     ) -> Self {
         resume.0.pending_effect.call_callable = Some(callable);
@@ -676,21 +788,21 @@ impl IterationStep {
     }
     pub(crate) fn request_next(
         iterator: ObjectRef,
-        method: Value,
+        method: JsValue,
         mut resume: IterationResume,
     ) -> Self {
         resume.0.pending_effect.next_iterator = Some(iterator);
         resume.0.pending_effect.next_method = Some(method);
         Self::Next { resume }
     }
-    pub(crate) fn request_key(value: Value, mut resume: IterationResume) -> Self {
+    pub(crate) fn request_key(value: JsValue, mut resume: IterationResume) -> Self {
         resume.0.pending_effect.key_value = Some(value);
         Self::Key { resume }
     }
     pub(crate) fn request_define(
         object: ObjectRef,
         key: PropertyKey,
-        descriptor: OrdinaryPropertyDescriptor,
+        descriptor: OwnedPropertyDescriptor,
         mut resume: IterationResume,
     ) -> Self {
         resume.0.pending_effect.define_object = Some(object);
@@ -700,7 +812,7 @@ impl IterationStep {
     }
     pub(crate) fn request_push(
         object: ObjectRef,
-        value: Value,
+        value: JsValue,
         mut resume: IterationResume,
     ) -> Self {
         resume.0.pending_effect.push_object = Some(object);
@@ -709,7 +821,7 @@ impl IterationStep {
     }
 }
 impl IterationResume {
-    pub(crate) fn take_read_receiver(&mut self) -> Value {
+    pub(crate) fn take_read_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .read_receiver
@@ -730,14 +842,14 @@ impl IterationResume {
             .take()
             .expect("IterationStep Call callable")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver
             .take()
             .expect("IterationStep Call receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .pending_effect
             .call_arguments
@@ -751,14 +863,14 @@ impl IterationResume {
             .take()
             .expect("IterationStep Next iterator")
     }
-    pub(crate) fn take_next_method(&mut self) -> Value {
+    pub(crate) fn take_next_method(&mut self) -> JsValue {
         self.0
             .pending_effect
             .next_method
             .take()
             .expect("IterationStep Next method")
     }
-    pub(crate) fn take_key_value(&mut self) -> Value {
+    pub(crate) fn take_key_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .key_value
@@ -779,7 +891,7 @@ impl IterationResume {
             .take()
             .expect("IterationStep Define key")
     }
-    pub(crate) fn take_define_descriptor(&mut self) -> OrdinaryPropertyDescriptor {
+    pub(crate) fn take_define_descriptor(&mut self) -> OwnedPropertyDescriptor {
         self.0
             .pending_effect
             .define_descriptor
@@ -793,7 +905,7 @@ impl IterationResume {
             .take()
             .expect("IterationStep Push object")
     }
-    pub(crate) fn take_push_value(&mut self) -> Value {
+    pub(crate) fn take_push_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .push_value

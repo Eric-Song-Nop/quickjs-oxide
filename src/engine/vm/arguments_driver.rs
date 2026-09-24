@@ -11,14 +11,14 @@ use crate::engine::code::bytecode::ArgumentsKind;
 use crate::engine::code::function::metadata::{
     ClosureSource, ClosureVariable, ClosureVariableKind, ClosureVariableName,
 };
-use crate::engine::value::Value;
+use crate::engine::value::JsValue;
 
 pub(super) fn arguments(
     runtime: &Runtime,
     execution: &mut RunningExecution,
     id: FrameId,
     kind: ArgumentsKind,
-) -> Result<Value, Error> {
+) -> Result<JsValue, Error> {
     let frame = execution.frames.current_mut(id)?;
     let count = execution.slots.actual_argument_count(&frame.window)?;
     let object = match kind {
@@ -63,7 +63,7 @@ pub(super) fn arguments(
         }
     }
     .map_err(runtime_error_to_vm_error)?;
-    Ok(Value::Object(object))
+    Ok(JsValue::Object(object.into_handle()))
 }
 
 pub(super) fn rest(
@@ -71,15 +71,15 @@ pub(super) fn rest(
     execution: &mut RunningExecution,
     id: FrameId,
     start: u16,
-) -> Result<Value, Error> {
+) -> Result<JsValue, Error> {
     let frame = execution.frames.current_mut(id)?;
     let values =
         execution
             .slots
             .snapshot_argument_tail(&frame.window, runtime, usize::from(start))?;
     runtime
-        .new_array_from_values(frame.executable.realm, values)
-        .map(Value::Object)
+        .new_array_from_values_jsvalue(frame.executable.realm, values)
+        .map(|object| JsValue::Object(object.into_handle()))
         .map_err(runtime_error_to_vm_error)
 }
 
@@ -121,7 +121,7 @@ pub(super) fn step(
             };
             Ok(Some(super::Completion::Throw(
                 runtime
-                    .new_native_error_from_error(realm, kind, &error)
+                    .new_native_error_from_error_jsvalue(realm, kind, &error)
                     .map_err(runtime_error_to_vm_error)?,
             )))
         }

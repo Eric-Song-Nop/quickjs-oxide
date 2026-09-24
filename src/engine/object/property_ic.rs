@@ -3,10 +3,9 @@
 use std::cell::Cell;
 
 use crate::engine::api::{runtime::Runtime, runtime_error::RuntimeError};
-use crate::engine::atom::{Atom, AtomTable};
+use crate::engine::atom::{Atom, AtomIdx, AtomTable};
 use crate::engine::code::bytecode::Instruction;
 use crate::engine::heap::{ContextId, Heap, ObjectId, ObjectKind, PropertySlot, RawValue, ShapeId};
-use crate::engine::value::Value;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Location {
     domain: u64,
@@ -72,6 +71,7 @@ impl PropertyReadCache {
         }
     }
 
+    #[inline(always)]
     fn read_location(
         location: Location,
         heap: &Heap,
@@ -82,14 +82,14 @@ impl PropertyReadCache {
         if location.domain != domain || location.realm != realm {
             return None;
         }
-        let object = heap.object(receiver).ok()?;
+        let object = heap.object_fast(receiver);
         if !ordinary_receiver(object, location.numeric_key) {
             return None;
         }
         if object.shape != location.shape {
             return None;
         }
-        let shape = heap.shape(object.shape).ok()?;
+        let shape = heap.shape_fast(object.shape);
         if shape.layout_revision() != location.revision {
             return None;
         }
@@ -99,16 +99,11 @@ impl PropertyReadCache {
                 return None;
             }
             for _ in 0..location.depth {
-                let data = heap.object(holder).ok()?;
-                holder = heap.shape(data.shape).ok()?.prototype()?;
+                let data = heap.object_fast(holder);
+                holder = heap.shape_fast(data.shape).prototype()?;
             }
         }
-        match heap
-            .object(holder)
-            .ok()?
-            .slots
-            .get(location.slot as usize)?
-        {
+        match heap.object_fast(holder).slots.get(location.slot as usize)? {
             PropertySlot::Data(value) => Some(value),
             // VarRef/AutoInit can share data-shaped storage; never treat them
             // as immutable data, even if an internal slot writer changed kind.
@@ -176,7 +171,7 @@ impl Runtime {
         realm: ContextId,
         handler: ObjectId,
         atom: Atom,
-    ) -> Result<Option<Value>, RuntimeError> {
+    ) -> Result<Option<crate::engine::value::JsValue>, RuntimeError> {
         let raw = {
             let state = self.0.state.borrow();
             let cache = &state.proxy_trap_reads[trap];
@@ -203,14 +198,17 @@ impl Runtime {
                 }
             }
         };
-        // String/BigInt clone their backing owner; Object/Symbol retain their
-        // heap count. The handler slot owner keeps the source alive meanwhile.
+        // Retain the same handle; the handler slot keeps the source alive
+        // until this owned result has acquired its edge.
         let mut state = self.0.state.borrow_mut();
-        state.retain_raw_root(&raw)?;
+        state.retain_raw_root(raw.clone())?;
         drop(state);
         #[cfg(feature = "profiling")]
         crate::engine::api::profiling::record_owned_execution_event("proxy_trap_read.hit");
-        Ok(Some(self.take_owned_raw_value(raw)?))
+        Ok(Some(
+            crate::engine::value::JsValue::from_raw(raw)
+                .expect("cached trap excludes internal sentinels"),
+        ))
     }
 }
 
@@ -291,7 +289,7 @@ fn locate(
             return None;
         }
         let shape = heap.shape(data.shape).ok()?;
-        if let Some(slot) = shape.find(atom) {
+        if let Some(slot) = shape.find(AtomIdx::from_raw(atom.raw())) {
             return matches!(data.slots.get(slot as usize), Some(PropertySlot::Data(_))).then_some(
                 Location {
                     domain,
@@ -330,7 +328,7 @@ impl PropertyWriteCache {
         if location.depth != 0 {
             return None;
         }
-        if heap.object(receiver).ok()?.kind == ObjectKind::Array && location.slot == 0 {
+        if matches!(heap.object(receiver).ok()?.kind, ObjectKind::Array) && location.slot == 0 {
             return None;
         }
         let shape = heap.shape(location.shape).ok()?;
@@ -433,6 +431,7 @@ fn event(name: &'static str) {
 mod tests {
     use super::*;
     use crate::engine::api::runtime::Runtime;
+    #[cfg(test)]
     use crate::engine::value::Value;
 
     fn object(value: Value) -> crate::engine::object::ObjectRef {
@@ -563,15 +562,15 @@ mod tests {
             number(&cache, &runtime, context.realm_id(), &obj),
             Some(1.0)
         );
-        context.eval("o.x=9").unwrap();
+        drop(context.eval("o.x=9").unwrap());
         assert_eq!(
             number(&cache, &runtime, context.realm_id(), &obj),
             Some(9.0)
         );
-        context.eval("delete o.x").unwrap();
+        drop(context.eval("delete o.x").unwrap());
         assert_eq!(number(&cache, &runtime, context.realm_id(), &obj), None);
         install(&cache, &runtime, context.realm_id(), &obj, key.atom());
-        context.eval("o.x=11").unwrap();
+        drop(context.eval("o.x=11").unwrap());
         install(&cache, &runtime, context.realm_id(), &obj, key.atom());
         assert!(matches!(cache.state.get(), State::Megamorphic(_)));
         assert_eq!(number(&cache, &runtime, context.realm_id(), &obj), None);
@@ -589,7 +588,7 @@ mod tests {
             let obj = object(context.eval("var p={x:3}; var o={x:1}; o").unwrap());
             let cache = PropertyReadCache::default();
             install(&cache, &runtime, context.realm_id(), &obj, key.atom());
-            context.eval(mutation).unwrap();
+            drop(context.eval(mutation).unwrap());
             assert_eq!(
                 number(&cache, &runtime, context.realm_id(), &obj),
                 None,
@@ -619,12 +618,12 @@ mod tests {
                 number(&cache, &runtime, context.realm_id(), &obj),
                 Some(3.0)
             );
-            context.eval("p.x=8").unwrap();
+            drop(context.eval("p.x=8").unwrap());
             assert_eq!(
                 number(&cache, &runtime, context.realm_id(), &obj),
                 Some(8.0)
             );
-            context.eval(mutation).unwrap();
+            drop(context.eval(mutation).unwrap());
             assert_eq!(
                 number(&cache, &runtime, context.realm_id(), &obj),
                 None,
@@ -667,11 +666,11 @@ mod tests {
             number(&cache, &runtime, context.realm_id(), &obj),
             Some(1.0)
         );
-        context.eval("delete o.p1").unwrap();
+        drop(context.eval("delete o.p1").unwrap());
         assert_eq!(number(&cache, &runtime, context.realm_id(), &obj), None);
         let cache = PropertyReadCache::default();
         install(&cache, &runtime, context.realm_id(), &obj, key.atom());
-        context.eval("o.more=6").unwrap();
+        drop(context.eval("o.more=6").unwrap());
         assert_eq!(number(&cache, &runtime, context.realm_id(), &obj), None);
     }
     #[test]
@@ -713,12 +712,12 @@ mod tests {
             number(&cache, &runtime, context.realm_id(), &obj),
             Some(4.0)
         );
-        context.eval("o.x=5; o[0]=8").unwrap();
+        drop(context.eval("o.x=5; o[0]=8").unwrap());
         assert_eq!(
             number(&cache, &runtime, context.realm_id(), &obj),
             Some(5.0)
         );
-        context.eval("delete o[1]").unwrap();
+        drop(context.eval("delete o[1]").unwrap());
         assert_eq!(number(&cache, &runtime, context.realm_id(), &obj), None);
     }
     #[test]
@@ -733,9 +732,11 @@ mod tests {
             number(&cache, &runtime, context.realm_id(), &obj),
             Some(1.0)
         );
-        context
-            .eval("for(var i=0;i<100;i++) o['p'+i]=i; delete o.p0")
-            .unwrap();
+        drop(
+            context
+                .eval("for(var i=0;i<100;i++) o['p'+i]=i; delete o.p0")
+                .unwrap(),
+        );
         assert_eq!(number(&cache, &runtime, context.realm_id(), &obj), None);
     }
     #[test]
@@ -775,7 +776,7 @@ mod tests {
                         state.heap.property_layout_epoch(),
                     )
                 };
-                context.eval(mutation).unwrap();
+                drop(context.eval(mutation).unwrap());
                 let state = runtime.0.state.borrow();
                 assert_eq!(
                     state.heap.object(receiver.object_id()).unwrap().shape,

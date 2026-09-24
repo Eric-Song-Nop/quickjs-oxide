@@ -1,4 +1,5 @@
 use crate::engine::api::Context;
+use crate::engine::atom::AtomIdx;
 use crate::engine::heap::{AutoInitProperty, PropertySlot, RawValue};
 use crate::engine::object::shape::PropertyFlags;
 
@@ -40,20 +41,29 @@ fn reduced_group_by_element_limit_checks_before_next_and_preserves_throw() {
     );
     let arguments = NativeArguments {
         actual_arg_count: 2,
-        readable: vec![Value::Object(iterable), Value::Object(callback)],
+        readable: vec![
+            runtime.into_jsvalue(Value::Object(iterable)).unwrap(),
+            runtime.into_jsvalue(Value::Object(callback)).unwrap(),
+        ],
     };
 
     let completion = runtime
         .call_object_group_by_with_element_limit(
             context.realm,
             NativeInvocation::Call {
-                this_value: Value::Undefined,
+                this_value: JsValue::Undefined,
             },
             &arguments,
             2,
         )
         .unwrap();
-    let Completion::Throw(Value::Object(error)) = completion else {
+    for value in arguments.readable {
+        runtime.release_jsvalue(value).unwrap();
+    }
+    let Completion::Throw(value) = completion else {
+        panic!("reduced Object.groupBy limit did not throw an Error object");
+    };
+    let Value::Object(error) = runtime.root_and_release_jsvalue(value).unwrap() else {
         panic!("reduced Object.groupBy limit did not throw an Error object");
     };
     assert_eq!(
@@ -91,7 +101,8 @@ fn object_keys_family_autoinit_preserves_pinned_metadata() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert_eq!(
             shape.entries()[slot_index].flags,
             PropertyFlags::data(true, false, true),
@@ -133,7 +144,8 @@ fn object_extensibility_autoinit_preserves_pinned_metadata() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert_eq!(
             shape.entries()[slot_index].flags,
             PropertyFlags::data(true, false, true),
@@ -233,7 +245,8 @@ fn object_descriptor_statics_autoinit_preserve_pinned_metadata() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert_eq!(
             shape.entries()[slot_index].flags,
             PropertyFlags::data(true, false, true),
@@ -275,7 +288,8 @@ fn object_is_autoinit_and_same_value_semantics_match_pinned_quickjs() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert_eq!(
             shape.entries()[slot_index].flags,
             PropertyFlags::data(true, false, true),
@@ -338,7 +352,8 @@ fn object_assign_autoinit_and_ordinary_snapshot_semantics_match_pinned_quickjs()
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert_eq!(
             shape.entries()[slot_index].flags,
             PropertyFlags::data(true, false, true),
@@ -399,7 +414,7 @@ fn object_assign_autoinit_and_ordinary_snapshot_semantics_match_pinned_quickjs()
         )),
     );
 
-    context.eval("Object.assign(Object(),Object)").unwrap();
+    drop(context.eval("Object.assign(Object(),Object)").unwrap());
     for (name, kind) in [
         ("values", ObjectKeysKind::Values),
         ("entries", ObjectKeysKind::Entries),
@@ -408,7 +423,8 @@ fn object_assign_autoinit_and_ordinary_snapshot_semantics_match_pinned_quickjs()
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert!(matches!(
             object.slots.get(slot_index),
             Some(PropertySlot::AutoInit(AutoInitProperty::NativeBuiltin {
@@ -477,7 +493,8 @@ fn object_from_entries_autoinit_preserves_pinned_metadata() {
     let state = runtime.0.state.borrow();
     let object = state.heap.object(object_constructor.object_id()).unwrap();
     let shape = state.heap.shape(object.shape).unwrap();
-    let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+    let slot_index =
+        usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
     assert_eq!(
         shape.entries()[slot_index].flags,
         PropertyFlags::data(true, false, true),
@@ -514,7 +531,12 @@ fn object_has_own_autoinit_preserves_pinned_metadata_and_presence_is_non_materia
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(has_own_key.atom()).unwrap()).unwrap();
+        let slot_index = usize::try_from(
+            shape
+                .find(AtomIdx::from_raw(has_own_key.atom().raw()))
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             shape.entries()[slot_index].flags,
             PropertyFlags::data(true, false, true),
@@ -541,7 +563,12 @@ fn object_has_own_autoinit_preserves_pinned_metadata_and_presence_is_non_materia
     let state = runtime.0.state.borrow();
     let object = state.heap.object(object_constructor.object_id()).unwrap();
     let shape = state.heap.shape(object.shape).unwrap();
-    let slot_index = usize::try_from(shape.find(keys_key.atom()).unwrap()).unwrap();
+    let slot_index = usize::try_from(
+        shape
+            .find(AtomIdx::from_raw(keys_key.atom().raw()))
+            .unwrap(),
+    )
+    .unwrap();
     assert!(matches!(
         object.slots.get(slot_index),
         Some(PropertySlot::AutoInit(AutoInitProperty::NativeBuiltin {
@@ -559,9 +586,10 @@ fn recursive_object_has_own_key_conversion_is_guarded_and_runtime_recovers() {
         .spawn(|| {
             let runtime = Runtime::new();
             let mut context = runtime.new_context();
-            context
-                .eval(
-                    r#"function objectHasOwnRecurse(depth){
+            drop(
+                context
+                    .eval(
+                        r#"function objectHasOwnRecurse(depth){
                     var key=Object();
                     key[Symbol.toPrimitive]=function(){
                         if(depth!==0)objectHasOwnRecurse(depth-1);
@@ -570,8 +598,9 @@ fn recursive_object_has_own_key_conversion_is_guarded_and_runtime_recovers() {
                     var target=Object();target.x=1;
                     return Object.hasOwn(target,key);
                 }"#,
-                )
-                .unwrap();
+                    )
+                    .unwrap(),
+            );
 
             assert_eq!(
                 context.eval("objectHasOwnRecurse(8)").unwrap(),
@@ -693,7 +722,8 @@ fn object_integrity_autoinit_materializes_and_tightens_in_pinned_order() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert_eq!(
             shape.entries()[slot_index].flags,
             PropertyFlags::data(true, false, true),
@@ -719,7 +749,8 @@ fn object_integrity_autoinit_materializes_and_tightens_in_pinned_order() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert_eq!(
             shape.entries()[slot_index].flags,
             PropertyFlags::data(true, false, false),
@@ -747,7 +778,8 @@ fn object_integrity_autoinit_materializes_and_tightens_in_pinned_order() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert_eq!(
             shape.entries()[slot_index].flags,
             PropertyFlags::data(false, false, false),
@@ -777,7 +809,8 @@ fn object_is_sealed_scans_descriptors_before_extensibility_and_short_circuits_au
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert!(matches!(
             object.slots.get(slot_index),
             Some(PropertySlot::AutoInit(
@@ -814,8 +847,14 @@ fn object_is_sealed_scans_descriptors_before_extensibility_and_short_circuits_au
     let state = runtime.0.state.borrow();
     let object = state.heap.object(object_constructor.object_id()).unwrap();
     let shape = state.heap.shape(object.shape).unwrap();
-    let create_slot = usize::try_from(shape.find(create.atom()).unwrap()).unwrap();
-    let get_prototype_slot = usize::try_from(shape.find(get_prototype_of.atom()).unwrap()).unwrap();
+    let create_slot =
+        usize::try_from(shape.find(AtomIdx::from_raw(create.atom().raw())).unwrap()).unwrap();
+    let get_prototype_slot = usize::try_from(
+        shape
+            .find(AtomIdx::from_raw(get_prototype_of.atom().raw()))
+            .unwrap(),
+    )
+    .unwrap();
     assert!(matches!(
         object.slots.get(create_slot),
         Some(PropertySlot::Data(RawValue::Object(_)))
@@ -905,9 +944,10 @@ fn object_integrity_preserves_descriptor_values_and_covers_array_string_and_symb
 fn recursive_object_assign_callbacks_are_catchable_before_host_stack_exhaustion() {
     let runtime = Runtime::new();
     let mut context = runtime.new_context();
-    context
-        .eval(
-            r#"function objectAssignRecurse(depth){
+    drop(
+        context
+            .eval(
+                r#"function objectAssignRecurse(depth){
                    var source=Object(),descriptor=Object();
                    descriptor.enumerable=true;
                    descriptor.get=function(){
@@ -941,8 +981,9 @@ fn recursive_object_assign_callbacks_are_catchable_before_host_stack_exhaustion(
                    Object.defineProperty(source,"value",descriptor);
                    return Object.assign(Object(),source).value;
                }"#,
-        )
-        .unwrap();
+            )
+            .unwrap(),
+    );
     for name in ["objectAssignRecurse", "objectAssignSetterRecurse"] {
         assert_eq!(context.eval(&format!("{name}(8)")).unwrap(), Value::Int(1),);
         for depth in [9, 10, 11] {
@@ -1019,9 +1060,10 @@ fn object_descriptor_statics_publish_complete_fields_without_calling_accessors()
 fn recursive_object_descriptor_key_coercion_is_catchable_before_host_stack_exhaustion() {
     let runtime = Runtime::new();
     let mut context = runtime.new_context();
-    context
-        .eval(
-            r#"var descriptorTarget=Object();descriptorTarget.x=1;
+    drop(
+        context
+            .eval(
+                r#"var descriptorTarget=Object();descriptorTarget.x=1;
                function objectDescriptorRecurse(depth){
                    var key=Object();
                    key[Symbol.toPrimitive]=function(hint){
@@ -1073,8 +1115,9 @@ fn recursive_object_descriptor_key_coercion_is_catchable_before_host_stack_exhau
                    };
                    return Object.getOwnPropertyDescriptor(descriptorTarget,key).value;
                }"#,
-        )
-        .unwrap();
+            )
+            .unwrap(),
+    );
     assert_eq!(
         context.eval("objectDescriptorRecurse(8)").unwrap(),
         Value::Int(1),
@@ -1135,7 +1178,8 @@ fn object_keys_descriptor_recheck_materializes_non_enumerable_autoinits() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert!(matches!(
             object.slots.get(slot_index),
             Some(PropertySlot::AutoInit(
@@ -1157,7 +1201,8 @@ fn object_keys_descriptor_recheck_materializes_non_enumerable_autoinits() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(object_constructor.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_index = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot_index =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         let Some(PropertySlot::Data(RawValue::Object(function))) = object.slots.get(slot_index)
         else {
             panic!("Object.{name} was not materialized during descriptor recheck");
@@ -1284,7 +1329,10 @@ fn borrowed_object_entries_uses_its_defining_realm_for_arrays_and_errors() {
             &[Value::String(JsString::from_static("x"))],
         )
         .unwrap();
-    let Completion::Return(Value::Object(result)) = completion else {
+    let Completion::Return(value) = completion else {
+        panic!("borrowed Object.entries did not return an Array");
+    };
+    let Value::Object(result) = runtime.root_and_release_jsvalue(value).unwrap() else {
         panic!("borrowed Object.entries did not return an Array");
     };
     assert_eq!(
@@ -1310,7 +1358,10 @@ fn borrowed_object_entries_uses_its_defining_realm_for_arrays_and_errors() {
             &[Value::Undefined],
         )
         .unwrap();
-    let Completion::Throw(Value::Object(error)) = completion else {
+    let Completion::Throw(value) = completion else {
+        panic!("borrowed Object.entries nullish conversion did not throw");
+    };
+    let Value::Object(error) = runtime.root_and_release_jsvalue(value).unwrap() else {
         panic!("borrowed Object.entries nullish conversion did not throw");
     };
     assert_eq!(
@@ -1327,9 +1378,10 @@ fn borrowed_object_entries_uses_its_defining_realm_for_arrays_and_errors() {
 fn recursive_object_keys_family_ceiling_protects_the_heaviest_measured_path() {
     let runtime = Runtime::new();
     let mut context = runtime.new_context();
-    context
-        .eval(
-            r#"function objectKeysHeavyRecurse(depth){
+    drop(
+        context
+            .eval(
+                r#"function objectKeysHeavyRecurse(depth){
                     var object=Object();
                     var descriptor=Object();
                     descriptor.enumerable=true;
@@ -1354,8 +1406,9 @@ fn recursive_object_keys_family_ceiling_protects_the_heaviest_measured_path() {
                     Object.defineProperty(object,"value",descriptor);
                     return Object.values(object)[0];
                 }"#,
-        )
-        .unwrap();
+            )
+            .unwrap(),
+    );
 
     assert_eq!(
         context.eval("objectKeysHeavyRecurse(8)").unwrap(),

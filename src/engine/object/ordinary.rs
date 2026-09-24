@@ -2,18 +2,15 @@
 //! exceptional receivers retain the internal-method dispatch contract.
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
-use crate::engine::heap::ContextId;
+use crate::engine::heap::{ContextId, ObjectId};
 use crate::engine::object::operations::{
     ArrayOwnKey, InternalDefineResult, InternalSetResult, PropertyDefineOutcome, PropertySetAction,
     PropertySetRejection,
 };
 use crate::engine::object::ordinary_storage::{SetProbe, SpecialKind};
-use crate::engine::object::{
-    CompleteOrdinaryPropertyDescriptor, DescriptorField, ObjectRef, OrdinaryPropertyDescriptor,
-    PropertyKey,
-};
-use crate::engine::value::Value;
+use crate::engine::object::{CallableRef, DescriptorField, ObjectRef, PropertyKey};
 use crate::engine::value::conversion::NativeConversion;
+use crate::engine::value::{JsValue, Value};
 
 mod set;
 
@@ -49,6 +46,7 @@ impl Runtime {
         self.prepare_set_property_with_receiver_in_realm(None, object, key, value, receiver)
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_set_property_with_receiver_in_realm(
         &self,
         realm: Option<ContextId>,
@@ -57,6 +55,17 @@ impl Runtime {
         value: Value,
         receiver: Value,
     ) -> Result<PropertySetAction, RuntimeError> {
+        self.validate_object_and_key(object, key)?;
+        self.validate_value_domain(&value, "property value")?;
+        self.validate_value_domain(&receiver, "property receiver")?;
+        let value = self.into_jsvalue(value)?;
+        let receiver = match self.into_jsvalue(receiver) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                self.release_jsvalue(value)?;
+                return Err(error);
+            }
+        };
         let mut step = SetStep::start(self, realm, object.clone(), key.clone(), value, receiver)?;
         loop {
             match step {
@@ -81,40 +90,52 @@ pub(crate) fn set_completion(result: NativeConversion<InternalSetResult>) -> Pro
 }
 
 impl Runtime {
-    /// Ordinary nodes are iterative. A special node delegates exactly once and
-    /// preserves the distinction between missing and an observed undefined.
-    pub(super) fn get_ordinary_chain(
-        &self,
-        realm: ContextId,
-        object: &ObjectRef,
-        key: &PropertyKey,
-        receiver: Value,
-    ) -> Result<NativeConversion<Option<Value>>, RuntimeError> {
-        let read = self.prepare_ordinary_read(object, key, receiver)?;
-        self.finish_prepared_read(realm, key, read)
-    }
-
     pub(crate) fn finish_prepared_read(
         &self,
         realm: ContextId,
         key: &PropertyKey,
         read: OrdinaryRead,
     ) -> Result<NativeConversion<Option<Value>>, RuntimeError> {
+        Ok(match self.finish_prepared_read_jsvalue(realm, key, read)? {
+            NativeConversion::Value(value) => NativeConversion::Value(
+                value
+                    .map(|v| self.root_and_release_jsvalue(v))
+                    .transpose()?,
+            ),
+            NativeConversion::Throw(value) => NativeConversion::Throw(value),
+        })
+    }
+
+    pub(crate) fn finish_prepared_read_jsvalue(
+        &self,
+        realm: ContextId,
+        key: &PropertyKey,
+        read: OrdinaryRead,
+    ) -> Result<NativeConversion<Option<JsValue>>, RuntimeError> {
         use crate::engine::vm::Completion;
-        match read {
-            OrdinaryRead::Complete(value) => Ok(NativeConversion::Value(value)),
+        let completion = match read {
+            OrdinaryRead::Complete(value) => return Ok(NativeConversion::Value(value)),
             OrdinaryRead::Call { getter, receiver } => {
-                Ok(match self.call_internal(realm, &getter, receiver, &[])? {
-                    Completion::Return(value) => NativeConversion::Value(Some(value)),
-                    Completion::Throw(value) => NativeConversion::Throw(value),
-                })
+                self.call_internal_jsvalue(realm, &getter, receiver, Vec::new())?
             }
             OrdinaryRead::Special {
                 kind,
                 object,
                 receiver,
-            } => self.get_special_or_missing(kind, realm, &object, key, receiver),
-        }
+            } => {
+                if !matches!(kind, SpecialKind::Proxy) {
+                    self.release_jsvalue(receiver)?;
+                    return Err(RuntimeError::Invariant(
+                        "prepared property read left a non-Proxy storage boundary",
+                    ));
+                }
+                self.proxy_get_jsvalue(realm, &object, key, receiver)?
+            }
+        };
+        Ok(match completion {
+            Completion::Return(value) => NativeConversion::Value(Some(value)),
+            Completion::Throw(value) => NativeConversion::Throw(value),
+        })
     }
 
     /// Finish lookup through non-Proxy storage without invoking an accessor.
@@ -137,31 +158,67 @@ impl Runtime {
         key: &PropertyKey,
         receiver: &Value,
     ) -> Result<OrdinaryRead, RuntimeError> {
-        self.prepare_ordinary_read_selected(object, key, receiver, None)
+        let receiver = self.unroot_value(receiver)?;
+        let result = self.prepare_ordinary_read_selected(object, key, &receiver, None);
+        self.release_jsvalue(receiver)?;
+        result
     }
     pub(crate) fn prepare_ordinary_read_selected(
         &self,
         object: &ObjectRef,
         key: &PropertyKey,
-        receiver: &Value,
-        mut native: Option<&mut Option<crate::engine::object::LinkedNativeSelection>>,
+        receiver: &JsValue,
+        native: Option<&mut Option<crate::engine::object::LinkedNativeSelection>>,
     ) -> Result<OrdinaryRead, RuntimeError> {
         let _operation = self.operation();
         self.validate_object_and_key(object, key)?;
-        self.validate_value_domain(receiver, "property receiver")?;
+        self.prepare_ordinary_read_selected_inner(
+            object.object_id(),
+            Some(object),
+            key,
+            receiver,
+            native,
+        )
+    }
+
+    /// The caller keeps the borrowed initial object alive for this lookup.
+    pub(crate) fn prepare_ordinary_read_selected_id(
+        &self,
+        object: ObjectId,
+        key: &PropertyKey,
+        receiver: &JsValue,
+        native: Option<&mut Option<crate::engine::object::LinkedNativeSelection>>,
+    ) -> Result<OrdinaryRead, RuntimeError> {
+        let _operation = self.operation();
+        if !key.belongs_to(self) {
+            return Err(RuntimeError::WrongRuntime("property key"));
+        }
+        self.prepare_ordinary_read_selected_inner(object, None, key, receiver, native)
+    }
+
+    fn prepare_ordinary_read_selected_inner(
+        &self,
+        object: ObjectId,
+        original: Option<&ObjectRef>,
+        key: &PropertyKey,
+        receiver: &JsValue,
+        mut native: Option<&mut Option<crate::engine::object::LinkedNativeSelection>>,
+    ) -> Result<OrdinaryRead, RuntimeError> {
         use crate::engine::object::ordinary_storage::ReadProbe;
-        let mut prototype = None;
+        let mut prototype: Option<ObjectRef> = None;
         loop {
-            let current = prototype.as_ref().unwrap_or(object);
-            match self.ordinary_read_probe_selected(current, key, native.as_deref_mut())? {
-                ReadProbe::Value(value) => return Ok(OrdinaryRead::Complete(Some(value))),
+            let current_id = prototype.as_ref().map_or(object, ObjectRef::object_id);
+            match self.ordinary_read_probe_selected_id(current_id, key, native.as_deref_mut())? {
+                ReadProbe::Value(value) => {
+                    return Ok(OrdinaryRead::Complete(Some(value)));
+                }
                 ReadProbe::Getter(None) => {
-                    return Ok(OrdinaryRead::Complete(Some(Value::Undefined)));
+                    return Ok(OrdinaryRead::Complete(Some(JsValue::Undefined)));
                 }
                 ReadProbe::Getter(Some(getter)) => {
                     return Ok(OrdinaryRead::Call {
                         getter,
-                        receiver: receiver.clone(),
+                        receiver: self.dup_jsvalue(receiver)?,
                     });
                 }
                 ReadProbe::Missing(Some(next)) => prototype = Some(next),
@@ -169,11 +226,20 @@ impl Runtime {
                 ReadProbe::Special(kind @ SpecialKind::Proxy) => {
                     return Ok(OrdinaryRead::Special {
                         kind,
-                        object: current.clone(),
-                        receiver: receiver.clone(),
+                        object: ObjectRef::from_borrowed_handle(self.clone(), current_id)?,
+                        receiver: self.dup_jsvalue(receiver)?,
                     });
                 }
                 ReadProbe::Special(kind) => {
+                    // Only exotic storage needs the ObjectRef adapter. Ordinary
+                    // data/getter/prototype probing borrows the initial base.
+                    let promoted;
+                    let current = if let Some(current) = prototype.as_ref().or(original) {
+                        current
+                    } else {
+                        promoted = ObjectRef::from_borrowed_handle(self.clone(), current_id)?;
+                        &promoted
+                    };
                     // Integer-indexed exotic Get is terminal, including
                     // invalid/detached indices. It must not inspect a prototype.
                     if matches!(kind, SpecialKind::TypedArray)
@@ -181,10 +247,10 @@ impl Runtime {
                     {
                         let value = match numeric {
                             crate::engine::builtins::CanonicalNumericIndex::Valid(index) => self
-                                .typed_array_read_index(current, index)?
-                                .unwrap_or(Value::Undefined),
+                                .typed_array_read_index_jsvalue(current, index)?
+                                .unwrap_or(JsValue::Undefined),
                             crate::engine::builtins::CanonicalNumericIndex::Invalid => {
-                                Value::Undefined
+                                JsValue::Undefined
                             }
                         };
                         return Ok(OrdinaryRead::Complete(Some(value)));
@@ -192,21 +258,41 @@ impl Runtime {
                     // Reuse the full storage kernel for Array holes, String,
                     // Arguments, namespace live cells and lazy own properties.
                     // Materializing a descriptor does not invoke its getter.
-                    if let Some(own) = self.get_own_property_in_operation(current, key)? {
-                        return Ok(match own {
-                            CompleteOrdinaryPropertyDescriptor::Data { value, .. } => {
-                                OrdinaryRead::Complete(Some(value))
+                    if let Some(own) = self.get_own_property_owned(current, key)? {
+                        use crate::engine::object::property::CompletePropertyDescriptor;
+                        let getter = match own.record() {
+                            CompletePropertyDescriptor::Data { .. } => {
+                                // Transfer the descriptor's owned value edge
+                                // instead of duplicating it and releasing the
+                                // descriptor's copy right after.
+                                return Ok(OrdinaryRead::Complete(Some(
+                                    own.into_data_value().ok_or(RuntimeError::Invariant(
+                                        "own descriptor stored an internal sentinel",
+                                    ))?,
+                                )));
                             }
-                            CompleteOrdinaryPropertyDescriptor::Accessor {
-                                get: Some(getter),
+                            CompletePropertyDescriptor::Accessor {
+                                get: Some(crate::engine::heap::RawValue::Object(id)),
                                 ..
-                            } => OrdinaryRead::Call {
-                                getter,
-                                receiver: receiver.clone(),
-                            },
-                            CompleteOrdinaryPropertyDescriptor::Accessor { get: None, .. } => {
-                                OrdinaryRead::Complete(Some(Value::Undefined))
+                            } => Some(*id),
+                            CompletePropertyDescriptor::Accessor { get: None, .. } => None,
+                            _ => {
+                                return Err(RuntimeError::Invariant(
+                                    "stored accessor getter was not an object",
+                                ));
                             }
+                        };
+                        return Ok(match getter {
+                            Some(id) => {
+                                let getter = CallableRef::from_validated_object(
+                                    ObjectRef::from_borrowed_handle(self.clone(), id)?,
+                                );
+                                OrdinaryRead::Call {
+                                    getter,
+                                    receiver: self.dup_jsvalue(receiver)?,
+                                }
+                            }
+                            None => OrdinaryRead::Complete(Some(JsValue::Undefined)),
                         });
                     }
                     // A non-Proxy object's prototype lookup has no user call.
@@ -223,15 +309,29 @@ impl Runtime {
 }
 
 /// A rooted ordinary lookup result, ready for an explicit caller to consume.
+/// Data values and selected receivers each carry one internal owned edge.
 pub(crate) enum OrdinaryRead {
-    Complete(Option<Value>),
+    Complete(Option<crate::engine::value::JsValue>),
     Call {
         getter: crate::engine::object::CallableRef,
-        receiver: Value,
+        receiver: JsValue,
     },
     Special {
         kind: SpecialKind,
         object: ObjectRef,
-        receiver: Value,
+        receiver: JsValue,
     },
+}
+
+impl OrdinaryRead {
+    /// Release an abandoned lookup reply without invoking the selected getter.
+    pub(crate) fn release(self, runtime: &Runtime) {
+        let value = match self {
+            Self::Complete(value) => value,
+            Self::Call { receiver, .. } | Self::Special { receiver, .. } => Some(receiver),
+        };
+        if let Some(value) = value {
+            let _ = runtime.release_jsvalue(value);
+        }
+    }
 }

@@ -1,7 +1,7 @@
 //! Public then preserves species/capability effects before inspecting handlers.
 use super::{
-    Completion, ContextId, NativeArguments, NativeConversion, NativeInvocation, ObjectRef, Phase,
-    PromiseResume, PromiseStep, Runtime, RuntimeError, Value,
+    Completion, ContextId, JsValue, NativeArguments, NativeConversion, NativeInvocation, ObjectRef,
+    Phase, PromiseResume, PromiseStep, Runtime, RuntimeError,
 };
 use crate::engine::{
     heap::ObjectPayload,
@@ -19,9 +19,10 @@ impl PromiseStep {
                 "Promise.prototype.then received a constructor invocation",
             ));
         };
-        let Value::Object(promise) = this_value else {
+        let JsValue::Object(promise_id) = this_value else {
             return super::capability::error(runtime, realm, "not a promise");
         };
+        let promise = ObjectRef::from_borrowed_handle(runtime.clone(), *promise_id)?;
         if !matches!(
             runtime
                 .0
@@ -34,27 +35,23 @@ impl PromiseStep {
         ) {
             return super::capability::error(runtime, realm, "not a promise");
         }
-        let handlers = ThenHandlers::Public([
-            arguments
-                .readable
-                .first()
-                .cloned()
-                .ok_or(RuntimeError::Invariant(
-                    "Promise.then fulfill argv was not padded",
-                ))?,
-            arguments
-                .readable
-                .get(1)
-                .cloned()
-                .ok_or(RuntimeError::Invariant(
-                    "Promise.then reject argv was not padded",
-                ))?,
-        ]);
+        let mut inputs = HandlerInputs {
+            runtime: runtime.clone(),
+            values: [JsValue::Undefined, JsValue::Undefined],
+        };
+        inputs.values[0] = runtime.dup_jsvalue(arguments.readable.first().ok_or(
+            RuntimeError::Invariant("Promise.then fulfill argv was not padded"),
+        )?)?;
+        inputs.values[1] = runtime.dup_jsvalue(arguments.readable.get(1).ok_or(
+            RuntimeError::Invariant("Promise.then reject argv was not padded"),
+        )?)?;
+        let handlers = ThenHandlers::Public(inputs);
         Ok({
-            let __pending_field_receiver = Value::Object(promise.clone());
             let __pending_field_key = runtime
                 .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Constructor)?;
+            let __pending_field_receiver = JsValue::Object(promise.clone().into_handle());
             let __pending_field_resume = Box::new(PromiseResume {
+                runtime: runtime.clone(),
                 pending_effect: super::PromiseStepPending::default(),
                 realm,
                 phase: Phase::ThenConstructor {
@@ -79,17 +76,20 @@ pub(super) fn constructor(
 ) -> Result<PromiseStep, RuntimeError> {
     match result {
         Completion::Throw(value) => Ok(PromiseStep::Complete(Completion::Throw(value))),
-        Completion::Return(Value::Undefined) => Box::new(PromiseResume {
+        Completion::Return(JsValue::Undefined) => Box::new(PromiseResume {
+            runtime: runtime.clone(),
             pending_effect: super::PromiseStepPending::default(),
             realm,
             phase: Phase::ThenCapability { promise, handlers },
         })
         .capability(runtime, None),
-        Completion::Return(Value::Object(constructor)) => Ok({
-            let __pending_field_receiver = Value::Object(constructor);
+        Completion::Return(JsValue::Object(constructor_id)) => Ok({
+            let constructor = ObjectRef::from_owned_handle(runtime.clone(), constructor_id);
+            let __pending_field_receiver = JsValue::Object(constructor.into_handle());
             let __pending_field_key =
                 PropertyKey::from(runtime.well_known_symbol(WellKnownSymbol::Species));
             let __pending_field_resume = Box::new(PromiseResume {
+                runtime: runtime.clone(),
                 pending_effect: super::PromiseStepPending::default(),
                 realm,
                 phase: Phase::ThenSpecies { promise, handlers },
@@ -100,7 +100,10 @@ pub(super) fn constructor(
                 __pending_field_resume,
             )
         }),
-        Completion::Return(_) => super::capability::error(runtime, realm, "not an object"),
+        Completion::Return(value) => {
+            runtime.release_jsvalue(value)?;
+            super::capability::error(runtime, realm, "not an object")
+        }
     }
 }
 pub(super) fn species(
@@ -112,8 +115,8 @@ pub(super) fn species(
 ) -> Result<PromiseStep, RuntimeError> {
     let constructor = match result {
         Completion::Throw(value) => return Ok(PromiseStep::Complete(Completion::Throw(value))),
-        Completion::Return(Value::Undefined | Value::Null) => None,
-        Completion::Return(value) => match runtime.constructor_from_value(realm, value)? {
+        Completion::Return(JsValue::Undefined | JsValue::Null) => None,
+        Completion::Return(value) => match runtime.constructor_from_jsvalue(realm, value)? {
             NativeConversion::Throw(value) => {
                 return Ok(PromiseStep::Complete(Completion::Throw(value)));
             }
@@ -121,6 +124,7 @@ pub(super) fn species(
         },
     };
     Box::new(PromiseResume {
+        runtime: runtime.clone(),
         pending_effect: super::PromiseStepPending::default(),
         realm,
         phase: Phase::ThenCapability { promise, handlers },
@@ -131,7 +135,7 @@ pub(super) fn species(
 /// Internal handlers are prepared at their original point after species and
 /// capability creation. Their roots remain owned while user code is suspended.
 pub(super) enum ThenHandlers {
-    Public([Value; 2]),
+    Public(HandlerInputs),
     Module {
         fulfill: crate::engine::object::CallableRef,
         reject: crate::engine::object::CallableRef,
@@ -142,6 +146,20 @@ pub(super) enum ThenHandlers {
         resolve: ObjectRef,
         reject: ObjectRef,
     },
+}
+/// Handler arguments are retained until species and capability effects finish.
+pub(super) struct HandlerInputs {
+    runtime: Runtime,
+    values: [JsValue; 2],
+}
+impl Drop for HandlerInputs {
+    fn drop(&mut self) {
+        for value in &mut self.values {
+            let _ = self
+                .runtime
+                .release_jsvalue(std::mem::replace(value, JsValue::Undefined));
+        }
+    }
 }
 impl PromiseStep {
     pub(crate) fn module_then(
@@ -190,10 +208,11 @@ impl PromiseStep {
         handlers: ThenHandlers,
     ) -> Result<Self, RuntimeError> {
         Ok({
-            let __pending_field_receiver = Value::Object(promise.clone());
             let __pending_field_key = runtime
                 .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Constructor)?;
+            let __pending_field_receiver = JsValue::Object(promise.clone().into_handle());
             let __pending_field_resume = Box::new(PromiseResume {
+                runtime: runtime.clone(),
                 pending_effect: super::PromiseStepPending::default(),
                 realm,
                 phase: Phase::ThenConstructor { promise, handlers },
@@ -220,7 +239,7 @@ impl ThenHandlers {
         };
         let (fulfill, reject) = match self {
             Self::Public(handlers) => {
-                return runtime.finish_promise_then(realm, promise, handlers, capability);
+                return runtime.finish_promise_then(realm, promise, &handlers.values, capability);
             }
             Self::Module { fulfill, reject } => (fulfill, reject),
             Self::Dynamic {
@@ -255,6 +274,6 @@ impl ThenHandlers {
             Some(&reject),
             &capability,
         )?;
-        Ok(Completion::Return(Value::Undefined))
+        Ok(Completion::Return(JsValue::Undefined))
     }
 }

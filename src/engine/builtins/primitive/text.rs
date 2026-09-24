@@ -9,7 +9,7 @@ use crate::engine::{
     },
     builtins::native::{StringCharAtKind, StringWellFormedKind},
     heap::ContextId,
-    value::{JsString, Value, conversion::NativeConversion},
+    value::{JsString, JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
@@ -40,11 +40,11 @@ impl ScalarTextKind {
 pub(crate) enum ScalarTextStep {
     Complete(Completion),
     String {
-        value: Value,
+        value: JsValue,
         resume: ScalarTextResume,
     },
     Number {
-        value: Value,
+        value: JsValue,
         resume: ScalarTextResume,
     },
 }
@@ -67,11 +67,21 @@ impl std::ops::DerefMut for ScalarTextResume {
 }
 const _: () = assert!(std::mem::size_of::<ScalarTextResume>() <= 8);
 pub(crate) struct ScalarTextResumeState {
+    runtime: Runtime,
     realm: ContextId,
     kind: ScalarTextKind,
     phase: Phase,
     string: JsString,
-    arguments: std::vec::IntoIter<Value>,
+    arguments: std::vec::IntoIter<JsValue>,
+}
+impl Drop for ScalarTextResumeState {
+    /// Release argument edges still owned when conversion abandons the call.
+    /// Consumption drains the iterator; releases are defer-safe and nothrow.
+    fn drop(&mut self) {
+        for value in self.arguments.by_ref() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
 }
 impl ScalarTextStep {
     pub(crate) fn start(
@@ -86,9 +96,9 @@ impl ScalarTextStep {
                 "String scalar method requires generic invocation",
             ));
         };
-        if matches!(this_value, Value::Null | Value::Undefined) {
+        if matches!(this_value, JsValue::Null | JsValue::Undefined) {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(
+                runtime.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "null or undefined are forbidden",
@@ -96,18 +106,42 @@ impl ScalarTextStep {
             )));
         }
         let arguments = match kind {
-            ScalarTextKind::Concat => arguments.readable[..arguments.actual_arg_count].to_vec(),
-            _ => vec![
-                arguments
-                    .readable
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Undefined),
-            ],
+            ScalarTextKind::Concat => {
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(arguments.actual_arg_count)
+                    .map_err(|_| RuntimeError::Invariant("String concat argv allocation failed"))?;
+                for value in &arguments.readable[..arguments.actual_arg_count] {
+                    match runtime.dup_jsvalue(value) {
+                        Ok(value) => values.push(value),
+                        Err(error) => {
+                            for value in values {
+                                let _ = runtime.release_jsvalue(value);
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                values
+            }
+            _ => vec![match arguments.readable.first() {
+                Some(value) => runtime.dup_jsvalue(value)?,
+                None => JsValue::Undefined,
+            }],
+        };
+        let this_value = match runtime.dup_jsvalue(this_value) {
+            Ok(value) => value,
+            Err(error) => {
+                for value in arguments {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                return Err(error);
+            }
         };
         Ok(Self::String {
-            value: this_value.clone(),
+            value: this_value,
             resume: ScalarTextResume(Box::new(ScalarTextResumeState {
+                runtime: runtime.clone(),
                 realm,
                 kind,
                 phase: Phase::Source,
@@ -144,36 +178,46 @@ impl ScalarTextResume {
             ScalarTextKind::WellFormed(kind) => {
                 Ok(ScalarTextStep::Complete(Completion::Return(match kind {
                     StringWellFormedKind::IsWellFormed => {
-                        Value::Bool(self.0.string.is_well_formed())
+                        JsValue::Bool(self.0.string.is_well_formed())
                     }
                     StringWellFormedKind::ToWellFormed => {
-                        Value::String(self.0.string.to_well_formed())
+                        runtime.unroot_value(&Value::String(self.0.string.to_well_formed()))?
                     }
                 })))
             }
             ScalarTextKind::Iterator => Ok(ScalarTextStep::Complete(Completion::Return(
-                Value::Object(runtime.new_string_iterator(self.0.realm, self.0.string)?),
+                JsValue::Object(
+                    runtime
+                        .new_string_iterator(
+                            self.0.realm,
+                            std::mem::replace(&mut self.0.string, JsString::from_static("")),
+                        )?
+                        .into_handle(),
+                ),
             ))),
-            ScalarTextKind::Concat => self.concat(),
+            ScalarTextKind::Concat => self.concat(runtime),
             _ => {
                 self.0.phase = Phase::Index;
                 Ok(ScalarTextStep::Number {
-                    value: self.0.arguments.next().unwrap_or(Value::Undefined),
+                    value: self.0.arguments.next().unwrap_or(JsValue::Undefined),
                     resume: self,
                 })
             }
         }
     }
-    fn concat(mut self) -> Result<ScalarTextStep, RuntimeError> {
+    fn concat(mut self, runtime: &Runtime) -> Result<ScalarTextStep, RuntimeError> {
         loop {
             match self.0.arguments.next() {
                 None => {
-                    return Ok(ScalarTextStep::Complete(Completion::Return(Value::String(
-                        self.0.string,
-                    ))));
+                    let string = std::mem::replace(&mut self.0.string, JsString::from_static(""));
+                    return Ok(ScalarTextStep::Complete(Completion::Return(
+                        runtime.unroot_value(&Value::String(string))?,
+                    )));
                 }
-                Some(Value::String(chunk)) => {
-                    self.0.string = self.0.string.try_concat(&chunk).map_err(Error::from)?
+                Some(JsValue::String(id)) => {
+                    let chunk = runtime.0.state.borrow().heap.string(id).cloned();
+                    runtime.release_jsvalue(JsValue::String(id))?;
+                    self.0.string = self.0.string.try_concat(&chunk?).map_err(Error::from)?;
                 }
                 Some(value) => {
                     self.0.phase = Phase::Chunk;
@@ -187,9 +231,13 @@ impl ScalarTextResume {
     }
     pub(crate) fn number(
         self,
+        runtime: &Runtime,
         result: NativeConversion<f64>,
     ) -> Result<ScalarTextStep, RuntimeError> {
         if !matches!(self.0.phase, Phase::Index) {
+            if let NativeConversion::Throw(value) = result {
+                let _ = runtime.release_jsvalue(value);
+            }
             return Err(RuntimeError::Invariant(
                 "String scalar index phase mismatch",
             ));
@@ -232,7 +280,9 @@ impl ScalarTextResume {
                 .map_or(Value::Undefined, |point| Value::Int(point as i32)),
             _ => return Err(RuntimeError::Invariant("String scalar index kind mismatch")),
         };
-        Ok(ScalarTextStep::Complete(Completion::Return(value)))
+        Ok(ScalarTextStep::Complete(Completion::Return(
+            runtime.into_jsvalue(value)?,
+        )))
     }
 }
 pub(crate) fn finish(
@@ -244,10 +294,10 @@ pub(crate) fn finish(
         step = match step {
             ScalarTextStep::Complete(result) => return Ok(result),
             ScalarTextStep::String { value, resume } => {
-                resume.string(runtime, runtime.native_to_js_string(realm, &value)?)?
+                resume.string(runtime, runtime.native_to_js_string_jsvalue(realm, value)?)?
             }
             ScalarTextStep::Number { value, resume } => {
-                resume.number(runtime.native_to_number(realm, &value)?)?
+                resume.number(runtime, runtime.native_to_number_jsvalue(realm, value)?)?
             }
         };
     }

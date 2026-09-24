@@ -16,7 +16,7 @@ use crate::engine::builtins::native::NativeFunctionId;
 
 use crate::engine::heap::{
     ContextId, IteratorConsumerKind, IteratorHelperData, IteratorHelperKind, IteratorRealmData,
-    IteratorResumeKind, ObjectData,
+    IteratorResumeKind, ObjectData, RawValue,
 };
 use crate::engine::object::shape::PropertyFlags;
 use crate::engine::object::{
@@ -24,7 +24,7 @@ use crate::engine::object::{
     PropertyKey, WellKnownSymbol,
 };
 use crate::engine::value::conversion::NativeConversion;
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
 
@@ -311,24 +311,27 @@ impl Runtime {
             .ok_or(RuntimeError::Invariant("realm has no Iterator intrinsics"))
     }
 
-    fn iterator_receiver(
+    pub(crate) fn iterator_receiver(
         &self,
         realm: ContextId,
-        invocation: NativeInvocation,
+        invocation: &NativeInvocation,
     ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
         let NativeInvocation::Call { this_value } = invocation else {
             return Err(RuntimeError::Invariant(
                 "Iterator prototype method did not receive a generic invocation",
             ));
         };
-        let Value::Object(object) = this_value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        let JsValue::Object(id) = this_value else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "not an object",
             )?));
         };
-        Ok(NativeConversion::Value(object))
+        Ok(NativeConversion::Value(ObjectRef::from_borrowed_handle(
+            self.clone(),
+            *id,
+        )?))
     }
 
     pub(crate) fn call_iterator_constructor(
@@ -336,11 +339,13 @@ impl Runtime {
         realm: ContextId,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        constructor::finish(
-            self,
-            realm,
-            constructor::ConstructorStep::start(self, realm, &invocation)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            constructor::finish(
+                self,
+                realm,
+                constructor::ConstructorStep::start(self, realm, invocation)?,
+            )
+        })
     }
 
     pub(crate) fn call_iterator_constructor_accessor(
@@ -350,11 +355,15 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        constructor::finish(
-            self,
-            realm,
-            constructor::ConstructorStep::accessor(self, realm, callable, &invocation, arguments)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            constructor::finish(
+                self,
+                realm,
+                constructor::ConstructorStep::accessor(
+                    self, realm, callable, invocation, arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_iterator_from(
@@ -363,45 +372,50 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        from::finish(
-            self,
-            realm,
-            from::FromStep::start(self, realm, &invocation, arguments)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            from::finish(
+                self,
+                realm,
+                from::FromStep::start(self, realm, invocation, arguments)?,
+            )
+        })
     }
 
-    fn iterator_callable_value(
+    fn dup_iterator_raw(&self, raw: &RawValue) -> Result<JsValue, RuntimeError> {
+        let value = JsValue::from_raw(raw.clone()).ok_or(RuntimeError::Invariant(
+            "iterator value was an internal sentinel",
+        ))?;
+        self.dup_jsvalue(&value)
+    }
+
+    fn iterator_callable_jsvalue(
         &self,
         realm: ContextId,
-        value: Value,
+        value: &JsValue,
     ) -> Result<NativeConversion<CallableRef>, RuntimeError> {
-        let Value::Object(object) = value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Type,
-                "not a function",
-            )?));
-        };
-        let Some(callable) = self.as_callable(&object)? else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Type,
-                "not a function",
-            )?));
-        };
-        Ok(NativeConversion::Value(callable))
+        if let JsValue::Object(id) = value {
+            let object = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
+            if let Some(callable) = self.as_callable(&object)? {
+                return Ok(NativeConversion::Value(callable));
+            }
+        }
+        Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+            realm,
+            NativeErrorKind::Type,
+            "not a function",
+        )?))
     }
 
     fn new_iterator_wrap(
         &self,
         realm: ContextId,
-        source: &Value,
-        next: &Value,
+        source: &JsValue,
+        next: &JsValue,
     ) -> Result<ObjectRef, RuntimeError> {
         let prototype = self.iterator_realm_data(realm)?.wrap_prototype;
         let prototype = ObjectRef::from_borrowed_handle(self.clone(), prototype)?;
-        let raw_source = self.raw_property_value(source)?;
-        let raw_next = self.raw_property_value(next)?;
+        let raw_source = source.as_raw();
+        let raw_next = next.as_raw();
         let mut state = self.0.state.borrow_mut();
         let shape = state.get_or_create_shape(Some(prototype.object_id()), &[])?;
         let retained_atoms = match state.retain_raw_value_atoms([&raw_source, &raw_next]) {
@@ -428,7 +442,6 @@ impl Runtime {
         };
         let cleanup = state.heap.release_shape(shape)?;
         state.apply_cleanup(cleanup)?;
-        drop(state);
         Ok(ObjectRef::from_owned_handle(self.clone(), object))
     }
 
@@ -438,11 +451,13 @@ impl Runtime {
         kind: IteratorResumeKind,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        wrap::finish(
-            self,
-            realm,
-            wrap::WrapStep::start(self, realm, kind, &invocation)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            wrap::finish(
+                self,
+                realm,
+                wrap::WrapStep::start(self, realm, kind, invocation)?,
+            )
+        })
     }
 
     pub(crate) fn call_iterator_create_helper(
@@ -452,19 +467,21 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        create::finish(
-            self,
-            realm,
-            create::CreateStep::start(self, realm, kind, &invocation, arguments)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            create::finish(
+                self,
+                realm,
+                create::CreateStep::start(self, realm, kind, invocation, arguments)?,
+            )
+        })
     }
 
     fn new_iterator_helper(
         &self,
         realm: ContextId,
         source: &ObjectRef,
-        next: &Value,
-        callback: &Value,
+        next: &JsValue,
+        callback: &JsValue,
         count: i64,
         kind: IteratorHelperKind,
     ) -> Result<ObjectRef, RuntimeError> {
@@ -472,8 +489,8 @@ impl Runtime {
         let prototype = ObjectRef::from_borrowed_handle(self.clone(), prototype)?;
         let data = IteratorHelperData {
             source: source.object_id(),
-            next: self.raw_property_value(next)?,
-            callback: self.raw_property_value(callback)?,
+            next: next.as_raw(),
+            callback: callback.as_raw(),
             inner: None,
             count,
             kind,
@@ -505,7 +522,6 @@ impl Runtime {
             };
         let cleanup = state.heap.release_shape(shape)?;
         state.apply_cleanup(cleanup)?;
-        drop(state);
         Ok(ObjectRef::from_owned_handle(self.clone(), object))
     }
 
@@ -516,17 +532,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        consume::finish(
-            self,
-            realm,
-            consume::ConsumeStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            consume::finish(
                 self,
                 realm,
-                consume::ConsumeKind::Predicate(kind),
-                &invocation,
-                arguments,
-            )?,
-        )
+                consume::ConsumeStep::start(
+                    self,
+                    realm,
+                    consume::ConsumeKind::Predicate(kind),
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_iterator_reduce(
@@ -535,17 +553,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        consume::finish(
-            self,
-            realm,
-            consume::ConsumeStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            consume::finish(
                 self,
                 realm,
-                consume::ConsumeKind::Reduce,
-                &invocation,
-                arguments,
-            )?,
-        )
+                consume::ConsumeStep::start(
+                    self,
+                    realm,
+                    consume::ConsumeKind::Reduce,
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_iterator_to_array(
@@ -553,20 +573,22 @@ impl Runtime {
         realm: ContextId,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        consume::finish(
-            self,
-            realm,
-            consume::ConsumeStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            consume::finish(
                 self,
                 realm,
-                consume::ConsumeKind::Array,
-                &invocation,
-                &NativeArguments {
-                    actual_arg_count: 0,
-                    readable: Vec::new(),
-                },
-            )?,
-        )
+                consume::ConsumeStep::start(
+                    self,
+                    realm,
+                    consume::ConsumeKind::Array,
+                    invocation,
+                    &NativeArguments {
+                        actual_arg_count: 0,
+                        readable: Vec::new(),
+                    },
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_iterator_helper_resume(
@@ -575,11 +597,13 @@ impl Runtime {
         mode: IteratorResumeKind,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        helper::finish(
-            self,
-            realm,
-            helper::HelperResumeStep::start(self, realm, mode, &invocation)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            helper::finish(
+                self,
+                realm,
+                helper::HelperResumeStep::start(self, realm, mode, invocation)?,
+            )
+        })
     }
 
     fn set_helper_count(&self, helper: &ObjectRef, count: i64) -> Result<(), RuntimeError> {

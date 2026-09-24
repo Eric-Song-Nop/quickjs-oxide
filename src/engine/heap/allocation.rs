@@ -123,10 +123,35 @@ impl Heap {
         }
 
         self.publish(index, NodeData::Object(object))?;
+        #[cfg(debug_assertions)]
+        if super::ownership::trace_object_matches(id) {
+            eprintln!(
+                "[o-alloc] {id:?}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         if is_weak_object {
             self.link_weak_object(id)?;
         }
         Ok(id)
+    }
+
+    /// Allocate and publish a string node owning one `JsString` payload.
+    ///
+    /// The caller owns one returned string reference and must eventually call
+    /// [`Heap::release_string`].  String nodes have no outgoing heap edges, so
+    /// publication cannot fail after the slot is reserved.
+    pub fn allocate_string(&mut self, value: JsString) -> Result<StringId, HeapError> {
+        self.allocate_string_leaf(value)
+    }
+
+    /// Allocate and publish a BigInt node owning one `JsBigInt` payload.
+    ///
+    /// The caller owns one returned BigInt reference and must eventually call
+    /// [`Heap::release_bigint`].  BigInt nodes have no outgoing heap edges, so
+    /// publication cannot fail after the slot is reserved.
+    pub fn allocate_bigint(&mut self, value: JsBigInt) -> Result<BigIntId, HeapError> {
+        self.allocate_bigint_leaf(value)
     }
 
     /// Allocate and publish a realm/context node, retaining all realm roots.
@@ -1324,6 +1349,24 @@ impl Heap {
     /// Allocate a captured-variable cell and transfer ownership of its value
     /// to the heap. The returned reference is normally owned by the active
     /// frame; closure objects retain the same `VarRefId` when published.
+    /// Publish a captured cell by adopting the complete value edge. Rejection
+    /// returns the input record unchanged; no partial edge retain is possible.
+    pub(crate) fn allocate_var_ref_owned(
+        &mut self,
+        var_ref: VarRefData,
+    ) -> Result<VarRefId, (HeapError, VarRefData)> {
+        if let Err(error) = validate_var_ref_payload(&var_ref) {
+            return Err((error, var_ref));
+        }
+        let (index, generation) = match self.reserve(HeapNodeKind::VarRef) {
+            Ok(slot) => slot,
+            Err(error) => return Err((error, var_ref)),
+        };
+        self.publish(index, NodeData::VarRef(var_ref))
+            .expect("fresh VarRef reservation must publish exactly once");
+        Ok(VarRefId { index, generation })
+    }
+
     pub fn allocate_var_ref(&mut self, var_ref: VarRefData) -> Result<VarRefId, HeapError> {
         validate_var_ref_payload(&var_ref)?;
         let (index, generation) = self.reserve(HeapNodeKind::VarRef)?;

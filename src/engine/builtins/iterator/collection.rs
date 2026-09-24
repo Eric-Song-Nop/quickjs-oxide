@@ -13,7 +13,7 @@ use crate::engine::{
     },
     heap::ContextId,
     object::{CallableRef, ObjectRef, PropertyKey, WellKnownSymbol},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{
         Completion,
         call::{ConstructorPrototypeSource, NativeArguments, NativeInvocation},
@@ -40,6 +40,40 @@ impl CollectionKind {
         matches!(self, Self::Map | Self::WeakMap)
     }
 }
+/// Create the empty collection object for one resolved prototype source.
+/// Shared by the synchronous no-iterable arm and the resumable protocol.
+fn new_collection_for_source(
+    runtime: &Runtime,
+    kind: CollectionKind,
+    source: ConstructorPrototypeSource,
+) -> Result<ObjectRef, RuntimeError> {
+    let prototype = match source {
+        ConstructorPrototypeSource::Explicit(prototype) => prototype,
+        ConstructorPrototypeSource::Realm(realm) => {
+            let prototype = match kind {
+                CollectionKind::Map => runtime.map_realm_data(realm)?.prototype,
+                CollectionKind::Set => runtime.set_realm_data(realm)?.prototype,
+                CollectionKind::WeakMap => {
+                    runtime.weak_collection_prototype(realm, WeakCollectionKind::Map)?
+                }
+                CollectionKind::WeakSet => {
+                    runtime.weak_collection_prototype(realm, WeakCollectionKind::Set)?
+                }
+            };
+            ObjectRef::from_borrowed_handle(runtime.clone(), prototype)?
+        }
+    };
+    match kind {
+        CollectionKind::Map => runtime.new_map_object(&prototype),
+        CollectionKind::Set => runtime.new_set_object(&prototype),
+        CollectionKind::WeakMap => {
+            runtime.new_weak_collection_object(&prototype, WeakCollectionKind::Map)
+        }
+        CollectionKind::WeakSet => {
+            runtime.new_weak_collection_object(&prototype, WeakCollectionKind::Set)
+        }
+    }
+}
 pub(crate) enum CollectionStep {
     Complete(Completion),
     Prototype { resume: CollectionResume },
@@ -62,16 +96,50 @@ impl std::ops::DerefMut for CollectionResume {
 }
 const _: () = assert!(std::mem::size_of::<CollectionResume>() <= 8);
 pub(crate) struct CollectionResumeState {
+    runtime: Runtime,
     pending_effect: CollectionStepPending,
     realm: ContextId,
     kind: CollectionKind,
     collection: Option<ObjectRef>,
-    iterable: Option<Value>,
+    iterable: Option<JsValue>,
     iterator: Option<ObjectRef>,
-    next: Value,
+    next: JsValue,
     adder: Option<CallableRef>,
     phase: Phase,
     closing: bool,
+}
+impl Drop for CollectionResumeState {
+    /// Release the internal edges the pending effect still owns when the
+    /// request is abandoned. Consumption goes through `Option::take`, so a
+    /// drained field is `None` here; releases are defer-safe and nothrow.
+    fn drop(&mut self) {
+        for value in [
+            self.pending_effect.prototype_new_target.take(),
+            self.pending_effect.read_receiver.take(),
+            self.pending_effect.call_receiver.take(),
+            self.pending_effect.next_method.take(),
+            self.iterable.take(),
+            Some(std::mem::replace(&mut self.next, JsValue::Undefined)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Phase::Value { key, .. } = std::mem::replace(&mut self.phase, Phase::Next) {
+            let _ = self.runtime.release_jsvalue(key);
+        }
+        if let Some(Completion::Return(value) | Completion::Throw(value)) =
+            self.pending_effect.close_completion.take()
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(values) = self.pending_effect.call_arguments.take() {
+            for value in values {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+    }
 }
 enum Phase {
     Prototype,
@@ -81,7 +149,7 @@ enum Phase {
     NextMethod,
     Next,
     Key(ObjectRef),
-    Value { item: ObjectRef, key: Value },
+    Value { item: ObjectRef, key: JsValue },
     Add(Option<ObjectRef>),
 }
 impl CollectionStep {
@@ -97,34 +165,48 @@ impl CollectionStep {
                 "collection constructor did not receive a constructor invocation",
             ));
         };
-        let _ = runtime;
+        // No-iterable fast arm: the spec resolves the prototype before it
+        // inspects the iterable, and a nullish iterable returns the fresh
+        // collection immediately. When the prototype lookup completes without
+        // re-entering user code, finish here without the resume Box and
+        // without duplicating the constructor frame's `new_target` edge.
+        let nullish_iterable = arguments.actual_arg_count == 0
+            || matches!(
+                arguments.readable.first(),
+                Some(JsValue::Null | JsValue::Undefined)
+            );
+        if nullish_iterable
+            && let Some(reply) = runtime.constructor_prototype_source_now(realm, new_target)?
+        {
+            return Ok(Self::Complete(match reply {
+                NativeConversion::Throw(value) => Completion::Throw(value),
+                NativeConversion::Value(source) => Completion::Return(JsValue::Object(
+                    new_collection_for_source(runtime, kind, source)?.into_handle(),
+                )),
+            }));
+        }
         Ok({
-            let __pending_field_new_target = new_target.clone();
-            let __pending_field_resume = CollectionResume(Box::new(CollectionResumeState {
+            let mut __pending_field_resume = CollectionResume(Box::new(CollectionResumeState {
+                runtime: runtime.clone(),
                 pending_effect: CollectionStepPending::default(),
                 realm,
                 kind,
                 collection: None,
-                iterable: if arguments.actual_arg_count == 0 {
-                    None
-                } else {
-                    Some(
-                        arguments
-                            .readable
-                            .first()
-                            .cloned()
-                            .ok_or(RuntimeError::Invariant(
-                                "collection iterable argv was not padded",
-                            ))?,
-                    )
-                },
+                iterable: None,
                 iterator: None,
-                next: Value::Undefined,
+                next: JsValue::Undefined,
                 adder: None,
                 phase: Phase::Prototype,
                 closing: false,
             }));
-            Self::request_prototype(__pending_field_new_target, __pending_field_resume)
+            if arguments.actual_arg_count != 0 {
+                __pending_field_resume.0.iterable =
+                    Some(runtime.dup_jsvalue(arguments.readable.first().ok_or(
+                        RuntimeError::Invariant("collection iterable argv was not padded"),
+                    )?)?);
+            }
+            let new_target = runtime.dup_jsvalue(new_target)?;
+            Self::request_prototype(new_target, __pending_field_resume)
         })
     }
 }
@@ -141,20 +223,25 @@ impl CollectionResume {
             .clone()
             .ok_or(RuntimeError::Invariant("collection iterator missing"))
     }
-    fn abrupt(mut self, value: Value) -> Result<CollectionStep, RuntimeError> {
+    fn abrupt(mut self, runtime: &Runtime, value: JsValue) -> Result<CollectionStep, RuntimeError> {
         if matches!(
             self.0.phase,
             Phase::Key(_) | Phase::Value { .. } | Phase::Add(_)
         ) {
+            self.0.pending_effect.close_completion = Some(Completion::Throw(value));
             // WeakMap explicitly releases the yielded pair and key before
             // close. Strong Map retains that pair until its ordinary exit.
             if !matches!(self.0.kind, CollectionKind::Map) {
-                self.0.phase = Phase::Next;
+                if let Phase::Value { key, .. } = std::mem::replace(&mut self.0.phase, Phase::Next)
+                {
+                    runtime.release_jsvalue(key)?;
+                }
             }
             self.0.closing = true;
             return Ok({
                 let __pending_field_iterator = self.iterator()?;
-                let __pending_field_completion = Completion::Throw(value);
+                let __pending_field_completion =
+                    self.0.pending_effect.close_completion.take().unwrap();
                 let __pending_field_resume = self;
                 CollectionStep::request_close(
                     __pending_field_iterator,
@@ -165,11 +252,11 @@ impl CollectionResume {
         }
         Ok(CollectionStep::Complete(Completion::Throw(value)))
     }
-    fn next_step(mut self) -> Result<CollectionStep, RuntimeError> {
+    fn next_step(mut self, runtime: &Runtime) -> Result<CollectionStep, RuntimeError> {
         self.0.phase = Phase::Next;
         Ok({
             let __pending_field_iterator = self.iterator()?;
-            let __pending_field_method = self.0.next.clone();
+            let __pending_field_method = runtime.dup_jsvalue(&self.0.next)?;
             let __pending_field_resume = self;
             CollectionStep::request_next(
                 __pending_field_iterator,
@@ -184,55 +271,36 @@ impl CollectionResume {
         reply: NativeConversion<ConstructorPrototypeSource>,
     ) -> Result<CollectionStep, RuntimeError> {
         if !matches!(self.0.phase, Phase::Prototype) {
+            if let NativeConversion::Throw(value) = reply {
+                runtime.release_jsvalue(value)?;
+            }
             return Err(RuntimeError::Invariant(
                 "collection prototype phase mismatch",
             ));
         }
-        let prototype = match reply {
+        let source = match reply {
             NativeConversion::Throw(value) => {
                 return Ok(CollectionStep::Complete(Completion::Throw(value)));
             }
-            NativeConversion::Value(ConstructorPrototypeSource::Explicit(prototype)) => prototype,
-            NativeConversion::Value(ConstructorPrototypeSource::Realm(realm)) => {
-                let prototype = match self.0.kind {
-                    CollectionKind::Map => runtime.map_realm_data(realm)?.prototype,
-                    CollectionKind::Set => runtime.set_realm_data(realm)?.prototype,
-                    CollectionKind::WeakMap => {
-                        runtime.weak_collection_prototype(realm, WeakCollectionKind::Map)?
-                    }
-                    CollectionKind::WeakSet => {
-                        runtime.weak_collection_prototype(realm, WeakCollectionKind::Set)?
-                    }
-                };
-                ObjectRef::from_borrowed_handle(runtime.clone(), prototype)?
-            }
+            NativeConversion::Value(source) => source,
         };
-        let collection = match self.0.kind {
-            CollectionKind::Map => runtime.new_map_object(&prototype)?,
-            CollectionKind::Set => runtime.new_set_object(&prototype)?,
-            CollectionKind::WeakMap => {
-                runtime.new_weak_collection_object(&prototype, WeakCollectionKind::Map)?
-            }
-            CollectionKind::WeakSet => {
-                runtime.new_weak_collection_object(&prototype, WeakCollectionKind::Set)?
-            }
-        };
+        let collection = new_collection_for_source(runtime, self.0.kind, source)?;
         self.0.collection = Some(collection.clone());
         if self
             .0
             .iterable
             .as_ref()
-            .is_none_or(|value| matches!(value, Value::Null | Value::Undefined))
+            .is_none_or(|value| matches!(value, JsValue::Null | JsValue::Undefined))
         {
-            return Ok(CollectionStep::Complete(Completion::Return(Value::Object(
-                collection,
-            ))));
+            return Ok(CollectionStep::Complete(Completion::Return(
+                JsValue::Object(collection.into_handle()),
+            )));
         }
         self.0.phase = Phase::Adder;
         Ok({
-            let __pending_field_receiver = Value::Object(collection);
             let __pending_field_key =
                 runtime.intern_property_key(if self.0.kind.pairs() { "set" } else { "add" })?;
+            let __pending_field_receiver = JsValue::Object(collection.into_handle());
             let __pending_field_resume = self;
             CollectionStep::request_read(
                 __pending_field_receiver,
@@ -251,30 +319,35 @@ impl CollectionResume {
         }
         let value = match reply {
             Completion::Return(value) => value,
-            Completion::Throw(value) => return self.abrupt(value),
+            Completion::Throw(value) => {
+                return self.abrupt(runtime, value);
+            }
         };
         match std::mem::replace(&mut self.0.phase, Phase::Next) {
             Phase::Adder => {
-                let callback = match value {
-                    Value::Object(ref object) => runtime.as_callable(object)?,
-                    _ => None,
+                let callback = match &value {
+                    JsValue::Object(id) => runtime.as_callable_object(*id),
+                    _ => Ok(None),
                 };
+                runtime.release_jsvalue(value)?;
+                let callback = callback?;
                 let Some(callback) = callback else {
-                    let error = runtime.new_native_error(
+                    let error = runtime.new_native_error_jsvalue(
                         self.0.realm,
                         NativeErrorKind::Type,
                         "set/add is not a function",
                     )?;
-                    return self.abrupt(error);
+                    return self.abrupt(runtime, error);
                 };
                 self.0.adder = Some(callback);
                 self.0.phase = Phase::Method;
                 Ok({
-                    let __pending_field_receiver = self
-                        .0
-                        .iterable
-                        .clone()
-                        .ok_or(RuntimeError::Invariant("collection iterable missing"))?;
+                    let __pending_field_receiver = runtime.dup_jsvalue(
+                        self.0
+                            .iterable
+                            .as_ref()
+                            .ok_or(RuntimeError::Invariant("collection iterable missing"))?,
+                    )?;
                     let __pending_field_key =
                         PropertyKey::from(runtime.well_known_symbol(WellKnownSymbol::Iterator));
                     let __pending_field_resume = self;
@@ -286,17 +359,19 @@ impl CollectionResume {
                 })
             }
             Phase::Method => {
-                let callback = match value {
-                    Value::Object(ref object) => runtime.as_callable(object)?,
-                    _ => None,
+                let callback = match &value {
+                    JsValue::Object(id) => runtime.as_callable_object(*id),
+                    _ => Ok(None),
                 };
+                runtime.release_jsvalue(value)?;
+                let callback = callback?;
                 let Some(callable) = callback else {
-                    let error = runtime.new_native_error(
+                    let error = runtime.new_native_error_jsvalue(
                         self.0.realm,
                         NativeErrorKind::Type,
                         "value is not iterable",
                     )?;
-                    return self.abrupt(error);
+                    return self.abrupt(runtime, error);
                 };
                 self.0.phase = Phase::Iterator;
                 Ok({
@@ -317,20 +392,22 @@ impl CollectionResume {
                 })
             }
             Phase::Iterator => {
-                let Value::Object(iterator) = value else {
-                    let error = runtime.new_native_error(
+                let JsValue::Object(iterator) = value else {
+                    runtime.release_jsvalue(value)?;
+                    let error = runtime.new_native_error_jsvalue(
                         self.0.realm,
                         NativeErrorKind::Type,
                         "not an object",
                     )?;
-                    return self.abrupt(error);
+                    return self.abrupt(runtime, error);
                 };
+                let iterator = ObjectRef::from_owned_handle(runtime.clone(), iterator);
                 self.0.iterator = Some(iterator.clone());
                 self.0.phase = Phase::NextMethod;
                 Ok({
-                    let __pending_field_receiver = Value::Object(iterator);
                     let __pending_field_key = runtime
                         .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Next)?;
+                    let __pending_field_receiver = JsValue::Object(iterator.into_handle());
                     let __pending_field_resume = self;
                     CollectionStep::request_read(
                         __pending_field_receiver,
@@ -340,8 +417,8 @@ impl CollectionResume {
                 })
             }
             Phase::NextMethod => {
-                self.0.next = value;
-                self.next_step()
+                runtime.release_jsvalue(std::mem::replace(&mut self.0.next, value))?;
+                self.next_step(runtime)
             }
             Phase::Key(item) => {
                 self.0.phase = Phase::Value {
@@ -349,9 +426,9 @@ impl CollectionResume {
                     key: value,
                 };
                 Ok({
-                    let __pending_field_receiver = Value::Object(item);
                     let __pending_field_key = runtime
                         .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Literal2)?;
+                    let __pending_field_receiver = JsValue::Object(item.into_handle());
                     let __pending_field_resume = self;
                     CollectionStep::request_read(
                         __pending_field_receiver,
@@ -366,34 +443,39 @@ impl CollectionResume {
                 } else {
                     None
                 });
-                self.add(vec![key, value])
+                self.add(runtime, vec![key, value])
             }
             Phase::Add(entry) => {
+                runtime.release_jsvalue(value)?;
                 drop(entry);
-                self.next_step()
+                self.next_step(runtime)
             }
-            _ => Err(RuntimeError::Invariant(
-                "collection completion phase mismatch",
-            )),
+            _ => {
+                runtime.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant(
+                    "collection completion phase mismatch",
+                ))
+            }
         }
     }
-    fn add(self, arguments: Vec<Value>) -> Result<CollectionStep, RuntimeError> {
-        Ok({
-            let __pending_field_callable = self
-                .0
-                .adder
-                .clone()
-                .ok_or(RuntimeError::Invariant("collection adder missing"))?;
-            let __pending_field_receiver = Value::Object(self.collection()?);
-            let __pending_field_arguments = arguments;
-            let __pending_field_resume = self;
-            CollectionStep::request_call(
-                __pending_field_callable,
-                __pending_field_receiver,
-                __pending_field_arguments,
-                __pending_field_resume,
-            )
-        })
+    fn add(
+        mut self,
+        _runtime: &Runtime,
+        arguments: Vec<JsValue>,
+    ) -> Result<CollectionStep, RuntimeError> {
+        self.0.pending_effect.call_arguments = Some(arguments);
+        let __pending_field_callable = self
+            .0
+            .adder
+            .clone()
+            .ok_or(RuntimeError::Invariant("collection adder missing"))?;
+        let __pending_field_receiver = JsValue::Object(self.collection()?.into_handle());
+        Ok(CollectionStep::request_call(
+            __pending_field_callable,
+            __pending_field_receiver,
+            self.0.pending_effect.call_arguments.take().unwrap(),
+            self,
+        ))
     }
     pub(crate) fn next(
         mut self,
@@ -401,6 +483,9 @@ impl CollectionResume {
         reply: ObjectIteratorStep,
     ) -> Result<CollectionStep, RuntimeError> {
         if !matches!(self.0.phase, Phase::Next) {
+            if let ObjectIteratorStep::Yield(value) | ObjectIteratorStep::Throw(value) = reply {
+                runtime.release_jsvalue(value)?;
+            }
             return Err(RuntimeError::Invariant("collection next phase mismatch"));
         }
         let item = match reply {
@@ -408,28 +493,32 @@ impl CollectionResume {
                 return Ok(CollectionStep::Complete(Completion::Throw(value)));
             }
             ObjectIteratorStep::Done => {
-                return Ok(CollectionStep::Complete(Completion::Return(Value::Object(
-                    self.collection()?,
-                ))));
+                return Ok(CollectionStep::Complete(Completion::Return(
+                    JsValue::Object(self.collection()?.into_handle()),
+                )));
             }
             ObjectIteratorStep::Yield(value) => value,
         };
         if !self.0.kind.pairs() {
             self.0.phase = Phase::Add(None);
-            return self.add(vec![item]);
+            return self.add(runtime, vec![item]);
         }
-        let Value::Object(item) = item else {
-            let error =
-                runtime.new_native_error(self.0.realm, NativeErrorKind::Type, "not an object")?;
-            drop(item);
+        let JsValue::Object(item) = item else {
+            runtime.release_jsvalue(item)?;
+            let error = runtime.new_native_error_jsvalue(
+                self.0.realm,
+                NativeErrorKind::Type,
+                "not an object",
+            )?;
             self.0.phase = Phase::Add(None);
-            return self.abrupt(error);
+            return self.abrupt(runtime, error);
         };
+        let item = ObjectRef::from_owned_handle(runtime.clone(), item);
         self.0.phase = Phase::Key(item.clone());
         Ok({
-            let __pending_field_receiver = Value::Object(item);
             let __pending_field_key =
                 runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Literal1)?;
+            let __pending_field_receiver = JsValue::Object(item.into_handle());
             let __pending_field_resume = self;
             CollectionStep::request_read(
                 __pending_field_receiver,
@@ -451,7 +540,7 @@ pub(crate) fn finish(
                 let new_target = resume.take_prototype_new_target();
                 resume.prototype(
                     runtime,
-                    runtime.constructor_prototype_source(realm, &new_target)?,
+                    runtime.constructor_prototype_source(realm, new_target)?,
                 )?
             }
             CollectionStep::Read { mut resume } => {
@@ -459,18 +548,16 @@ pub(crate) fn finish(
                 let key = resume.take_read_key();
                 resume.resume(
                     runtime,
-                    runtime.get_value_property_in_realm(realm, receiver, &key)?,
+                    runtime.get_value_property_in_realm_jsvalue(realm, receiver, &key)?,
                 )?
             }
             CollectionStep::Call { mut resume } => {
                 let callable = resume.take_call_callable();
                 let receiver = resume.take_call_receiver();
                 let arguments = resume.take_call_arguments();
-                {
-                    let result = runtime.call_internal(realm, &callable, receiver, &arguments)?;
-                    drop(arguments);
-                    resume.resume(runtime, result)?
-                }
+                let result =
+                    runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?;
+                resume.resume(runtime, result)?
             }
             CollectionStep::Next { mut resume } => {
                 let iterator = resume.take_next_iterator();
@@ -480,7 +567,7 @@ pub(crate) fn finish(
                     finish_next(
                         runtime,
                         realm,
-                        NextStep::start(runtime, realm, iterator, method)?,
+                        NextStep::start_jsvalue(runtime, realm, iterator, method)?,
                     )?,
                 )?
             }
@@ -504,6 +591,7 @@ pub(crate) fn finish(
 mod owned_tests {
     use super::*;
     use crate::engine::api::profiling::CostProfile;
+    use crate::engine::value::Value;
 
     #[test]
     fn iterator_and_collection_callbacks_stay_on_owned_driver() {
@@ -571,24 +659,24 @@ mod owned_tests {
 
 #[derive(Default)]
 struct CollectionStepPending {
-    prototype_new_target: Option<Value>,
-    read_receiver: Option<Value>,
+    prototype_new_target: Option<JsValue>,
+    read_receiver: Option<JsValue>,
     read_key: Option<PropertyKey>,
     call_callable: Option<CallableRef>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
     next_iterator: Option<ObjectRef>,
-    next_method: Option<Value>,
+    next_method: Option<JsValue>,
     close_iterator: Option<ObjectRef>,
     close_completion: Option<Completion>,
 }
 impl CollectionStep {
-    pub(crate) fn request_prototype(new_target: Value, mut resume: CollectionResume) -> Self {
+    pub(crate) fn request_prototype(new_target: JsValue, mut resume: CollectionResume) -> Self {
         resume.0.pending_effect.prototype_new_target = Some(new_target);
         Self::Prototype { resume }
     }
     pub(crate) fn request_read(
-        receiver: Value,
+        receiver: JsValue,
         key: PropertyKey,
         mut resume: CollectionResume,
     ) -> Self {
@@ -598,8 +686,8 @@ impl CollectionStep {
     }
     pub(crate) fn request_call(
         callable: CallableRef,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: CollectionResume,
     ) -> Self {
         resume.0.pending_effect.call_callable = Some(callable);
@@ -609,7 +697,7 @@ impl CollectionStep {
     }
     pub(crate) fn request_next(
         iterator: ObjectRef,
-        method: Value,
+        method: JsValue,
         mut resume: CollectionResume,
     ) -> Self {
         resume.0.pending_effect.next_iterator = Some(iterator);
@@ -627,14 +715,14 @@ impl CollectionStep {
     }
 }
 impl CollectionResume {
-    pub(crate) fn take_prototype_new_target(&mut self) -> Value {
+    pub(crate) fn take_prototype_new_target(&mut self) -> JsValue {
         self.0
             .pending_effect
             .prototype_new_target
             .take()
             .expect("CollectionStep Prototype new_target")
     }
-    pub(crate) fn take_read_receiver(&mut self) -> Value {
+    pub(crate) fn take_read_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .read_receiver
@@ -655,14 +743,14 @@ impl CollectionResume {
             .take()
             .expect("CollectionStep Call callable")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver
             .take()
             .expect("CollectionStep Call receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .pending_effect
             .call_arguments
@@ -676,7 +764,7 @@ impl CollectionResume {
             .take()
             .expect("CollectionStep Next iterator")
     }
-    pub(crate) fn take_next_method(&mut self) -> Value {
+    pub(crate) fn take_next_method(&mut self) -> JsValue {
         self.0
             .pending_effect
             .next_method

@@ -6,7 +6,7 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
     object::{ObjectRef, PropertyKey},
-    value::{JsString, JsStringError, Value, conversion::NativeConversion},
+    value::{JsString, JsStringError, JsValue, conversion::NativeConversion},
     vm::Completion,
 };
 
@@ -24,7 +24,7 @@ pub(crate) enum SubstitutionMatch<'a> {
 
 #[derive(Clone, Copy)]
 pub(crate) enum SubstitutionCaptures<'a> {
-    Converted(&'a [Value]),
+    Converted(&'a [JsValue]),
     MatchRanges(&'a [Option<std::ops::Range<usize>>]),
 }
 
@@ -134,9 +134,10 @@ impl Runtime {
                         match captures.expect("non-zero capture count omitted capture storage") {
                             SubstitutionCaptures::Converted(values) => {
                                 match &values[capture_index] {
-                                    Value::Undefined => {}
-                                    Value::String(value) => {
-                                        buffer.append_js_string(value);
+                                    JsValue::Undefined => {}
+                                    JsValue::String(id) => {
+                                        let state = self.0.state.borrow();
+                                        buffer.append_js_string(state.heap.string(*id)?);
                                         if buffer.error().is_some() {
                                             return Ok(SubstitutionAction::Complete(
                                                 SubstitutionStatus::BufferFailed,
@@ -193,30 +194,38 @@ impl Runtime {
         realm: ContextId,
         buffer: &mut ReplacementStringBuffer,
         substitution: SubstitutionInput<'_>,
-    ) -> Result<Result<SubstitutionStatus, Value>, RuntimeError> {
+    ) -> Result<Result<SubstitutionStatus, JsValue>, RuntimeError> {
         let mut cursor = 0;
         loop {
             let key = match self.advance_get_substitution(buffer, substitution, &mut cursor)? {
                 SubstitutionAction::Complete(status) => return Ok(Ok(status)),
                 SubstitutionAction::Named(key) => key,
             };
-            let capture = match self.get_property_in_realm(
+            let object = substitution
+                .named_captures
+                .expect("named captures disappeared");
+            let capture = match self.internal_get_jsvalue(
                 realm,
-                substitution
-                    .named_captures
-                    .expect("named captures disappeared"),
+                object,
                 &key,
+                JsValue::Object(object.clone().into_handle()),
             )? {
                 Completion::Return(value) => value,
-                Completion::Throw(value) => return Ok(Err(value)),
+                Completion::Throw(value) => {
+                    return Ok(Err(value));
+                }
             };
-            match named_substitution_capture(buffer, capture) {
-                NamedSubstitutionCapture::Skip => continue,
+            match named_substitution_capture(buffer, &capture) {
+                NamedSubstitutionCapture::Skip => {
+                    self.release_jsvalue(capture)?;
+                    continue;
+                }
                 NamedSubstitutionCapture::Failed => {
+                    self.release_jsvalue(capture)?;
                     return Ok(Ok(SubstitutionStatus::BufferFailed));
                 }
-                NamedSubstitutionCapture::Convert(value) => {
-                    let capture = match self.native_to_js_string(realm, &value)? {
+                NamedSubstitutionCapture::Convert => {
+                    let capture = match self.native_to_js_string_jsvalue(realm, capture)? {
                         NativeConversion::Value(value) => value,
                         NativeConversion::Throw(value) => return Ok(Err(value)),
                     };
@@ -241,7 +250,7 @@ impl Runtime {
                     JsStringError::TooLong => "string too long",
                     JsStringError::OutOfMemory => "out of memory",
                 };
-                Ok(NativeConversion::Throw(self.new_native_error(
+                Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Internal,
                     message,
@@ -259,17 +268,17 @@ pub(crate) enum SubstitutionAction {
 pub(crate) enum NamedSubstitutionCapture {
     Skip,
     Failed,
-    Convert(Value),
+    Convert,
 }
 pub(crate) fn named_substitution_capture(
     buffer: &ReplacementStringBuffer,
-    capture: Value,
+    capture: &JsValue,
 ) -> NamedSubstitutionCapture {
-    if matches!(capture, Value::Undefined) {
+    if matches!(capture, JsValue::Undefined) {
         NamedSubstitutionCapture::Skip
     } else if buffer.error().is_some() {
         NamedSubstitutionCapture::Failed
     } else {
-        NamedSubstitutionCapture::Convert(capture)
+        NamedSubstitutionCapture::Convert
     }
 }

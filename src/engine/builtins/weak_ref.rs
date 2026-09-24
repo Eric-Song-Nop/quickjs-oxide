@@ -7,7 +7,7 @@
 use crate::engine::api::error::{Error, ErrorKind, NativeErrorKind};
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
-use crate::engine::atom::AtomKind;
+use crate::engine::atom::{AtomIdx, AtomKind};
 
 use crate::engine::builtins::native::{
     FinalizationRegistryNativeKind, NativeFunctionId, WeakRefNativeKind,
@@ -20,7 +20,7 @@ use crate::engine::object::{
     WellKnownSymbol,
 };
 use crate::engine::value::conversion::NativeConversion;
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
 
@@ -173,26 +173,14 @@ impl Runtime {
         })
     }
 
-    fn weak_target_key(
-        &self,
-        value: &Value,
-        role: &'static str,
-    ) -> Result<Option<WeakCollectionKey>, RuntimeError> {
+    fn weak_target_key(&self, value: &JsValue) -> Result<Option<WeakCollectionKey>, RuntimeError> {
         match value {
-            Value::Object(object) => {
-                if !object.belongs_to(self) {
-                    return Err(RuntimeError::WrongRuntime(role));
-                }
-                Ok(Some(WeakCollectionKey::Object(object.object_id())))
-            }
-            Value::Symbol(symbol) => {
-                if !symbol.belongs_to(self) {
-                    return Err(RuntimeError::WrongRuntime(role));
-                }
-                let atom = symbol.atom();
-                let can_be_held_weakly =
-                    self.0.state.borrow().atoms.kind(atom)? == AtomKind::Symbol;
-                Ok(can_be_held_weakly.then_some(WeakCollectionKey::Symbol(atom)))
+            JsValue::Object(object) => Ok(Some(WeakCollectionKey::Object(*object))),
+            JsValue::Symbol(index) => {
+                let state = self.0.state.borrow();
+                let atom = state.atoms.brand(*index)?;
+                Ok((state.atoms.kind(atom)? == AtomKind::Symbol)
+                    .then_some(WeakCollectionKey::Symbol(atom)))
             }
             _ => Ok(None),
         }
@@ -203,7 +191,7 @@ impl Runtime {
         realm: ContextId,
         message: &'static str,
     ) -> Result<Completion, RuntimeError> {
-        Ok(Completion::Throw(self.new_native_error(
+        Ok(Completion::Throw(self.new_native_error_jsvalue(
             realm,
             NativeErrorKind::Type,
             message,
@@ -296,12 +284,10 @@ impl Runtime {
                         "WeakRef.prototype.deref received the wrong native invocation",
                     ));
                 };
-                let Value::Object(weak_ref) = this_value else {
+                let JsValue::Object(id) = this_value else {
                     return self.invalid_weak_target(realm, "WeakRef object expected");
                 };
-                if !weak_ref.belongs_to(self) {
-                    return Err(RuntimeError::WrongRuntime("WeakRef receiver"));
-                }
+                let weak_ref = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
                 let target = {
                     let state = self.0.state.borrow();
                     state.heap.weak_ref_target(weak_ref.object_id())
@@ -314,7 +300,7 @@ impl Runtime {
                     Err(error) => return Err(error.into()),
                 };
                 let Some(target) = target else {
-                    return Ok(Completion::Return(Value::Undefined));
+                    return Ok(Completion::Return(JsValue::Undefined));
                 };
                 let live = {
                     let state = self.0.state.borrow();
@@ -330,37 +316,43 @@ impl Runtime {
                     }
                 };
                 if !live {
-                    return Ok(Completion::Return(Value::Undefined));
+                    return Ok(Completion::Return(JsValue::Undefined));
                 }
                 let raw = match target {
                     WeakCollectionKey::Object(object) => RawValue::Object(object),
-                    WeakCollectionKey::Symbol(atom) => RawValue::Symbol(atom),
+                    // The branded key atom was already validated by the heap
+                    // lookup above, so it can be narrowed without re-branding.
+                    WeakCollectionKey::Symbol(atom) => {
+                        RawValue::Symbol(AtomIdx::from_raw(atom.raw()))
+                    }
                 };
-                Ok(Completion::Return(self.root_raw_value(&raw)?))
+                Ok(Completion::Return(self.dup_jsvalue(
+                    &JsValue::from_raw(raw.clone()).ok_or(RuntimeError::Invariant(
+                        "stored collection value is uninitialized",
+                    ))?,
+                )?))
             }
         }
     }
 
-    pub(in crate::engine::builtins) fn finalization_registry_receiver<'a>(
+    pub(in crate::engine::builtins) fn finalization_registry_receiver(
         &self,
         realm: ContextId,
-        invocation: &'a NativeInvocation,
-    ) -> Result<NativeConversion<&'a ObjectRef>, RuntimeError> {
+        invocation: &NativeInvocation,
+    ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
         let NativeInvocation::Call { this_value } = invocation else {
             return Err(RuntimeError::Invariant(
                 "FinalizationRegistry method received the wrong native invocation",
             ));
         };
-        let Value::Object(registry) = this_value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        let JsValue::Object(id) = this_value else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "FinalizationRegistry object expected",
             )?));
         };
-        if !registry.belongs_to(self) {
-            return Err(RuntimeError::WrongRuntime("FinalizationRegistry receiver"));
-        }
+        let registry = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
         let has_brand = matches!(
             self.0
                 .state
@@ -371,7 +363,7 @@ impl Runtime {
             ObjectPayload::FinalizationRegistry(_)
         );
         if !has_brand {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "FinalizationRegistry object expected",
@@ -403,56 +395,48 @@ impl Runtime {
 
         let registry = match self.finalization_registry_receiver(realm, invocation)? {
             NativeConversion::Value(registry) => registry,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        let first = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "FinalizationRegistry first argv was not padded",
-            ))?;
+        let first = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "FinalizationRegistry first argv was not padded",
+        ))?;
         match kind {
             FinalizationRegistryNativeKind::Constructor => {
                 unreachable!("FinalizationRegistry constructor returned before receiver validation")
             }
             FinalizationRegistryNativeKind::Register => {
-                let Some(target) = self.weak_target_key(&first, "FinalizationRegistry target")?
-                else {
+                let Some(target) = self.weak_target_key(first)? else {
                     return self.invalid_weak_target(realm, "invalid target");
                 };
-                let held_value =
-                    arguments
-                        .readable
-                        .get(1)
-                        .cloned()
-                        .ok_or(RuntimeError::Invariant(
-                            "FinalizationRegistry held value argv was not padded",
-                        ))?;
-                if first.same_value(&held_value) {
+                let held_value = arguments.readable.get(1).ok_or(RuntimeError::Invariant(
+                    "FinalizationRegistry held value argv was not padded",
+                ))?;
+                let same_target = {
+                    let state = self.0.state.borrow();
+                    crate::engine::value::collection_key::same_value(
+                        &state.heap,
+                        &arguments.readable[0].as_raw(),
+                        &held_value.as_raw(),
+                    )
+                };
+                if same_target {
                     return self.invalid_weak_target(realm, "held value cannot be the target");
                 }
-                let token_value =
-                    arguments
-                        .readable
-                        .get(2)
-                        .cloned()
-                        .ok_or(RuntimeError::Invariant(
-                            "FinalizationRegistry unregister token argv was not padded",
-                        ))?;
-                let unregister_token = if matches!(token_value, Value::Undefined) {
+                let token_value = arguments.readable.get(2).ok_or(RuntimeError::Invariant(
+                    "FinalizationRegistry unregister token argv was not padded",
+                ))?;
+                let unregister_token = if matches!(token_value, JsValue::Undefined) {
                     None
                 } else {
-                    let Some(token) = self
-                        .weak_target_key(&token_value, "FinalizationRegistry unregister token")?
-                    else {
+                    let Some(token) = self.weak_target_key(token_value)? else {
                         return self.invalid_weak_target(realm, "invalid unregister token");
                     };
                     Some(token)
                 };
 
-                self.validate_value_domain(&held_value, "FinalizationRegistry held value")?;
-                let raw_held_value = self.raw_property_value(&held_value)?;
+                let raw_held_value = held_value.as_raw();
                 let mut state = self.0.state.borrow_mut();
                 let retained_atoms = state.retain_raw_value_atoms([&raw_held_value])?;
                 if let Err(error) = state.heap.finalization_registry_register(
@@ -464,13 +448,10 @@ impl Runtime {
                     state.release_atoms(retained_atoms)?;
                     return Err(Self::weak_intrinsic_mutation_error(error));
                 }
-                drop(state);
-                Ok(Completion::Return(Value::Undefined))
+                Ok(Completion::Return(JsValue::Undefined))
             }
             FinalizationRegistryNativeKind::Unregister => {
-                let Some(token) =
-                    self.weak_target_key(&first, "FinalizationRegistry unregister token")?
-                else {
+                let Some(token) = self.weak_target_key(first)? else {
                     return self.invalid_weak_target(realm, "invalid unregister token");
                 };
                 let mut state = self.0.state.borrow_mut();
@@ -478,7 +459,7 @@ impl Runtime {
                     .heap
                     .finalization_registry_unregister(registry.object_id(), token)?;
                 state.apply_cleanup(cleanup)?;
-                Ok(Completion::Return(Value::Bool(removed)))
+                Ok(Completion::Return(JsValue::Bool(removed)))
             }
         }
     }

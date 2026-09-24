@@ -1,7 +1,7 @@
 use crate::engine::api::error::ErrorKind;
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
-use crate::engine::atom::Atom;
+use crate::engine::atom::{Atom, AtomIdx};
 use crate::engine::code::function::metadata::ClosureVariableKind;
 use crate::engine::heap::roots::VarRefRoot;
 
@@ -10,7 +10,7 @@ use crate::engine::object::shape::PropertyFlags;
 use crate::engine::object::{ObjectRef, PropertyKey};
 #[cfg(test)]
 use crate::engine::value::JsString;
-use crate::engine::value::Value;
+use crate::engine::value::{JsValue, Value};
 
 impl Runtime {
     pub(crate) fn check_global_lexical_declaration(
@@ -25,9 +25,11 @@ impl Runtime {
             let lexical_shape = state.heap.shape(lexical.shape)?;
             let global = state.heap.object(context.global_object)?;
             let global_shape = state.heap.shape(global.shape)?;
-            let lexical_exists = lexical_shape.find(key.atom()).is_some();
+            let lexical_exists = lexical_shape
+                .find(AtomIdx::from_raw(key.atom().raw()))
+                .is_some();
             let fixed_global_exists = global_shape
-                .find(key.atom())
+                .find(AtomIdx::from_raw(key.atom().raw()))
                 .and_then(|index| global_shape.entries().get(index as usize))
                 .is_some_and(|entry| !entry.flags.configurable);
             lexical_exists || fixed_global_exists
@@ -52,9 +54,16 @@ impl Runtime {
             let lexical_shape = state.heap.shape(lexical.shape)?;
             let global = state.heap.object(context.global_object)?;
             let global_shape = state.heap.shape(global.shape)?;
-            if global_shape.find(key.atom()).is_none() && !global.extensible {
+            if global_shape
+                .find(AtomIdx::from_raw(key.atom().raw()))
+                .is_none()
+                && !global.extensible
+            {
                 Some(ErrorKind::Type)
-            } else if lexical_shape.find(key.atom()).is_some() {
+            } else if lexical_shape
+                .find(AtomIdx::from_raw(key.atom().raw()))
+                .is_some()
+            {
                 Some(ErrorKind::Syntax)
             } else {
                 None
@@ -92,7 +101,7 @@ impl Runtime {
                 let global = state.heap.object(context.global_object)?;
                 let global_shape = state.heap.shape(global.shape)?;
                 let cannot_define =
-                    match global_shape.find(key.atom()) {
+                    match global_shape.find(AtomIdx::from_raw(key.atom().raw())) {
                         None => !global.extensible,
                         Some(index) => {
                             let index = usize::try_from(index).map_err(|_| {
@@ -112,7 +121,10 @@ impl Runtime {
                     };
                 if cannot_define {
                     Some(ErrorKind::Type)
-                } else if lexical_shape.find(key.atom()).is_some() {
+                } else if lexical_shape
+                    .find(AtomIdx::from_raw(key.atom().raw()))
+                    .is_some()
+                {
                     Some(ErrorKind::Syntax)
                 } else {
                     None
@@ -259,16 +271,22 @@ impl Runtime {
                 let state = self.0.state.borrow();
                 let object = state.heap.object(global_object.object_id())?;
                 let shape = state.heap.shape(object.shape)?;
-                let index = shape.find(key.atom()).ok_or(RuntimeError::Invariant(
-                    "global VarRef disappeared during lexical creation",
-                ))? as usize;
+                let index = shape.find(AtomIdx::from_raw(key.atom().raw())).ok_or(
+                    RuntimeError::Invariant("global VarRef disappeared during lexical creation"),
+                )? as usize;
                 let flags = shape.entries()[index].flags;
                 let value = state.heap.var_ref(root.id())?.value.clone();
                 (flags, value)
             };
-            let value = self.root_raw_value(&value)?;
-            let replacement =
-                self.new_var_ref(value, false, !flags.writable, ClosureVariableKind::Normal)?;
+            let value = JsValue::from_raw(value).ok_or(RuntimeError::Invariant(
+                "global property contains a private sentinel",
+            ))?;
+            let replacement = self.new_var_ref(
+                self.dup_jsvalue(&value)?,
+                false,
+                !flags.writable,
+                ClosureVariableKind::Normal,
+            )?;
             self.store_property_slot(
                 &global_object,
                 key,
@@ -289,7 +307,7 @@ impl Runtime {
         };
         self.set_var_ref_metadata(&root, true, is_const, ClosureVariableKind::Normal)?;
         if let Some(value) = initial_value {
-            self.write_var_ref(&root, value)?;
+            self.write_var_ref(&root, self.into_jsvalue(value)?)?;
         }
         self.store_property_slot(
             &global_var_object,
@@ -344,7 +362,7 @@ impl Runtime {
                 "hidden global VarRef property was not configurable",
             ));
         }
-        self.write_var_ref(&root, Value::Undefined)?;
+        self.write_var_ref(&root, JsValue::Undefined)?;
         self.set_var_ref_metadata(&root, false, false, ClosureVariableKind::Normal)?;
         self.store_property_slot(
             &global_object,
@@ -400,7 +418,7 @@ impl Runtime {
                     "hidden global VarRef property was not configurable",
                 ));
             }
-            self.write_var_ref(&root, Value::Undefined)?;
+            self.write_var_ref(&root, JsValue::Undefined)?;
             self.set_var_ref_metadata(&root, false, false, ClosureVariableKind::Normal)?;
             self.store_property_slot(
                 &global_object,
@@ -420,9 +438,11 @@ impl Runtime {
             let state = self.0.state.borrow();
             let object = state.heap.object(global_object.object_id())?;
             let shape = state.heap.shape(object.shape)?;
-            let index = usize::try_from(shape.find(key.atom()).ok_or(RuntimeError::Invariant(
-                "global function property disappeared after declaration creation",
-            ))?)
+            let index = usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).ok_or(
+                RuntimeError::Invariant(
+                    "global function property disappeared after declaration creation",
+                ),
+            )?)
             .map_err(|_| RuntimeError::Invariant("shape index does not fit usize"))?;
             let flags = shape
                 .entries()
@@ -456,8 +476,10 @@ impl Runtime {
                 }
             }
             PropertySlot::Data(value) => {
-                let value = self.root_raw_value(value)?;
-                self.write_var_ref(&root, value)?;
+                let value = JsValue::from_raw(value.clone()).ok_or(RuntimeError::Invariant(
+                    "global property contains a private sentinel",
+                ))?;
+                self.write_var_ref(&root, self.dup_jsvalue(&value)?)?;
                 if hidden_root
                     .as_ref()
                     .is_none_or(|hidden_root| hidden_root.id() != root.id())
@@ -542,7 +564,7 @@ impl Runtime {
                 .ok_or(RuntimeError::Invariant(
                     "test initialized a missing global lexical binding",
                 ))?;
-        self.write_var_ref(&root, value)
+        self.write_var_ref(&root, self.into_jsvalue(value)?)
     }
 }
 

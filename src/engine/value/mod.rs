@@ -10,7 +10,11 @@ use crate::engine::value::bigint::JsBigInt;
 mod primitive;
 pub use primitive::*;
 
+pub(crate) mod js_value;
+pub(crate) use js_value::JsValue;
+
 #[derive(Clone, Debug)]
+#[must_use]
 pub enum Value {
     Undefined,
     Null,
@@ -24,19 +28,9 @@ pub enum Value {
 }
 
 impl Value {
-    #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::float_cmp)]
     pub fn number(value: f64) -> Self {
         number::operations::Number::compact(value).into()
-    }
-
-    /// Representation-only Number projection; never performs ToNumber.
-    pub(crate) fn as_number_repr(&self) -> Option<number::operations::Number> {
-        match self {
-            Self::Int(value) => Some(number::operations::Number::Int(*value)),
-            Self::Float(value) => Some(number::operations::Number::Float(*value)),
-            _ => None,
-        }
     }
 
     /// Match QuickJS's representation-only `JSValue` comparison. This is

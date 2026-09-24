@@ -3,8 +3,8 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     builtins::native::NativeFunctionId,
     heap::{ContextId, ObjectPayload},
-    object::{CallableRef, DescriptorField, ObjectRef, OrdinaryPropertyDescriptor},
-    value::{Value, conversion::NativeConversion},
+    object::{CallableRef, DescriptorField, ObjectRef, OwnedPropertyDescriptor},
+    value::{JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion,
         call::{ConstructorPrototypeSource, NativeArguments, NativeInvocation},
@@ -13,7 +13,7 @@ use crate::engine::{
 pub(crate) enum ConstructorStep {
     Complete(Completion),
     Prototype {
-        new_target: Value,
+        new_target: JsValue,
         resume: ConstructorResume,
     },
 }
@@ -24,32 +24,46 @@ impl ConstructorStep {
         realm: ContextId,
         invocation: &NativeInvocation,
     ) -> Result<Self, RuntimeError> {
-        let new_target = match invocation {
-            NativeInvocation::Construct {
-                new_target: Value::Object(object),
-            } => object,
-            NativeInvocation::Construct { .. } | NativeInvocation::Call { .. } => {
-                return Ok(Self::Complete(Completion::Throw(
-                    runtime.new_native_error(
-                        realm,
-                        NativeErrorKind::Type,
-                        "constructor requires 'new'",
-                    )?,
-                )));
-            }
-            NativeInvocation::Getter { .. } | NativeInvocation::Setter { .. } => {
+        let NativeInvocation::Construct { new_target } = invocation else {
+            if matches!(
+                invocation,
+                NativeInvocation::Getter { .. } | NativeInvocation::Setter { .. }
+            ) {
                 return Err(RuntimeError::Invariant(
                     "Iterator constructor received an accessor invocation",
                 ));
             }
+            return Ok(Self::Complete(Completion::Throw(
+                runtime.new_native_error_jsvalue(
+                    realm,
+                    NativeErrorKind::Type,
+                    "constructor requires 'new'",
+                )?,
+            )));
         };
+        let new_target_value = runtime.dup_jsvalue(new_target)?;
+        let JsValue::Object(new_target_id) = &new_target_value else {
+            runtime.release_jsvalue(new_target_value)?;
+            return Ok(Self::Complete(Completion::Throw(
+                runtime.new_native_error_jsvalue(
+                    realm,
+                    NativeErrorKind::Type,
+                    "constructor requires 'new'",
+                )?,
+            )));
+        };
+        let new_target = crate::engine::object::ObjectRef::from_borrowed_handle(
+            runtime.clone(),
+            *new_target_id,
+        )?;
         let native_iterator = {
             let state = runtime.0.state.borrow();
             matches!(&state.heap.object(new_target.object_id())?.payload, ObjectPayload::NativeFunction { data, .. } if data.target == NativeFunctionId::IteratorConstructor)
         };
         if native_iterator {
+            runtime.release_jsvalue(new_target_value)?;
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(
+                runtime.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "abstract class not constructable",
@@ -57,7 +71,7 @@ impl ConstructorStep {
             )));
         }
         Ok(Self::Prototype {
-            new_target: Value::Object(new_target.clone()),
+            new_target: new_target_value,
             resume: ConstructorResume,
         })
     }
@@ -93,33 +107,39 @@ impl ConstructorStep {
         };
         if arguments.actual_arg_count == 0 {
             let constructor = runtime.iterator_realm_data(defining_realm)?.constructor;
-            return Ok(Self::Complete(Completion::Return(Value::Object(
-                ObjectRef::from_borrowed_handle(runtime.clone(), constructor)?,
-            ))));
+            return Ok(Self::Complete(Completion::Return(runtime.into_jsvalue(
+                Value::Object(ObjectRef::from_borrowed_handle(
+                    runtime.clone(),
+                    constructor,
+                )?),
+            )?)));
         }
-        let Some(Value::Object(value)) = arguments.readable.first() else {
+        let Some(JsValue::Object(value_id)) = arguments.readable.first() else {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(realm, NativeErrorKind::Type, "not an object")?,
+                runtime.new_native_error_jsvalue(realm, NativeErrorKind::Type, "not an object")?,
             )));
         };
-        let Value::Object(receiver) = this_value else {
+        let JsValue::Object(receiver_id) = this_value else {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(realm, NativeErrorKind::Type, "not an object")?,
+                runtime.new_native_error_jsvalue(realm, NativeErrorKind::Type, "not an object")?,
             )));
         };
+        let receiver = ObjectRef::from_borrowed_handle(runtime.clone(), *receiver_id)?;
         let key =
             runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Constructor)?;
-        let descriptor = OrdinaryPropertyDescriptor {
-            value: DescriptorField::Present(Value::Object(value.clone())),
-            writable: DescriptorField::Present(true),
-            enumerable: DescriptorField::Present(false),
-            configurable: DescriptorField::Present(true),
-            ..OrdinaryPropertyDescriptor::new()
-        };
-        let completion = if runtime.define_own_property(receiver, &key, &descriptor)? {
-            Completion::Return(Value::Undefined)
+        let mut descriptor = OwnedPropertyDescriptor::new(runtime);
+        descriptor.value =
+            DescriptorField::Present(runtime.dup_jsvalue(&JsValue::Object(*value_id))?);
+        descriptor.writable = DescriptorField::Present(true);
+        descriptor.enumerable = DescriptorField::Present(false);
+        descriptor.configurable = DescriptorField::Present(true);
+        let completion = if matches!(
+            runtime.define_owned_property_in_realm(Some(realm), &receiver, &key, &descriptor)?,
+            crate::engine::object::operations::PropertyDefineOutcome::Defined(true)
+        ) {
+            Completion::Return(JsValue::Undefined)
         } else {
-            Completion::Throw(runtime.new_native_error(
+            Completion::Throw(runtime.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "cannot define property",
@@ -151,7 +171,7 @@ impl ConstructorResume {
             }
         };
         Ok(ConstructorStep::Complete(Completion::Return(
-            Value::Object(runtime.new_iterator_object(&prototype)?),
+            runtime.into_jsvalue(Value::Object(runtime.new_iterator_object(&prototype)?))?,
         )))
     }
 }
@@ -165,7 +185,7 @@ pub(crate) fn finish(
             ConstructorStep::Complete(result) => return Ok(result),
             ConstructorStep::Prototype { new_target, resume } => resume.prototype(
                 runtime,
-                runtime.constructor_prototype_source(realm, &new_target)?,
+                runtime.constructor_prototype_source(realm, new_target)?,
             )?,
         };
     }

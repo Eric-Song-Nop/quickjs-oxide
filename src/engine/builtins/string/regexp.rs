@@ -5,7 +5,7 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
     object::{ObjectRef, PropertyKey, WellKnownSymbol},
-    value::{JsString, Value, conversion::NativeConversion},
+    value::{JsString, JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion, ToPrimitiveHint,
         call::{ConstructorRef, DirectCallTarget, NativeArguments, NativeInvocation},
@@ -89,11 +89,13 @@ impl Runtime {
         arguments: &NativeArguments,
         protocol: StringProtocolKind,
     ) -> Result<Completion, RuntimeError> {
-        finish(
-            self,
-            realm,
-            StringProtocolStep::start(self, realm, protocol, &invocation, arguments)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            finish(
+                self,
+                realm,
+                StringProtocolStep::start(self, realm, protocol, invocation, arguments)?,
+            )
+        })
     }
 }
 
@@ -131,19 +133,33 @@ pub(crate) struct StringProtocolResumeState {
     step_pending: StringProtocolStepPending,
     realm: ContextId,
     kind: StringProtocolKind,
-    receiver: Value,
-    pattern: Value,
+    receiver: JsValue,
+    pattern: JsValue,
+    method: JsValue,
+    source: JsValue,
     phase: ProtocolPhase,
 }
 enum ProtocolPhase {
     Method,
-    Match(Value),
-    Flags(Value),
-    FlagsString(Value),
+    Match,
+    Flags,
+    FlagsString,
     Source,
-    Constructed(JsString),
-    ConstructMethod { regexp: ObjectRef, source: JsString },
+    Constructed,
+    ConstructMethod { regexp: ObjectRef },
     Called,
+}
+impl Drop for StringProtocolResumeState {
+    fn drop(&mut self) {
+        for value in [
+            std::mem::replace(&mut self.receiver, JsValue::Undefined),
+            std::mem::replace(&mut self.pattern, JsValue::Undefined),
+            std::mem::replace(&mut self.method, JsValue::Undefined),
+            std::mem::replace(&mut self.source, JsValue::Undefined),
+        ] {
+            let _ = self.step_pending.runtime.release_jsvalue(value);
+        }
+    }
 }
 impl StringProtocolStep {
     pub(crate) fn start(
@@ -156,9 +172,9 @@ impl StringProtocolStep {
         let NativeInvocation::Call { this_value } = invocation else {
             return Err(RuntimeError::Invariant(kind.invocation_invariant()));
         };
-        if matches!(this_value, Value::Null | Value::Undefined) {
+        if matches!(this_value, JsValue::Null | JsValue::Undefined) {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(
+                runtime.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "cannot convert to object",
@@ -168,74 +184,81 @@ impl StringProtocolStep {
         let pattern = arguments
             .readable
             .first()
-            .ok_or(RuntimeError::Invariant(kind.argument_invariant()))?
-            .clone();
+            .ok_or(RuntimeError::Invariant(kind.argument_invariant()))?;
         let key = PropertyKey::from(runtime.well_known_symbol(kind.symbol()));
-        let resume = StringProtocolResume(Box::new(StringProtocolResumeState {
-            step_pending: StringProtocolStepPending::default(),
+        let mut resume = StringProtocolResume(Box::new(StringProtocolResumeState {
+            step_pending: StringProtocolStepPending::new(runtime),
             realm,
             kind,
-            receiver: this_value.clone(),
-            pattern,
+            receiver: JsValue::Undefined,
+            pattern: JsValue::Undefined,
+            method: JsValue::Undefined,
+            source: JsValue::Undefined,
             phase: ProtocolPhase::Method,
         }));
-        if let Value::Object(object) = &resume.pattern {
-            Ok(Self::make_read(object.clone(), key, resume))
+        resume.receiver = runtime.dup_jsvalue(this_value)?;
+        resume.pattern = runtime.dup_jsvalue(pattern)?;
+        if let JsValue::Object(object) = &resume.pattern {
+            let object = ObjectRef::from_borrowed_handle(runtime.clone(), *object)?;
+            Ok(Self::make_read(object, key, resume))
         } else {
-            Ok(resume.source())
+            resume.source(runtime)
         }
     }
 }
 impl StringProtocolResume {
-    fn source(mut self) -> StringProtocolStep {
-        StringProtocolStep::make_primitive(self.0.receiver.clone(), {
-            let updated_0 = ProtocolPhase::Source;
-            self.0.phase = updated_0;
-            self
-        })
+    fn source(mut self, runtime: &Runtime) -> Result<StringProtocolStep, RuntimeError> {
+        Ok(StringProtocolStep::make_primitive(
+            runtime.dup_jsvalue(&self.0.receiver)?,
+            {
+                let updated_0 = ProtocolPhase::Source;
+                self.0.phase = updated_0;
+                self
+            },
+        ))
     }
-    fn selected(
-        self,
-        runtime: &Runtime,
-        method: Value,
-    ) -> Result<StringProtocolStep, RuntimeError> {
-        if matches!(method, Value::Undefined | Value::Null) {
-            return Ok(self.source());
+    fn selected(self, runtime: &Runtime) -> Result<StringProtocolStep, RuntimeError> {
+        if matches!(self.0.method, JsValue::Undefined | JsValue::Null) {
+            return self.source(runtime);
         }
-        let receiver = self.0.pattern.clone();
-        let argument = self.0.receiver.clone();
-        self.call(runtime, receiver, method, argument)
+        self.call_selected(runtime)
     }
-    fn call(
-        mut self,
-        runtime: &Runtime,
-        receiver: Value,
-        method: Value,
-        argument: Value,
-    ) -> Result<StringProtocolStep, RuntimeError> {
-        let callable = match method {
-            Value::Object(object) => runtime.as_callable(&object)?,
+    fn call_selected(mut self, runtime: &Runtime) -> Result<StringProtocolStep, RuntimeError> {
+        let callable = match &self.0.method {
+            JsValue::Object(id) => {
+                runtime.as_callable(&ObjectRef::from_borrowed_handle(runtime.clone(), *id)?)?
+            }
             _ => None,
         };
         let Some(callable) = callable else {
             return Ok(StringProtocolStep::Complete(Completion::Throw(
-                runtime.new_native_error(self.0.realm, NativeErrorKind::Type, "not a function")?,
+                runtime.new_native_error_jsvalue(
+                    self.0.realm,
+                    NativeErrorKind::Type,
+                    "not a function",
+                )?,
             )));
         };
         let mut arguments = Vec::new();
         if arguments.try_reserve_exact(1).is_err() {
             return protocol_oom(runtime, self.0.realm);
         }
-        arguments.push(argument);
+        self.0.step_pending.arguments = Some(arguments);
+        let argument = runtime.dup_jsvalue(&self.0.receiver)?;
+        self.0
+            .step_pending
+            .arguments
+            .as_mut()
+            .expect("call buffer")
+            .push(argument);
+        let receiver = runtime.dup_jsvalue(&self.0.pattern)?;
+        let arguments = self.0.step_pending.arguments.take().expect("call buffer");
+        self.0.phase = ProtocolPhase::Called;
         Ok(StringProtocolStep::make_call(
             DirectCallTarget::Callable(callable),
             receiver,
             arguments,
-            {
-                let updated_0 = ProtocolPhase::Called;
-                self.0.phase = updated_0;
-                self
-            },
+            self,
         ))
     }
     pub(crate) fn resume(
@@ -250,41 +273,45 @@ impl StringProtocolResume {
             }
         };
         let realm = self.0.realm;
-        match self.0.phase {
+        match std::mem::replace(&mut self.0.phase, ProtocolPhase::Called) {
             ProtocolPhase::Method => {
+                self.0.method = value;
                 if matches!(self.0.kind, StringProtocolKind::MatchAll) {
-                    let Value::Object(object) = &self.0.pattern else {
+                    let JsValue::Object(object) = &self.0.pattern else {
                         return Err(RuntimeError::Invariant(
                             "String matchAll check lost its pattern object",
                         ));
                     };
                     Ok(StringProtocolStep::make_read(
-                        object.clone(),
+                        ObjectRef::from_borrowed_handle(runtime.clone(), *object)?,
                         PropertyKey::from(runtime.well_known_symbol(WellKnownSymbol::Match)),
                         {
-                            let updated_0 = ProtocolPhase::Match(value);
+                            let updated_0 = ProtocolPhase::Match;
                             self.0.phase = updated_0;
                             self
                         },
                     ))
                 } else {
-                    self.selected(runtime, value)
+                    self.selected(runtime)
                 }
             }
-            ProtocolPhase::Match(method) => {
-                let Value::Object(object) = &self.0.pattern else {
+            ProtocolPhase::Match => {
+                let JsValue::Object(object) = &self.0.pattern else {
                     return Err(RuntimeError::Invariant(
                         "String matchAll check lost its pattern object",
                     ));
                 };
-                let regexp = runtime.is_regexp_from_match(object, &value)?;
+                let object = ObjectRef::from_borrowed_handle(runtime.clone(), *object)?;
+                let regexp = runtime.is_regexp_from_match_jsvalue(&object, &value);
+                runtime.release_jsvalue(value)?;
+                let regexp = regexp?;
                 if regexp {
                     Ok(StringProtocolStep::make_read(
                         object.clone(),
                         runtime
                             .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Flags)?,
                         {
-                            let updated_0 = ProtocolPhase::Flags(method);
+                            let updated_0 = ProtocolPhase::Flags;
                             self.0.phase = updated_0;
                             self
                         },
@@ -295,13 +322,13 @@ impl StringProtocolResume {
                         self.0.phase = updated_0;
                         self
                     }
-                    .selected(runtime, method)
+                    .selected(runtime)
                 }
             }
-            ProtocolPhase::Flags(method) => {
-                if matches!(value, Value::Undefined | Value::Null) {
+            ProtocolPhase::Flags => {
+                if matches!(value, JsValue::Undefined | JsValue::Null) {
                     return Ok(StringProtocolStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             realm,
                             NativeErrorKind::Type,
                             "cannot convert to object",
@@ -309,12 +336,12 @@ impl StringProtocolResume {
                     )));
                 }
                 Ok(StringProtocolStep::make_primitive(value, {
-                    let updated_0 = ProtocolPhase::FlagsString(method);
+                    let updated_0 = ProtocolPhase::FlagsString;
                     self.0.phase = updated_0;
                     self
                 }))
             }
-            ProtocolPhase::FlagsString(method) => {
+            ProtocolPhase::FlagsString => {
                 let flags = match protocol_string(runtime, realm, value)? {
                     NativeConversion::Value(value) => value,
                     NativeConversion::Throw(value) => {
@@ -323,7 +350,7 @@ impl StringProtocolResume {
                 };
                 if !flags.utf16_units().any(|unit| unit == u16::from(b'g')) {
                     return Ok(StringProtocolStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             realm,
                             NativeErrorKind::Type,
                             "regexp must have the 'g' flag",
@@ -335,13 +362,19 @@ impl StringProtocolResume {
                     self.0.phase = updated_0;
                     self
                 }
-                .selected(runtime, method)
+                .selected(runtime)
             }
             ProtocolPhase::Source => {
-                let source = match protocol_string(runtime, realm, value)? {
-                    NativeConversion::Value(value) => value,
-                    NativeConversion::Throw(value) => {
-                        return Ok(StringProtocolStep::Complete(Completion::Throw(value)));
+                self.0.source = if matches!(value, JsValue::String(_)) {
+                    value
+                } else {
+                    match protocol_string(runtime, realm, value)? {
+                        NativeConversion::Value(value) => {
+                            runtime.into_jsvalue(Value::String(value))?
+                        }
+                        NativeConversion::Throw(value) => {
+                            return Ok(StringProtocolStep::Complete(Completion::Throw(value)));
+                        }
                     }
                 };
                 let constructor = ObjectRef::from_borrowed_handle(
@@ -361,42 +394,67 @@ impl StringProtocolResume {
                 {
                     return protocol_oom(runtime, realm);
                 }
-                arguments.push(self.0.pattern.clone());
+                self.0.step_pending.arguments = Some(arguments);
+                let pattern = runtime.dup_jsvalue(&self.0.pattern)?;
+                self.0
+                    .step_pending
+                    .arguments
+                    .as_mut()
+                    .expect("constructor buffer")
+                    .push(pattern);
                 if all {
-                    arguments.push(Value::String(JsString::from_static("g")));
+                    let flags = runtime.into_jsvalue(Value::String(JsString::from_static("g")))?;
+                    self.0
+                        .step_pending
+                        .arguments
+                        .as_mut()
+                        .expect("constructor buffer")
+                        .push(flags);
                 }
+                let arguments = self
+                    .0
+                    .step_pending
+                    .arguments
+                    .take()
+                    .expect("constructor buffer");
                 Ok(StringProtocolStep::make_construct(
                     ConstructorRef::from_validated_object(constructor),
                     arguments,
                     {
-                        let updated_0 = ProtocolPhase::Constructed(source);
+                        let updated_0 = ProtocolPhase::Constructed;
                         self.0.phase = updated_0;
                         self
                     },
                 ))
             }
-            ProtocolPhase::Constructed(source) => {
-                let Value::Object(regexp) = value else {
+            ProtocolPhase::Constructed => {
+                let JsValue::Object(regexp) = value else {
+                    runtime.release_jsvalue(value)?;
                     return Err(RuntimeError::Invariant(
                         "intrinsic RegExp constructor returned a primitive",
                     ));
                 };
+                let regexp = ObjectRef::from_owned_handle(runtime.clone(), regexp);
                 Ok(StringProtocolStep::make_read(
                     regexp.clone(),
                     PropertyKey::from(runtime.well_known_symbol(self.0.kind.symbol())),
                     {
-                        let updated_0 = ProtocolPhase::ConstructMethod { regexp, source };
+                        let updated_0 = ProtocolPhase::ConstructMethod { regexp };
                         self.0.phase = updated_0;
                         self
                     },
                 ))
             }
-            ProtocolPhase::ConstructMethod { regexp, source } => {
-                let updated_0 = ProtocolPhase::Called;
-                self.0.phase = updated_0;
-                self
+            ProtocolPhase::ConstructMethod { regexp } => {
+                self.0.method = value;
+                runtime.release_jsvalue(std::mem::replace(
+                    &mut self.0.pattern,
+                    JsValue::Object(regexp.into_handle()),
+                ))?;
+                let source = std::mem::replace(&mut self.0.source, JsValue::Undefined);
+                runtime.release_jsvalue(std::mem::replace(&mut self.0.receiver, source))?;
+                self.call_selected(runtime)
             }
-            .call(runtime, Value::Object(regexp), value, Value::String(source)),
             ProtocolPhase::Called => Ok(StringProtocolStep::Complete(Completion::Return(value))),
         }
     }
@@ -404,18 +462,19 @@ impl StringProtocolResume {
 fn protocol_string(
     runtime: &Runtime,
     realm: ContextId,
-    value: Value,
+    value: JsValue,
 ) -> Result<NativeConversion<JsString>, RuntimeError> {
-    if matches!(value, Value::Object(_)) {
+    if matches!(value, JsValue::Object(_)) {
+        runtime.release_jsvalue(value)?;
         return Err(RuntimeError::Invariant(
             "String protocol conversion returned an object",
         ));
     }
-    runtime.native_to_js_string(realm, &value)
+    runtime.native_to_js_string_jsvalue(realm, value)
 }
 fn protocol_oom(runtime: &Runtime, realm: ContextId) -> Result<StringProtocolStep, RuntimeError> {
     Ok(StringProtocolStep::Complete(Completion::Throw(
-        runtime.new_native_error(realm, NativeErrorKind::Internal, "out of memory")?,
+        runtime.new_native_error_jsvalue(realm, NativeErrorKind::Internal, "out of memory")?,
     )))
 }
 fn finish(
@@ -437,8 +496,8 @@ fn finish(
             StringProtocolStep::Primitive { mut resume } => {
                 let value = resume.take_primitive_value();
                 {
-                    let result = if matches!(value, Value::Object(_)) {
-                        runtime.to_primitive(realm, value, ToPrimitiveHint::String)?
+                    let result = if matches!(value, JsValue::Object(_)) {
+                        runtime.to_primitive_jsvalue(realm, value, ToPrimitiveHint::String)?
                     } else {
                         Completion::Return(value)
                     };
@@ -447,30 +506,28 @@ fn finish(
             }
             StringProtocolStep::Call { mut resume } => {
                 let target = resume.take_call_target();
+                let DirectCallTarget::Callable(callable) = target else {
+                    return Err(RuntimeError::Invariant(
+                        "String protocol requested an invalid call target",
+                    ));
+                };
                 let receiver = resume.take_call_receiver();
                 let arguments = resume.take_call_arguments();
-                {
-                    let DirectCallTarget::Callable(callable) = target else {
-                        return Err(RuntimeError::Invariant(
-                            "String protocol requested an invalid call target",
-                        ));
-                    };
-                    resume.resume(
-                        runtime,
-                        runtime.call_internal(realm, &callable, receiver, &arguments)?,
-                    )?
-                }
+                resume.resume(
+                    runtime,
+                    runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?,
+                )?
             }
             StringProtocolStep::Construct { mut resume } => {
                 let constructor = resume.take_construct_constructor();
                 let arguments = resume.take_construct_arguments();
                 resume.resume(
                     runtime,
-                    runtime.construct_constructor_internal(
+                    runtime.construct_internal_jsvalue(
                         realm,
                         &constructor,
-                        &constructor,
-                        &arguments,
+                        crate::engine::vm::call::ConstructNewTarget::Validated(constructor.clone()),
+                        arguments,
                     )?,
                 )?
             }
@@ -478,15 +535,48 @@ fn finish(
     }
 }
 
-#[derive(Default)]
 pub(crate) struct StringProtocolStepPending {
+    runtime: Runtime,
     object: Option<ObjectRef>,
     key: Option<PropertyKey>,
-    value: Option<Value>,
+    value: Option<JsValue>,
     target: Option<DirectCallTarget>,
-    receiver: Option<Value>,
-    arguments: Option<Vec<Value>>,
+    receiver: Option<JsValue>,
+    arguments: Option<Vec<JsValue>>,
     constructor: Option<ConstructorRef>,
+}
+impl StringProtocolStepPending {
+    fn new(runtime: &Runtime) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            object: None,
+            key: None,
+            value: None,
+            target: None,
+            receiver: None,
+            arguments: None,
+            constructor: None,
+        }
+    }
+
+    /// Release the internal edges still owned when the request is abandoned
+    /// before its step consumed them. Taken fields are empty here.
+    fn release_owned(&mut self) {
+        for value in [self.value.take(), self.receiver.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        for argument in self.arguments.take().into_iter().flatten() {
+            let _ = self.runtime.release_jsvalue(argument);
+        }
+    }
+}
+impl Drop for StringProtocolStepPending {
+    fn drop(&mut self) {
+        self.release_owned();
+    }
 }
 impl StringProtocolStep {
     pub(crate) fn make_read(
@@ -498,14 +588,14 @@ impl StringProtocolStep {
         resume.0.step_pending.key = Some(key);
         Self::Read { resume }
     }
-    pub(crate) fn make_primitive(value: Value, mut resume: StringProtocolResume) -> Self {
+    pub(crate) fn make_primitive(value: JsValue, mut resume: StringProtocolResume) -> Self {
         resume.0.step_pending.value = Some(value);
         Self::Primitive { resume }
     }
     pub(crate) fn make_call(
         target: DirectCallTarget,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: StringProtocolResume,
     ) -> Self {
         resume.0.step_pending.target = Some(target);
@@ -515,7 +605,7 @@ impl StringProtocolStep {
     }
     pub(crate) fn make_construct(
         constructor: ConstructorRef,
-        arguments: Vec<Value>,
+        arguments: Vec<JsValue>,
         mut resume: StringProtocolResume,
     ) -> Self {
         resume.0.step_pending.constructor = Some(constructor);
@@ -539,7 +629,7 @@ impl StringProtocolResume {
             .expect("StringProtocolStep::Read lost key")
     }
 
-    pub(crate) fn take_primitive_value(&mut self) -> Value {
+    pub(crate) fn take_primitive_value(&mut self) -> JsValue {
         self.0
             .step_pending
             .value
@@ -554,14 +644,14 @@ impl StringProtocolResume {
             .take()
             .expect("StringProtocolStep::Call lost target")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .step_pending
             .receiver
             .take()
             .expect("StringProtocolStep::Call lost receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .step_pending
             .arguments
@@ -576,7 +666,7 @@ impl StringProtocolResume {
             .take()
             .expect("StringProtocolStep::Construct lost constructor")
     }
-    pub(crate) fn take_construct_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_construct_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .step_pending
             .arguments

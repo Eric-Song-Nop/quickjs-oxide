@@ -26,7 +26,6 @@ pub(super) fn keys(
             } => {
                 let object = object.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
                 if runtime
                     .is_proxy_object(&object)
@@ -37,13 +36,14 @@ pub(super) fn keys(
                         key: Some(key),
                         resume: Some(Resume::OwnFlagReply {
                             enumerable: true,
-                            resume: Box::new(resume),
+                            resume: Box::new(resume.take().expect("selected Step field")),
                         }),
                     };
                 } else {
                     let result = runtime
                         .internal_snapshot_own_property_is_enumerable(realm, &object, &key)
                         .map_err(runtime_error_to_vm_error)?;
+                    let resume = resume.take().expect("selected Step field");
                     *step = resume
                         .boolean(runtime, result)
                         .map_err(runtime_error_to_vm_error)?;
@@ -59,7 +59,6 @@ pub(super) fn keys(
                 let object = object.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
                 let enumerable = enumerable.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
                 if runtime
                     .is_proxy_object(&object)
@@ -70,7 +69,7 @@ pub(super) fn keys(
                         key: Some(key),
                         resume: Some(Resume::OwnFlagReply {
                             enumerable,
-                            resume: Box::new(resume),
+                            resume: Box::new(resume.take().expect("selected Step field")),
                         }),
                     };
                 } else {
@@ -80,6 +79,7 @@ pub(super) fn keys(
                         runtime.internal_has_own_property(realm, &object, &key)
                     }
                     .map_err(runtime_error_to_vm_error)?;
+                    let resume = resume.take().expect("selected Step field");
                     *step = resume
                         .boolean(runtime, result)
                         .map_err(runtime_error_to_vm_error)?;
@@ -88,7 +88,6 @@ pub(super) fn keys(
             }
             Step::Keys { object, resume } => {
                 let object = object.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
                 if runtime
                     .is_proxy_object(&object)
@@ -101,6 +100,7 @@ pub(super) fn keys(
                         let Completion::Throw(value) = overflow(runtime, realm)? else {
                             unreachable!()
                         };
+                        let resume = resume.take().expect("selected Step field");
                         *step = resume
                             .keys(runtime, NativeConversion::Throw(value))
                             .map_err(runtime_error_to_vm_error)?;
@@ -110,6 +110,7 @@ pub(super) fn keys(
                         .parents
                         .try_reserve(1)
                         .map_err(|_| Error::internal("ownKeys continuation allocation failed"))?;
+                    let resume = resume.take().expect("selected Step field");
                     query.parents.push(resume);
                     *step = crate::engine::object::KeysStep::start(runtime, realm, object)
                         .map_err(runtime_error_to_vm_error)?
@@ -118,6 +119,7 @@ pub(super) fn keys(
                     let result = runtime
                         .own_property_keys(&object)
                         .map_err(runtime_error_to_vm_error)?;
+                    let resume = resume.take().expect("selected Step field");
                     *step = resume
                         .keys(runtime, NativeConversion::Value(result))
                         .map_err(runtime_error_to_vm_error)?;
@@ -125,12 +127,11 @@ pub(super) fn keys(
                 continue;
             }
             Step::KeysComplete(result) => {
-                let result = result.take().expect("selected Step field");
-
                 let resume = query
                     .parents
                     .pop()
                     .ok_or_else(|| Error::internal("ownKeys result has no parent"))?;
+                let result = result.take().expect("selected Step field");
                 *step = resume
                     .keys(runtime, result)
                     .map_err(runtime_error_to_vm_error)?;
@@ -143,12 +144,12 @@ pub(super) fn keys(
             } => {
                 let receiver = receiver.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
-                *step = match runtime
+                let read = runtime
                     .prepare_value_property_read_completion(realm, receiver, &key)
-                    .map_err(runtime_error_to_vm_error)?
-                {
+                    .map_err(runtime_error_to_vm_error)?;
+                let resume = resume.take().expect("selected Step field");
+                *step = match read {
                     NativeConversion::Value(read) => Step::PreparedRead {
                         read: Some(read),
                         key: Some(key),
@@ -186,9 +187,6 @@ pub(super) fn set(
                 step: selected,
                 resume,
             } => {
-                let selected = selected.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
-
                 if !execution
                     .frames
                     .can_push_with_continuations(query.continuation_depth())
@@ -196,6 +194,11 @@ pub(super) fn set(
                     let Completion::Throw(value) = overflow(runtime, realm)? else {
                         unreachable!()
                     };
+                    selected
+                        .take()
+                        .expect("selected Step field")
+                        .release(runtime);
+                    let resume = resume.take().expect("selected Step field");
                     *step = resume
                         .set(
                             runtime,
@@ -208,6 +211,8 @@ pub(super) fn set(
                     .parents
                     .try_reserve(1)
                     .map_err(|_| Error::internal("property continuation allocation failed"))?;
+                let selected = selected.take().expect("selected Step field");
+                let resume = resume.take().expect("selected Step field");
                 query.parents.push(resume);
                 *step = (*selected).into();
                 continue;
@@ -222,13 +227,12 @@ pub(super) fn set(
                 continue;
             }
             Step::SetLength { value, resume } => {
-                let value = value.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
-
                 query
                     .parents
                     .try_reserve(1)
                     .map_err(|_| Error::internal("property continuation allocation failed"))?;
+                let value = value.take().expect("selected Step field");
+                let resume = resume.take().expect("selected Step field");
                 query.parents.push(Resume::SetLength(resume));
                 *step = crate::engine::object::ArrayLengthStep::start(runtime, Some(realm), value)
                     .map_err(runtime_error_to_vm_error)?
@@ -246,22 +250,32 @@ pub(super) fn set(
                 let key = key.take().expect("selected Step field");
                 let value = value.take().expect("selected Step field");
                 let receiver = receiver.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
-                match runtime
-                    .prepare_typed_array_set(&object, &key, &value, &receiver)
-                    .map_err(runtime_error_to_vm_error)?
-                {
+                let result = runtime.prepare_typed_array_set(&object, &key, &value, &receiver);
+                let value_cleanup = runtime.release_jsvalue(value);
+                let receiver_cleanup = runtime.release_jsvalue(receiver);
+                if let Err(error) = value_cleanup.and(receiver_cleanup) {
+                    if let Ok(Some(request)) = result {
+                        let mut abandoned: Step = request.into();
+                        abandoned.release_owned(runtime);
+                    }
+                    return Err(runtime_error_to_vm_error(error));
+                }
+                match result.map_err(runtime_error_to_vm_error)? {
                     None => {
+                        let resume = resume.take().expect("selected Step field");
                         *step = resume
                             .special(runtime, None)
                             .map_err(runtime_error_to_vm_error)?
                             .into()
                     }
                     Some(request) => {
-                        query.parents.try_reserve(1).map_err(|_| {
-                            Error::internal("property continuation allocation failed")
-                        })?;
+                        if query.parents.try_reserve(1).is_err() {
+                            let mut abandoned: Step = request.into();
+                            abandoned.release_owned(runtime);
+                            return Err(Error::internal("property continuation allocation failed"));
+                        }
+                        let resume = resume.take().expect("selected Step field");
                         query.parents.push(Resume::SetTyped(resume));
                         *step = request.into();
                     }
@@ -274,11 +288,7 @@ pub(super) fn set(
                 if let crate::engine::object::operations::PropertySetAction::Call { payload } =
                     action
                 {
-                    let crate::engine::object::operations::PropertySetterCall {
-                        setter,
-                        receiver,
-                        argument,
-                    } = *payload;
+                    let (setter, receiver, argument) = payload.into_parts();
 
                     *step = Step::Call {
                         target: Some(DirectCallTarget::Callable(setter)),
@@ -295,6 +305,11 @@ pub(super) fn set(
                     continue;
                 }
                 let Some(Finish::Write { key, strict, .. }) = query.finish.as_ref() else {
+                    if let crate::engine::object::operations::PropertySetAction::Throw(value) =
+                        action
+                    {
+                        let _ = runtime.release_jsvalue(value);
+                    }
                     return Err(Error::internal("Set result has no assignment owner"));
                 };
                 *step = Step::Complete(Some(
@@ -316,31 +331,40 @@ pub(super) fn set(
                 receiver,
                 resume,
             } => {
+                if !execution
+                    .frames
+                    .can_push_with_continuations(query.continuation_depth())
+                {
+                    let Completion::Throw(error) = overflow(runtime, realm)? else {
+                        unreachable!()
+                    };
+                    let resume = resume.take().expect("selected Step field");
+                    let value_cleanup =
+                        runtime.release_jsvalue(value.take().expect("selected Step field"));
+                    let receiver_cleanup =
+                        runtime.release_jsvalue(receiver.take().expect("selected Step field"));
+                    if let Err(failure) = value_cleanup.and(receiver_cleanup) {
+                        let _ = runtime.release_jsvalue(error);
+                        resume.release_owned();
+                        return Err(runtime_error_to_vm_error(failure));
+                    }
+                    *step = resume
+                        .set(
+                            runtime,
+                            crate::engine::object::operations::PropertySetAction::Throw(error),
+                        )
+                        .map_err(runtime_error_to_vm_error)?;
+                    continue;
+                }
+                if query.parents.try_reserve(1).is_err() {
+                    return Err(Error::internal("property continuation allocation failed"));
+                }
                 let object = object.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
                 let value = value.take().expect("selected Step field");
                 let receiver = receiver.take().expect("selected Step field");
                 let resume = resume.take().expect("selected Step field");
 
-                if !execution
-                    .frames
-                    .can_push_with_continuations(query.continuation_depth())
-                {
-                    let Completion::Throw(value) = overflow(runtime, realm)? else {
-                        unreachable!()
-                    };
-                    *step = resume
-                        .set(
-                            runtime,
-                            crate::engine::object::operations::PropertySetAction::Throw(value),
-                        )
-                        .map_err(runtime_error_to_vm_error)?;
-                    continue;
-                }
-                query
-                    .parents
-                    .try_reserve(1)
-                    .map_err(|_| Error::internal("property continuation allocation failed"))?;
                 query.parents.push(resume);
                 *step = crate::engine::object::SetStep::start(
                     runtime,
@@ -366,31 +390,40 @@ pub(super) fn set(
                 receiver,
                 resume,
             } => {
+                if !execution
+                    .frames
+                    .can_push_with_continuations(query.continuation_depth())
+                {
+                    let Completion::Throw(error) = overflow(runtime, realm)? else {
+                        unreachable!()
+                    };
+                    let resume = resume.take().expect("selected Step field");
+                    let value_cleanup =
+                        runtime.release_jsvalue(value.take().expect("selected Step field"));
+                    let receiver_cleanup =
+                        runtime.release_jsvalue(receiver.take().expect("selected Step field"));
+                    if let Err(failure) = value_cleanup.and(receiver_cleanup) {
+                        let _ = runtime.release_jsvalue(error);
+                        resume.release_owned();
+                        return Err(runtime_error_to_vm_error(failure));
+                    }
+                    *step = resume
+                        .set(
+                            runtime,
+                            crate::engine::object::operations::PropertySetAction::Throw(error),
+                        )
+                        .map_err(runtime_error_to_vm_error)?;
+                    continue;
+                }
+                if query.parents.try_reserve(1).is_err() {
+                    return Err(Error::internal("property continuation allocation failed"));
+                }
                 let object = object.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
                 let value = value.take().expect("selected Step field");
                 let receiver = receiver.take().expect("selected Step field");
                 let resume = resume.take().expect("selected Step field");
 
-                if !execution
-                    .frames
-                    .can_push_with_continuations(query.continuation_depth())
-                {
-                    let Completion::Throw(value) = overflow(runtime, realm)? else {
-                        unreachable!()
-                    };
-                    *step = resume
-                        .set(
-                            runtime,
-                            crate::engine::object::operations::PropertySetAction::Throw(value),
-                        )
-                        .map_err(runtime_error_to_vm_error)?;
-                    continue;
-                }
-                query
-                    .parents
-                    .try_reserve(1)
-                    .map_err(|_| Error::internal("property continuation allocation failed"))?;
                 query.parents.push(resume);
                 *step = crate::engine::object::ProxySetStep::start(
                     runtime, realm, object, key, value, receiver,
@@ -432,12 +465,11 @@ pub(super) fn define(
         let realm = query.realm;
         match &mut *step {
             Step::Defined(result) => {
-                let result = result.take().expect("selected Step field");
-
                 let resume = query
                     .parents
                     .pop()
                     .ok_or_else(|| Error::internal("Define result has no parent"))?;
+                let result = result.take().expect("selected Step field");
                 *step = resume
                     .defined(runtime, result)
                     .map_err(runtime_error_to_vm_error)?;
@@ -451,8 +483,28 @@ pub(super) fn define(
             } => {
                 let object = object.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
-                let descriptor = descriptor.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
+                let descriptor = descriptor
+                    .take()
+                    .expect("selected Step field")
+                    .into_owned(runtime)
+                    .map_err(runtime_error_to_vm_error)?;
+                if let Some(accepted) = runtime
+                    .try_define_owned_property(&object, &key, &descriptor)
+                    .map_err(runtime_error_to_vm_error)?
+                {
+                    let result = if accepted {
+                        crate::engine::object::operations::InternalDefineResult::Defined
+                    } else {
+                        crate::engine::object::operations::InternalDefineResult::RejectedOrdinary(
+                            object,
+                        )
+                    };
+                    let resume = resume.take().expect("selected Step field");
+                    *step = resume
+                        .defined(runtime, NativeConversion::Value(result))
+                        .map_err(runtime_error_to_vm_error)?;
+                    continue;
+                }
 
                 if runtime
                     .is_proxy_object(&object)
@@ -465,6 +517,7 @@ pub(super) fn define(
                         let Completion::Throw(value) = overflow(runtime, realm)? else {
                             unreachable!()
                         };
+                        let resume = resume.take().expect("selected Step field");
                         *step = resume
                             .defined(runtime, NativeConversion::Throw(value))
                             .map_err(runtime_error_to_vm_error)?;
@@ -474,7 +527,9 @@ pub(super) fn define(
                         .parents
                         .try_reserve(1)
                         .map_err(|_| Error::internal("property continuation allocation failed"))?;
-                    query.parents.push(resume);
+                    query
+                        .parents
+                        .push(resume.take().expect("selected Step field"));
                     *step = crate::engine::object::ProxyDefineStep::start(
                         runtime, realm, object, key, descriptor,
                     )
@@ -485,8 +540,8 @@ pub(super) fn define(
                 *step = Step::DefineOrdinary {
                     object: Some(object),
                     key: Some(key),
-                    descriptor: Some(descriptor),
-                    resume: Some(resume),
+                    descriptor: Some(descriptor.into()),
+                    resume: Some(resume.take().expect("selected Step field")),
                 };
                 continue;
             }
@@ -498,53 +553,76 @@ pub(super) fn define(
             } => {
                 let object = object.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
-                let descriptor = descriptor.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
-
-                if let Some(length) = runtime
-                    .prepare_array_length_definition(Some(realm), &object, &key, &descriptor)
+                let descriptor = descriptor
+                    .take()
+                    .expect("selected Step field")
+                    .into_owned(runtime)
+                    .map_err(runtime_error_to_vm_error)?;
+                if let Some(accepted) = runtime
+                    .try_define_owned_property(&object, &key, &descriptor)
                     .map_err(runtime_error_to_vm_error)?
                 {
-                    query
-                        .parents
-                        .try_reserve(1)
-                        .map_err(|_| Error::internal("property continuation allocation failed"))?;
+                    let result = if accepted {
+                        crate::engine::object::operations::InternalDefineResult::Defined
+                    } else {
+                        crate::engine::object::operations::InternalDefineResult::RejectedOrdinary(
+                            object,
+                        )
+                    };
+                    let resume = resume.take().expect("selected Step field");
+                    *step = resume
+                        .defined(runtime, NativeConversion::Value(result))
+                        .map_err(runtime_error_to_vm_error)?;
+                    continue;
+                }
+
+                if let Some(length) = runtime
+                    .prepare_array_length_definition_owned(Some(realm), &object, &key, &descriptor)
+                    .map_err(runtime_error_to_vm_error)?
+                {
+                    if query.parents.try_reserve(1).is_err() {
+                        let mut abandoned: Step = length.into();
+                        abandoned.release_owned(runtime);
+                        return Err(Error::internal("property continuation allocation failed"));
+                    }
                     query.parents.push(Resume::DefineLength {
                         payload: Box::new(super::request::DefineLengthPayload {
                             object,
                             key,
                             descriptor,
-                            resume: Box::new(resume),
+                            resume: Box::new(resume.take().expect("selected Step field")),
                         }),
                     });
                     *step = length.into();
                     continue;
                 }
                 if let Some(request) = runtime
-                    .prepare_typed_array_definition(&object, &key, &descriptor)
+                    .prepare_typed_array_definition_owned(&object, &key, &descriptor)
                     .map_err(runtime_error_to_vm_error)?
                 {
-                    query
-                        .parents
-                        .try_reserve(1)
-                        .map_err(|_| Error::internal("property continuation allocation failed"))?;
+                    if query.parents.try_reserve(1).is_err() {
+                        let mut abandoned: Step = request.into();
+                        abandoned.release_owned(runtime);
+                        return Err(Error::internal("property continuation allocation failed"));
+                    }
                     query.parents.push(Resume::DefineTyped {
                         payload: Box::new(super::request::DefineTypedPayload {
                             object,
                             _descriptor: descriptor,
-                            resume: Box::new(resume),
+                            resume: Box::new(resume.take().expect("selected Step field")),
                         }),
                     });
                     *step = request.into();
                     continue;
                 }
                 let result = match runtime
-                        .define_own_property_in_realm(Some(realm), &object, &key, &descriptor)
+                        .define_owned_property_in_realm(Some(realm), &object, &key, &descriptor)
                         .map_err(runtime_error_to_vm_error)? {
                         crate::engine::object::operations::PropertyDefineOutcome::Defined(true) => NativeConversion::Value(crate::engine::object::operations::InternalDefineResult::Defined),
                         crate::engine::object::operations::PropertyDefineOutcome::Defined(false) => NativeConversion::Value(crate::engine::object::operations::InternalDefineResult::RejectedOrdinary(object)),
                         crate::engine::object::operations::PropertyDefineOutcome::Throw(value) => NativeConversion::Throw(value),
                     };
+                let resume = resume.take().expect("selected Step field");
                 *step = resume
                     .defined(runtime, result)
                     .map_err(runtime_error_to_vm_error)?;
@@ -562,6 +640,7 @@ mod local_set_tests {
     use super::super::Parents;
     use super::*;
     use crate::engine::api::Value;
+    use crate::engine::value::JsValue;
     use crate::engine::vm::execution::ExecutionLimits;
 
     #[test]
@@ -585,8 +664,8 @@ mod local_set_tests {
         let mut pending = Step::Set {
             object: Some(array.clone()),
             key: Some(key.clone()),
-            value: Some(Value::Int(7)),
-            receiver: Some(Value::Object(array.clone())),
+            value: Some(JsValue::Int(7)),
+            receiver: Some(runtime.unroot_value(&Value::Object(array.clone())).unwrap()),
             resume: Some(Resume::RootSet),
         };
         let mut execution = RunningExecution::new(
@@ -609,10 +688,10 @@ mod local_set_tests {
             .unwrap(),
             Next::Continue
         ));
-        assert!(matches!(
-            pending,
-            Step::Complete(Some(Completion::Throw(_)))
-        ));
+        let Step::Complete(Some(Completion::Throw(value))) = pending else {
+            panic!("expected an abrupt local set");
+        };
+        runtime.release_jsvalue(value).unwrap();
         assert!(query.parents.is_empty());
         assert!(runtime.get_own_property(&array, &key).unwrap().is_none());
         assert_eq!(

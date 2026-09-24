@@ -9,9 +9,29 @@ impl Heap {
             NodeData::Object(_)
             | NodeData::Shape(_)
             | NodeData::Context(_)
-            | NodeData::FunctionBytecode(_) => Err(HeapError::Invariant(
+            | NodeData::FunctionBytecode(_)
+            | NodeData::String(_)
+            | NodeData::BigInt(_) => Err(HeapError::Invariant(
                 "typed var-ref lookup reached another node payload",
             )),
+        }
+    }
+
+    /// Trusted shared read for a live `VarRefId` held by an owning root.
+    #[inline]
+    pub(in crate::engine::heap) fn var_ref_fast(&self, id: VarRefId) -> &VarRefData {
+        match &self.live_node_fast(RawId::VarRef(id)).data {
+            NodeData::VarRef(var_ref) => var_ref,
+            _ => unreachable!("trusted var-ref handle reached another node payload"),
+        }
+    }
+
+    /// Trusted mutable read for a live `VarRefId` held by an owning root.
+    #[inline]
+    pub(in crate::engine::heap) fn var_ref_fast_mut(&mut self, id: VarRefId) -> &mut VarRefData {
+        match &mut self.live_node_fast_mut(RawId::VarRef(id)).data {
+            NodeData::VarRef(var_ref) => var_ref,
+            _ => unreachable!("trusted var-ref handle reached another node payload"),
         }
     }
 
@@ -25,7 +45,9 @@ impl Heap {
             NodeData::Object(_)
             | NodeData::Shape(_)
             | NodeData::VarRef(_)
-            | NodeData::Context(_) => Err(HeapError::Invariant(
+            | NodeData::Context(_)
+            | NodeData::String(_)
+            | NodeData::BigInt(_) => Err(HeapError::Invariant(
                 "typed bytecode lookup reached another node payload",
             )),
         }
@@ -65,6 +87,29 @@ impl Heap {
         Ok(cleanup)
     }
 
+    /// Exchange two owned edges without a retain/release pair. The caller
+    /// releases the returned previous edge after ending this storage borrow.
+    /// Validation failure returns the unpublished replacement unchanged.
+    pub(crate) fn replace_var_ref_value_owned(
+        &mut self,
+        id: VarRefId,
+        replacement: RawValue,
+    ) -> Result<RawValue, (HeapError, RawValue)> {
+        let validation = self.var_ref(id).and_then(|current| {
+            validate_var_ref_value(
+                current.kind,
+                current.is_lexical,
+                current.is_const,
+                &replacement,
+            )
+        });
+        if let Err(error) = validation {
+            return Err((error, replacement));
+        }
+        let cell = self.var_ref_mut(id).expect("validated live VarRef");
+        Ok(std::mem::replace(&mut cell.value, replacement))
+    }
+
     /// Restricted equivalent of replacement for a mutable, initialized cell
     /// whose old and new values own no heap/atom/primitive-storage edge.
     /// Declining leaves both the cell and all pending cleanup untouched.
@@ -82,26 +127,29 @@ impl Heap {
                     | RawValue::Bool(_)
                     | RawValue::Int(_)
                     | RawValue::Float(_)
+                    | RawValue::ShortBigInt(_)
             )
         }
         if !self.zero_queue.is_empty() || !immediate(&replacement) {
             return false;
         }
-        let Ok(cell) = self.var_ref_mut(id) else {
-            return false;
-        };
+        // The caller holds an owning VarRef root, so the cell is live; a stale
+        // id is a heap invariant violation at this trusted boundary. The
+        // replacement is an immediate, so the only `validate_var_ref_value`
+        // rejection still reachable here is a module-import view, checked
+        // explicitly instead of running the full validator on every write.
+        let cell = self.var_ref_fast_mut(id);
         if cell.is_const
             || cell.kind.is_private()
+            || cell.kind == ClosureVariableKind::ModuleImportView
             || !immediate(&cell.value)
             || expected
                 .is_some_and(|metadata| metadata != (cell.is_lexical, cell.is_const, cell.kind))
-            || validate_var_ref_value(cell.kind, cell.is_lexical, cell.is_const, &replacement)
-                .is_err()
         {
             return false;
         }
-        // Same validator as replace_var_ref_value. Both edge sets and atom
-        // cleanup are empty, and the zero queue was empty before mutation.
+        // Both edge sets and atom cleanup are empty, and the zero queue was
+        // empty before mutation.
         cell.value = replacement;
         true
     }
@@ -133,7 +181,7 @@ mod immediate_write_tests {
         let runtime = crate::engine::api::runtime::Runtime::new();
         let root = runtime
             .new_var_ref(
-                crate::engine::value::Value::Int(1),
+                crate::engine::value::JsValue::Int(1),
                 false,
                 false,
                 ClosureVariableKind::Normal,
@@ -151,10 +199,10 @@ mod immediate_write_tests {
                 .try_replace_immediate_var_ref_value(root.id(), RawValue::Int(2), None)
         );
         assert_eq!(state.heap.zero_queue.len(), 1);
-        assert_eq!(
+        assert!(matches!(
             state.heap.var_ref(root.id()).unwrap().value,
             RawValue::Int(1)
-        );
+        ));
         let cleanup = state.heap.drain_zero_queue().unwrap();
         state.apply_cleanup(cleanup).unwrap();
         assert!(
@@ -162,9 +210,9 @@ mod immediate_write_tests {
                 .heap
                 .try_replace_immediate_var_ref_value(root.id(), RawValue::Int(2), None)
         );
-        assert_eq!(
+        assert!(matches!(
             state.heap.var_ref(root.id()).unwrap().value,
             RawValue::Int(2)
-        );
+        ));
     }
 }

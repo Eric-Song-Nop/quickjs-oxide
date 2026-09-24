@@ -8,7 +8,7 @@ use super::{
 };
 use crate::engine::{
     api::{Error, runtime::Runtime},
-    value::Value,
+    value::JsValue,
 };
 
 pub(super) struct FrameExit {
@@ -18,7 +18,7 @@ pub(super) struct FrameExit {
 
 #[inline(never)]
 pub(super) fn finish(
-    _runtime: &Runtime,
+    runtime: &Runtime,
     execution: &mut RunningExecution,
     id: FrameId,
     exit: RunExit,
@@ -29,7 +29,6 @@ pub(super) fn finish(
     }
     let mut frame = execution.frames.pop(id)?;
     let return_to = frame.cold.return_to;
-    let constructor_return = frame.cold.constructor_return.take();
     let guard = frame.cold.entry_guard.take();
     let completion = match forwarded {
         Some(completion) => completion,
@@ -39,26 +38,45 @@ pub(super) fn finish(
             .map(Completion::Return)
             .ok_or_else(|| Error::internal("owned completion has no payload"))?,
     };
-    execution.slots.clear_frame(frame.window.take())?;
+    execution.slots.clear_frame(runtime, frame.window.take())?;
+    if let Some(mut pending) = frame.cold.iterator_wait.take() {
+        super::iterator_driver::release_wait(runtime, &mut pending)?;
+    }
     if let Some(guard) = guard {
         guard.finish().map_err(runtime_error_to_vm_error)?;
     }
+    let constructor_return = frame.cold.constructor_return.take();
     execution.call_storage.recycle(frame.cold);
     let completion = match (completion, constructor_return) {
         (Completion::Return(value), Some(ConstructorReturn::Base(receiver))) => {
-            Completion::Return(if matches!(value, Value::Object(_)) {
+            Completion::Return(if matches!(value, JsValue::Object(_)) {
+                runtime
+                    .release_jsvalue(receiver)
+                    .map_err(runtime_error_to_vm_error)?;
                 value
             } else {
+                runtime
+                    .release_jsvalue(value)
+                    .map_err(runtime_error_to_vm_error)?;
                 receiver
             })
         }
         (Completion::Return(value), Some(ConstructorReturn::Derived)) => {
-            if !matches!(value, Value::Object(_)) {
+            if !matches!(value, JsValue::Object(_)) {
+                runtime
+                    .release_jsvalue(value)
+                    .map_err(runtime_error_to_vm_error)?;
                 return Err(Error::internal(
                     "derived constructor bytecode returned an unvalidated primitive",
                 ));
             }
             Completion::Return(value)
+        }
+        (completion, Some(ConstructorReturn::Base(receiver))) => {
+            runtime
+                .release_jsvalue(receiver)
+                .map_err(runtime_error_to_vm_error)?;
+            completion
         }
         (completion, _) => completion,
     };

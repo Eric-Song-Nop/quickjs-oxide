@@ -49,26 +49,65 @@ pub(crate) enum PropertySetAction {
     RejectedProxyTrap,
     Complete,
     Rejected(PropertySetRejection),
-    Throw(Value),
+    Throw(crate::engine::value::JsValue),
     Call { payload: Box<PropertySetterCall> },
 }
 
 // Allocated only after selecting a real setter invocation.
 pub(crate) struct PropertySetterCall {
-    pub(crate) setter: CallableRef,
-    pub(crate) receiver: Value,
-    pub(crate) argument: Value,
+    runtime: crate::engine::api::runtime::Runtime,
+    setter: Option<CallableRef>,
+    receiver: Option<crate::engine::value::JsValue>,
+    argument: Option<crate::engine::value::JsValue>,
+}
+impl PropertySetterCall {
+    pub(crate) fn new(
+        runtime: &crate::engine::api::runtime::Runtime,
+        setter: CallableRef,
+        receiver: crate::engine::value::JsValue,
+        argument: crate::engine::value::JsValue,
+    ) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            setter: Some(setter),
+            receiver: Some(receiver),
+            argument: Some(argument),
+        }
+    }
+    pub(crate) fn into_parts(
+        mut self,
+    ) -> (
+        CallableRef,
+        crate::engine::value::JsValue,
+        crate::engine::value::JsValue,
+    ) {
+        (
+            self.setter.take().expect("setter"),
+            self.receiver.take().expect("setter receiver"),
+            self.argument.take().expect("setter argument"),
+        )
+    }
+}
+impl Drop for PropertySetterCall {
+    fn drop(&mut self) {
+        if let Some(receiver) = self.receiver.take() {
+            let _ = self.runtime.release_jsvalue(receiver);
+        }
+        if let Some(value) = self.argument.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
 }
 const _: () = assert!(std::mem::size_of::<PropertySetAction>() <= 64);
 
 pub(crate) enum PropertyDefineOutcome {
     Defined(bool),
-    Throw(Value),
+    Throw(crate::engine::value::JsValue),
 }
 
 pub(crate) enum ArrayLengthConversion {
     Length(u32),
-    Throw(Value),
+    Throw(crate::engine::value::JsValue),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

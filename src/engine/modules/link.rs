@@ -3,7 +3,7 @@ use super::{ModuleBytecodeRef, ModuleDfsFrame, ModuleLinkDfs, ModuleLinkStatus};
 use crate::engine::api::{runtime::Runtime, runtime_error::RuntimeError};
 use crate::engine::heap::{ContextId, RawModuleLinkRealm, RawModuleRef, RawModuleTransition};
 use crate::engine::object::CallableRef;
-use crate::engine::value::Value;
+use crate::engine::value::JsValue;
 use crate::engine::vm::Completion;
 
 pub(crate) enum LinkStep {
@@ -33,7 +33,7 @@ impl LinkStep {
         runtime.prepare_module_instance(module, initiating_realm)?;
         match runtime.module_record(module)?.link_status {
             ModuleLinkStatus::Linked => {
-                return Ok(LinkStep::Complete(Completion::Return(Value::Undefined)));
+                return Ok(LinkStep::Complete(Completion::Return(JsValue::Undefined)));
             }
             ModuleLinkStatus::Linking => {
                 return Err(RuntimeError::Invariant(
@@ -139,7 +139,7 @@ impl LinkResume {
                 dfs,
                 frames,
                 frame,
-                Completion::Return(Value::Undefined),
+                Completion::Return(JsValue::Undefined),
             )?;
         }
         if !dfs.stack.is_empty() {
@@ -148,7 +148,7 @@ impl LinkResume {
             ));
         }
         self.armed = false;
-        Ok(LinkStep::Complete(Completion::Return(Value::Undefined)))
+        Ok(LinkStep::Complete(Completion::Return(JsValue::Undefined)))
     }
     fn finish_frame(
         runtime: &Runtime,
@@ -158,7 +158,7 @@ impl LinkResume {
         completion: Completion,
     ) -> Result<(), RuntimeError> {
         match completion {
-            Completion::Return(Value::Undefined) => {
+            Completion::Return(JsValue::Undefined) => {
                 let entry = dfs
                     .entries
                     .get(&frame.module.module)
@@ -174,7 +174,10 @@ impl LinkResume {
                             cache: frame.module.cache,
                             module: member,
                         };
-                        if runtime.module_record(member)?.link_status != ModuleLinkStatus::Linking {
+                        if !matches!(
+                            runtime.module_record(member)?.link_status,
+                            ModuleLinkStatus::Linking
+                        ) {
                             return Err(RuntimeError::Invariant(
                                 "module link SCC contained a non-linking member",
                             ));
@@ -202,12 +205,15 @@ impl LinkResume {
                 ));
             }
             Completion::Throw(exception) => {
-                runtime.set_pending_exception(exception)?;
+                runtime.set_pending_exception_jsvalue(exception)?;
                 return Err(RuntimeError::Exception);
             }
         }
 
-        if runtime.module_record(frame.module)?.link_status == ModuleLinkStatus::Linking {
+        if matches!(
+            runtime.module_record(frame.module)?.link_status,
+            ModuleLinkStatus::Linking
+        ) {
             let dependency_ancestor = dfs
                 .entries
                 .get(&frame.module.module)
@@ -262,7 +268,7 @@ impl Drop for LinkResume {
             if self
                 .runtime
                 .module_record(member)
-                .is_ok_and(|record| record.link_status == ModuleLinkStatus::Linking)
+                .is_ok_and(|record| matches!(record.link_status, ModuleLinkStatus::Linking))
             {
                 let _ = self
                     .runtime
@@ -283,7 +289,9 @@ pub(crate) fn resume_reply(
                 .ok_or(RuntimeError::Invariant(
                     "module link exception has no pending value",
                 ))?;
-            Ok(LinkStep::Complete(Completion::Throw(reason)))
+            Ok(LinkStep::Complete(Completion::Throw(
+                runtime.into_jsvalue(reason)?,
+            )))
         }
         result => result,
     }

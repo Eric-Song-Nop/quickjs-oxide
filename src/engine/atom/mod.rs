@@ -19,6 +19,7 @@
 //! for future C-ABI compatibility without letting a stale or cross-runtime
 //! [`Atom`] alias the new occupant.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -146,6 +147,86 @@ impl fmt::Debug for Atom {
     }
 }
 
+/// Crate-internal unbranded atom index for trusted owners.
+///
+/// `AtomIdx` carries only the compact `u32` encoding of an [`Atom`] (table
+/// slot, or the immediate-integer tag space).  It is held by owners which
+/// already retain the atom — shape entries, bytecode key tables, pinned sets,
+/// and internal value handles — under the same liveness argument as the
+/// heap's trusted fast accessors: while an owning edge exists, the slot
+/// cannot be reclaimed or reused.  Brand checks (generation/table ID) run in
+/// full at boundary conversions ([`AtomTable::brand`] /
+/// [`AtomTable::unbrand`]) and in debug builds on trusted paths.
+///
+/// Copying an `AtomIdx` does *not* retain the atom; explicit retain/release
+/// discipline applies exactly as for [`Atom`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AtomIdx(u32);
+
+impl AtomIdx {
+    /// Sentinel used for "no atom", mirroring [`Atom::NULL`].
+    pub const NULL: Self = Self(0);
+
+    /// Reconstruct an index from its raw representation without validation.
+    /// Immediate integers remain usable; table-backed values are only safe
+    /// from owners which already retain the atom.
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Return the compact raw representation.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// Whether this is the reserved null sentinel.
+    #[must_use]
+    pub const fn is_null(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether this index directly encodes a non-negative integer property.
+    #[must_use]
+    pub const fn is_immediate_integer(self) -> bool {
+        self.0 & ATOM_TAG_INT != 0
+    }
+
+    /// Decode an immediate integer index.
+    #[must_use]
+    pub const fn immediate_integer(self) -> Option<u32> {
+        if self.is_immediate_integer() {
+            Some(self.0 & !ATOM_TAG_INT)
+        } else {
+            None
+        }
+    }
+
+    /// Construct an immediate integer index when `value` is within
+    /// `QuickJS`'s direct-encoding range.
+    #[must_use]
+    pub const fn from_immediate_integer(value: u32) -> Option<Self> {
+        if value <= ATOM_MAX_INT {
+            Some(Self(ATOM_TAG_INT | value))
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Debug for AtomIdx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_null() {
+            f.write_str("AtomIdx::NULL")
+        } else if let Some(value) = self.immediate_integer() {
+            write!(f, "AtomIdx::Integer({value})")
+        } else {
+            write!(f, "AtomIdx({})", self.0)
+        }
+    }
+}
+
 /// Internal atom classification needed to implement ECMAScript property keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AtomKind {
@@ -254,7 +335,7 @@ impl From<JsStringError> for AtomError {
 struct Entry {
     kind: AtomKind,
     text: Option<JsString>,
-    ref_count: u32,
+    ref_count: Cell<u32>,
     pinned: bool,
 }
 
@@ -266,7 +347,7 @@ impl Entry {
                 Some(text) => AtomSpelling::Text(text),
                 None => AtomSpelling::NoDescription,
             },
-            ref_count: (!self.pinned).then_some(self.ref_count),
+            ref_count: (!self.pinned).then_some(self.ref_count.get()),
             is_permanent: self.pinned,
         }
     }
@@ -283,14 +364,28 @@ pub struct AtomTable {
     entries: Vec<Option<Entry>>,
     generations: Vec<u32>,
     free: Vec<u32>,
-    strings: HashMap<JsString, Atom>,
+    strings: HashMap<JsString, Atom, crate::engine::hash::FxBuildHasher>,
     /// Released String atoms retain only weak identities. If an atom-derived
     /// JavaScript String is still live, a later interning operation must reuse
     /// that exact cell just as QuickJS's unified JSString/atom refcount does.
-    released_strings: HashMap<u32, Vec<WeakJsString>>,
+    released_strings: HashMap<u32, Vec<WeakJsString>, crate::engine::hash::FxBuildHasher>,
     released_string_cleanup_budget: u16,
-    global_symbols: HashMap<JsString, Atom>,
+    global_symbols: HashMap<JsString, Atom, crate::engine::hash::FxBuildHasher>,
     live_table_atoms: usize,
+    /// Debug-only edge ledger: creation-site provenance for non-pinned atom
+    /// slots.  See [`AtomTable::debug_leak_report`].
+    #[cfg(debug_assertions)]
+    alloc_sites: Vec<Option<AtomAllocSite>>,
+}
+
+/// Debug-only creation-site provenance for one atom slot.
+#[cfg(debug_assertions)]
+#[derive(Debug)]
+pub(crate) struct AtomAllocSite {
+    generation: u32,
+    kind: AtomKind,
+    summary: String,
+    backtrace: String,
 }
 
 impl Default for AtomTable {
@@ -310,11 +405,13 @@ impl AtomTable {
             entries: vec![None],
             generations: vec![0],
             free: Vec::new(),
-            strings: HashMap::new(),
-            released_strings: HashMap::new(),
+            strings: HashMap::default(),
+            released_strings: HashMap::default(),
             released_string_cleanup_budget: 256,
-            global_symbols: HashMap::new(),
+            global_symbols: HashMap::default(),
             live_table_atoms: 0,
+            #[cfg(debug_assertions)]
+            alloc_sites: Vec::new(),
         }
     }
 
@@ -679,19 +776,60 @@ impl AtomTable {
     /// Returns [`AtomError::UnknownAtom`] for an invalid or released table ID,
     /// or [`AtomError::RefCountOverflow`] if its counter is already maximal.
     pub fn retain(&mut self, atom: Atom) -> Result<Atom, AtomError> {
+        self.retain_shared(atom)
+    }
+
+    /// Shared-borrow variant of [`AtomTable::retain`].
+    ///
+    /// The counter lives in a [`Cell`], so a trusted owner can duplicate its
+    /// reference while the table is only immutably borrowed (symbol fast
+    /// paths).  Brand validation runs here, at the boundary; the counter
+    /// update itself goes through the unbranded index operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`AtomTable::retain`].
+    pub(crate) fn retain_shared(&self, atom: Atom) -> Result<Atom, AtomError> {
         if atom.is_null() || atom.is_immediate_integer() {
             return Ok(atom);
         }
-
-        let entry = self.entry_mut(atom)?;
-        if entry.pinned {
-            return Ok(atom);
-        }
-        entry.ref_count = entry
-            .ref_count
-            .checked_add(1)
-            .ok_or(AtomError::RefCountOverflow(atom))?;
+        self.entry(atom)?;
+        self.retain_index_shared(AtomIdx::from_raw(atom.raw()))?;
         Ok(atom)
+    }
+
+    /// Duplicate one owning reference by unbranded index.
+    ///
+    /// This is the internal operation for owners which already hold their
+    /// atom under the retain invariant (value slots, shapes, bytecode).  The
+    /// slot itself is validated; no brand stamp is required or checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtomError::UnknownAtom`] for an invalid or released index,
+    /// or [`AtomError::RefCountOverflow`] if its counter is already maximal.
+    pub(crate) fn retain_index_shared(&self, index: AtomIdx) -> Result<(), AtomError> {
+        if index.is_null() || index.is_immediate_integer() {
+            return Ok(());
+        }
+        let entry = self.entry_by_raw(index.raw())?;
+        if entry.pinned {
+            return Ok(());
+        }
+        let atom = Atom::from_raw(index.raw());
+        entry.ref_count.set(
+            entry
+                .ref_count
+                .get()
+                .checked_add(1)
+                .ok_or(AtomError::RefCountOverflow(atom))?,
+        );
+        Ok(())
+    }
+
+    /// Mutable-borrow form of [`AtomTable::retain_index_shared`].
+    pub(crate) fn retain_index(&mut self, index: AtomIdx) -> Result<(), AtomError> {
+        self.retain_index_shared(index)
     }
 
     /// Drop one explicit owning reference.
@@ -701,29 +839,156 @@ impl AtomTable {
     /// Returns [`AtomError::UnknownAtom`] for an invalid or already released
     /// table ID.
     pub fn release(&mut self, atom: Atom) -> Result<ReleaseOutcome, AtomError> {
+        if !self.release_shared(atom)? {
+            return Ok(if atom.is_null() || atom.is_immediate_integer() {
+                ReleaseOutcome::Permanent
+            } else {
+                // The entry is either pinned or still referenced; both read
+                // cleanly through the shared path.
+                let entry = self.entry(atom)?;
+                if entry.pinned {
+                    ReleaseOutcome::Permanent
+                } else {
+                    ReleaseOutcome::Retained(entry.ref_count.get())
+                }
+            });
+        }
+        self.remove_released(atom)?;
+        Ok(ReleaseOutcome::Removed)
+    }
+
+    /// Shared-borrow release: decrement the counter without a `&mut` table.
+    ///
+    /// Returns `Ok(true)` when the counter reached zero; the caller must then
+    /// ensure [`AtomTable::remove_released`] runs (immediately with a mutable
+    /// borrow, or deferred through the runtime's deferred queue).  A racing
+    /// retain may resurrect the entry before removal, in which case removal
+    /// is skipped and the new owner stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtomError::UnknownAtom`] for an invalid, released, or
+    /// already-zero table ID.
+    pub(crate) fn release_shared(&self, atom: Atom) -> Result<bool, AtomError> {
         if atom.is_null() || atom.is_immediate_integer() {
-            return Ok(ReleaseOutcome::Permanent);
+            return Ok(false);
         }
+        self.entry(atom)?;
+        self.release_index_shared(AtomIdx::from_raw(atom.raw()))
+    }
 
-        let index = self.valid_index(atom)?;
-        let entry = self.entries[index]
-            .as_mut()
-            .ok_or(AtomError::UnknownAtom(atom))?;
+    /// Shared-borrow release by unbranded index.
+    ///
+    /// Returns `Ok(true)` when the counter reached zero; the caller must then
+    /// ensure [`AtomTable::remove_released_index`] runs.  See
+    /// [`AtomTable::release_shared`] for the resurrection semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtomError::UnknownAtom`] for an invalid, released, or
+    /// already-zero index.
+    pub(crate) fn release_index_shared(&self, index: AtomIdx) -> Result<bool, AtomError> {
+        if index.is_null() || index.is_immediate_integer() {
+            return Ok(false);
+        }
+        let entry = self.entry_by_raw(index.raw())?;
         if entry.pinned {
+            return Ok(false);
+        }
+        let count = entry.ref_count.get();
+        if count == 0 {
+            return Err(AtomError::UnknownAtom(Atom::from_raw(index.raw())));
+        }
+        let next = count - 1;
+        entry.ref_count.set(next);
+        Ok(next == 0)
+    }
+
+    /// Remove the slot of an atom whose counter already reached zero.
+    ///
+    /// Callers reach this after [`AtomTable::release_shared`] reported zero.
+    /// If a racing retain resurrected the entry (counter nonzero) or it was
+    /// pinned in between, removal is skipped and ownership stands.  All other
+    /// invalid identities are an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtomError::UnknownAtom`] for an invalid or released table ID.
+    pub(crate) fn remove_released(&mut self, atom: Atom) -> Result<(), AtomError> {
+        if atom.is_null() || atom.is_immediate_integer() {
+            return Ok(());
+        }
+        self.entry(atom)?;
+        self.remove_released_index(AtomIdx::from_raw(atom.raw()))
+    }
+
+    /// Mutable-borrow release by unbranded index: decrement the counter and
+    /// reclaim the slot when it reaches zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtomError::UnknownAtom`] for an invalid or already released
+    /// index.
+    pub(crate) fn release_index(&mut self, index: AtomIdx) -> Result<ReleaseOutcome, AtomError> {
+        // Immediate integers and the null sentinel are permanent and carry no
+        // table entry; shape entries for array-index keys push these into
+        // heap cleanups, exactly as the branded path always has.
+        if index.is_null() || index.is_immediate_integer() {
             return Ok(ReleaseOutcome::Permanent);
         }
-
-        if entry.ref_count == 0 {
-            return Err(AtomError::UnknownAtom(atom));
+        if !self.release_index_shared(index)? {
+            let entry = self.entry_by_raw(index.raw())?;
+            return Ok(if entry.pinned {
+                ReleaseOutcome::Permanent
+            } else {
+                ReleaseOutcome::Retained(entry.ref_count.get())
+            });
         }
-        entry.ref_count -= 1;
-        if entry.ref_count != 0 {
-            return Ok(ReleaseOutcome::Retained(entry.ref_count));
-        }
+        self.remove_released_index(index)?;
+        Ok(ReleaseOutcome::Removed)
+    }
 
-        let entry = self.entries[index]
+    /// Whether an unbranded index is currently live in this table.
+    ///
+    /// Null is a sentinel rather than a live atom.  All well-formed immediate
+    /// integers are live without table storage.
+    #[must_use]
+    pub(crate) fn is_live_index(&self, index: AtomIdx) -> bool {
+        if index.is_null() {
+            return false;
+        }
+        if index.is_immediate_integer() {
+            return true;
+        }
+        self.raw_index_live(index.raw())
+    }
+
+    /// Remove the slot of an atom index whose counter already reached zero.
+    ///
+    /// See [`AtomTable::remove_released`] for the resurrection semantics; this
+    /// is the same operation for owners holding unbranded indices.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtomError::UnknownAtom`] for an invalid or released index.
+    pub(crate) fn remove_released_index(&mut self, index: AtomIdx) -> Result<(), AtomError> {
+        if index.is_null() || index.is_immediate_integer() {
+            return Ok(());
+        }
+        let raw = index.raw();
+        let index_usize = raw as usize;
+        if self.generations.get(index_usize).is_none() || self.entries.get(index_usize).is_none() {
+            return Err(AtomError::UnknownAtom(Atom::from_raw(raw)));
+        }
+        let entry = self.entries[index_usize]
+            .as_ref()
+            .ok_or(AtomError::UnknownAtom(Atom::from_raw(raw)))?;
+        if entry.pinned || entry.ref_count.get() != 0 {
+            return Ok(());
+        }
+        let entry = self.entries[index_usize]
             .take()
-            .ok_or(AtomError::UnknownAtom(atom))?;
+            .ok_or(AtomError::UnknownAtom(Atom::from_raw(raw)))?;
         match entry.kind {
             AtomKind::String => {
                 if let Some(text) = entry.text {
@@ -742,11 +1007,15 @@ impl AtomTable {
             AtomKind::Symbol | AtomKind::Private => {}
         }
         self.live_table_atoms -= 1;
-        if let Some(generation) = self.generations[index].checked_add(1) {
-            self.generations[index] = generation;
-            self.free.push(atom.raw());
+        if let Some(generation) = self.generations[index_usize].checked_add(1) {
+            self.generations[index_usize] = generation;
+            self.free.push(raw);
         }
-        Ok(ReleaseOutcome::Removed)
+        #[cfg(debug_assertions)]
+        if let Some(site) = self.alloc_sites.get_mut(index_usize) {
+            *site = None;
+        }
+        Ok(())
     }
 
     /// Make a live table-backed atom permanent.
@@ -763,7 +1032,7 @@ impl AtomTable {
         }
         let entry = self.entry_mut(atom)?;
         entry.pinned = true;
-        entry.ref_count = 0;
+        entry.ref_count.set(0);
         Ok(())
     }
 
@@ -895,6 +1164,49 @@ impl AtomTable {
         self.valid_index(atom).is_ok()
     }
 
+    /// Strip the brand from a validated atom at an internal boundary.
+    ///
+    /// Trusted owners hold the resulting [`AtomIdx`] under the retain
+    /// invariant; the full generation/table-ID check runs here, at the
+    /// boundary, for every caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtomError::UnknownAtom`] for an invalid or released table ID.
+    pub(crate) fn unbrand(&self, atom: Atom) -> Result<AtomIdx, AtomError> {
+        if atom.is_null() || atom.is_immediate_integer() {
+            return Ok(AtomIdx::from_raw(atom.raw()));
+        }
+        self.entry(atom)?;
+        Ok(AtomIdx::from_raw(atom.raw()))
+    }
+
+    /// Re-attach the table's brand to an internal atom index.
+    ///
+    /// This is the checked mirror of [`AtomTable::unbrand`] and performs the
+    /// same full validation: a stale or foreign index is rejected here, at the
+    /// boundary, rather than deeper in the engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtomError::UnknownAtom`] for an invalid or released index.
+    pub(crate) fn brand(&self, index: AtomIdx) -> Result<Atom, AtomError> {
+        if index.is_null() || index.is_immediate_integer() {
+            return Ok(Atom::from_raw(index.raw()));
+        }
+        let atom = Atom {
+            raw: index.raw(),
+            generation: self
+                .generations
+                .get(index.raw() as usize)
+                .copied()
+                .ok_or(AtomError::UnknownAtom(Atom::from_raw(index.raw())))?,
+            table_id: self.table_id,
+        };
+        self.entry(atom)?;
+        Ok(atom)
+    }
+
     fn allocate(
         &mut self,
         kind: AtomKind,
@@ -925,14 +1237,99 @@ impl AtomTable {
             generation: self.generations[index_usize],
             table_id: self.table_id,
         };
+        #[cfg(debug_assertions)]
+        if !pinned && crate::engine::heap::ownership::alloc_site_capture_enabled() {
+            self.record_alloc_site(index, self.generations[index_usize], kind, text.as_ref());
+        }
         self.entries[index_usize] = Some(Entry {
             kind,
             text,
-            ref_count: u32::from(!pinned),
+            ref_count: Cell::new(u32::from(!pinned)),
             pinned,
         });
         self.live_table_atoms += 1;
         Ok(atom)
+    }
+
+    /// Record the creation site of one non-pinned atom slot for the debug
+    /// edge ledger.
+    #[cfg(debug_assertions)]
+    fn record_alloc_site(
+        &mut self,
+        index: u32,
+        generation: u32,
+        kind: AtomKind,
+        text: Option<&JsString>,
+    ) {
+        let summary = text
+            .map(|text| text.to_utf8_lossy().chars().take(60).collect::<String>())
+            .unwrap_or_default();
+        let backtrace = crate::engine::heap::ownership::compact_backtrace();
+        let index = index as usize;
+        if self.alloc_sites.len() <= index {
+            self.alloc_sites.resize_with(index + 1, || None);
+        }
+        self.alloc_sites[index] = Some(AtomAllocSite {
+            generation,
+            kind,
+            summary,
+            backtrace,
+        });
+    }
+
+    /// Count retained non-permanent atoms independently of heap-node liveness.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_live_unpinned_count(&self) -> usize {
+        self.entries
+            .iter()
+            .flatten()
+            .filter(|entry| !entry.pinned && entry.ref_count.get() != 0)
+            .count()
+    }
+
+    /// Print the debug edge ledger for every atom that still holds a reference.
+    ///
+    /// Pinned atoms are permanent by design and are skipped; a non-pinned
+    /// entry with a nonzero counter at teardown is a leak.  Runs only on the
+    /// teardown failure/diagnosis path.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_leak_report(&self) {
+        let mut leaked = 0usize;
+        let mut shown = 0usize;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let Some(entry) = entry else {
+                continue;
+            };
+            if entry.pinned || entry.ref_count.get() == 0 {
+                continue;
+            }
+            leaked += 1;
+            if shown == 8 {
+                continue;
+            }
+            shown += 1;
+            let site = self
+                .alloc_sites
+                .get(index)
+                .and_then(|site| site.as_ref())
+                .filter(|site| site.generation == self.generations[index]);
+            match site {
+                Some(site) => eprintln!(
+                    "[atom-ledger] #{index} {:?} refs={} text={:?} created at {}",
+                    site.kind,
+                    entry.ref_count.get(),
+                    site.summary,
+                    site.backtrace
+                ),
+                None => eprintln!(
+                    "[atom-ledger] #{index} refs={} no creation backtrace recorded",
+                    entry.ref_count.get()
+                ),
+            }
+        }
+        if leaked != 0 {
+            eprintln!("[atom-ledger] leaked_atoms={leaked} shown={shown}");
+        }
     }
 
     fn valid_index(&self, atom: Atom) -> Result<usize, AtomError> {
@@ -957,6 +1354,27 @@ impl AtomTable {
         Ok(self.entries[index]
             .as_ref()
             .expect("valid_index guarantees a live entry"))
+    }
+
+    /// Validate a raw table index and return its live entry, without a brand
+    /// stamp.  Internal owners use this under the retain invariant; boundary
+    /// callers must keep using [`AtomTable::entry`] with a branded [`Atom`].
+    fn entry_by_raw(&self, raw: u32) -> Result<&Entry, AtomError> {
+        let index = raw as usize;
+        if self.generations.get(index).is_none() {
+            return Err(AtomError::UnknownAtom(Atom::from_raw(raw)));
+        }
+        match self.entries.get(index) {
+            Some(Some(_)) => Ok(self.entries[index]
+                .as_ref()
+                .expect("entries presence was just checked")),
+            _ => Err(AtomError::UnknownAtom(Atom::from_raw(raw))),
+        }
+    }
+
+    /// Slot liveness for a raw index, without a brand stamp.
+    fn raw_index_live(&self, raw: u32) -> bool {
+        self.entry_by_raw(raw).is_ok()
     }
 
     fn entry_mut(&mut self, atom: Atom) -> Result<&mut Entry, AtomError> {

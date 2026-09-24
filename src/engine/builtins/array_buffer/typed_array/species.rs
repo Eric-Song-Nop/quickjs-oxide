@@ -9,7 +9,7 @@ use crate::engine::{
     builtins::native::TypedArrayElementKind,
     heap::ContextId,
     object::{ObjectRef, PropertyKey, WellKnownSymbol},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{Completion, call::ConstructorRef},
 };
 
@@ -54,14 +54,21 @@ impl Runtime {
     pub(crate) fn typed_array_create_from_constructor(
         &self,
         realm: ContextId,
-        constructor: Value,
+        constructor: JsValue,
         length: u64,
     ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
-        self.typed_array_create_from_constructor_arguments(
+        finish_species(
+            self,
             realm,
-            constructor,
-            &[Value::number(length as f64)],
-            Some(length),
+            TypedSpeciesStep::create(
+                self,
+                realm,
+                constructor,
+                vec![
+                    crate::engine::value::number::operations::Number::compact(length as f64).into(),
+                ],
+                Some(length),
+            )?,
         )
     }
 
@@ -74,11 +81,12 @@ impl Runtime {
     pub(crate) fn typed_array_create_from_static_constructor(
         &self,
         realm: ContextId,
-        constructor: Value,
+        constructor: JsValue,
         length: u64,
     ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
-        if !matches!(&constructor, Value::Object(_)) {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        if !matches!(&constructor, JsValue::Object(_)) {
+            self.release_jsvalue(constructor)?;
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "not a function",
@@ -87,32 +95,6 @@ impl Runtime {
         self.typed_array_create_from_constructor(realm, constructor, length)
     }
 
-    /// Construct and validate a species result with the exact authored
-    /// argument vector. QuickJS only enforces a minimum result length for its
-    /// one-argument create form; `subarray` deliberately uses two or three
-    /// arguments and therefore accepts any live TypedArray result.
-    fn typed_array_create_from_constructor_arguments(
-        &self,
-        realm: ContextId,
-        constructor: Value,
-        arguments: &[Value],
-        minimum_length: Option<u64>,
-    ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
-        let mut owned = Vec::new();
-        if owned.try_reserve_exact(arguments.len()).is_err() {
-            return Ok(NativeConversion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Internal,
-                "out of memory",
-            )?));
-        }
-        owned.extend_from_slice(arguments);
-        finish_species(
-            self,
-            realm,
-            TypedSpeciesStep::create(self, realm, constructor, owned, minimum_length)?,
-        )
-    }
     fn validate_typed_array_construction(
         &self,
         realm: ContextId,
@@ -120,18 +102,23 @@ impl Runtime {
         minimum_length: Option<u64>,
     ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
         let target = match result {
-            Completion::Return(Value::Object(value)) => value,
-            Completion::Return(_) => {
-                return Ok(NativeConversion::Throw(self.new_native_error(
-                    realm,
-                    NativeErrorKind::Type,
-                    "not a TypedArray",
-                )?));
+            Completion::Return(value) => match value {
+                JsValue::Object(object) => ObjectRef::from_owned_handle(self.clone(), object),
+                value => {
+                    self.release_jsvalue(value)?;
+                    return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+                        realm,
+                        NativeErrorKind::Type,
+                        "not a TypedArray",
+                    )?));
+                }
+            },
+            Completion::Throw(value) => {
+                return Ok(NativeConversion::Throw(value));
             }
-            Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
         };
         let Some(_) = self.typed_array_snapshot_if_branded(&target)? else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "not a TypedArray",
@@ -142,7 +129,7 @@ impl Runtime {
             NativeConversion::Throw(value) => return Ok(NativeConversion::Throw(value)),
         };
         if minimum_length.is_some_and(|length| u64::from(target_length) < length) {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "TypedArray length is too small",
@@ -166,7 +153,7 @@ impl Runtime {
         let width = u64::from(element.byte_length());
         // Alignment precedes the detached-buffer check in pinned QuickJS.
         if byte_offset % width != 0 {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "invalid offset",
@@ -174,7 +161,7 @@ impl Runtime {
         }
         let backing = self.snapshot_buffer_access(buffer.object_id())?.state;
         if backing.detached {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer is detached",
@@ -190,7 +177,7 @@ impl Runtime {
                     "ToIndex TypedArray end offset overflowed u64",
                 ))?;
             if end > u64::from(backing.byte_length) {
-                return Ok(NativeConversion::Throw(self.new_native_error(
+                return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Range,
                     "invalid length",
@@ -205,7 +192,7 @@ impl Runtime {
             )
         } else {
             if byte_offset > u64::from(backing.byte_length) {
-                return Ok(NativeConversion::Throw(self.new_native_error(
+                return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Range,
                     "invalid offset",
@@ -218,7 +205,7 @@ impl Runtime {
                 None
             } else {
                 if u64::from(available) % width != 0 {
-                    return Ok(NativeConversion::Throw(self.new_native_error(
+                    return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                         realm,
                         NativeErrorKind::Range,
                         "invalid length",
@@ -248,7 +235,6 @@ pub(crate) enum TypedSpeciesStep {
     },
     Construct {
         constructor: ConstructorRef,
-        arguments: Vec<Value>,
         resume: TypedSpeciesResume,
     },
 }
@@ -266,8 +252,22 @@ impl std::ops::DerefMut for TypedSpeciesResume {
 }
 const _: () = assert!(std::mem::size_of::<TypedSpeciesResume>() <= 8);
 pub(crate) struct TypedSpeciesResumeState {
+    runtime: Runtime,
+    constructor_value: JsValue,
+    arguments: Vec<JsValue>,
     realm: ContextId,
     phase: SpeciesPhase,
+}
+impl Drop for TypedSpeciesResumeState {
+    fn drop(&mut self) {
+        let _ = self.runtime.release_jsvalue(std::mem::replace(
+            &mut self.constructor_value,
+            JsValue::Undefined,
+        ));
+        for value in self.arguments.drain(..) {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
 }
 struct SpeciesInput {
     source: ObjectRef,
@@ -338,6 +338,9 @@ impl TypedSpeciesStep {
             key: runtime
                 .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Constructor)?,
             resume: TypedSpeciesResume(Box::new(TypedSpeciesResumeState {
+                runtime: runtime.clone(),
+                constructor_value: JsValue::Undefined,
+                arguments: Vec::new(),
                 realm,
                 phase: SpeciesPhase::Constructor(input),
             })),
@@ -346,44 +349,51 @@ impl TypedSpeciesStep {
     pub(crate) fn create(
         runtime: &Runtime,
         realm: ContextId,
-        constructor: Value,
-        arguments: Vec<Value>,
+        constructor: JsValue,
+        arguments: Vec<JsValue>,
         minimum_length: Option<u64>,
     ) -> Result<Self, RuntimeError> {
-        let Value::Object(object) = constructor else {
+        let resume = TypedSpeciesResume(Box::new(TypedSpeciesResumeState {
+            runtime: runtime.clone(),
+            constructor_value: constructor,
+            arguments,
+            realm,
+            phase: SpeciesPhase::Constructed(minimum_length),
+        }));
+        let JsValue::Object(id) = &resume.0.constructor_value else {
             return Ok(Self::Complete(NativeConversion::Throw(
-                runtime.new_native_error(realm, NativeErrorKind::Type, "not a constructor")?,
+                runtime.new_native_error_jsvalue(
+                    realm,
+                    NativeErrorKind::Type,
+                    "not a constructor",
+                )?,
             )));
         };
+        let object = ObjectRef::from_borrowed_handle(runtime.clone(), *id)?;
         if !runtime.is_constructor(&object)? {
             return Ok(Self::Complete(NativeConversion::Throw(
-                runtime.new_not_constructor_error(realm, &Value::Object(object))?,
+                runtime.new_not_constructor_error_jsvalue(realm, &resume.0.constructor_value)?,
             )));
         }
-        let constructor = match runtime.constructor_from_value(realm, Value::Object(object))? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => {
-                return Ok(Self::Complete(NativeConversion::Throw(value)));
-            }
-        };
+        let constructor = ConstructorRef::from_validated_object(object);
         Ok(Self::Construct {
             constructor,
-            arguments,
-            resume: TypedSpeciesResume(Box::new(TypedSpeciesResumeState {
-                realm,
-                phase: SpeciesPhase::Constructed(minimum_length),
-            })),
+            resume,
         })
     }
 }
 impl TypedSpeciesResume {
+    pub(crate) fn take_arguments(&mut self) -> Vec<JsValue> {
+        std::mem::take(&mut self.0.arguments)
+    }
     fn selected(
         runtime: &Runtime,
         realm: ContextId,
         input: SpeciesInput,
-        species: Value,
+        species: JsValue,
     ) -> Result<TypedSpeciesStep, RuntimeError> {
-        if matches!(species, Value::Undefined | Value::Null) {
+        if matches!(species, JsValue::Undefined | JsValue::Null) {
+            runtime.release_jsvalue(species)?;
             let prototype = runtime.typed_array_default_prototype(realm, input.element)?;
             return Ok(TypedSpeciesStep::Complete(match input.mode {
                 SpeciesMode::Length(length) => {
@@ -412,13 +422,20 @@ impl TypedSpeciesResume {
             SpeciesMode::View { .. } => 2,
         };
         if arguments.try_reserve_exact(count).is_err() {
+            runtime.release_jsvalue(species)?;
             return Ok(TypedSpeciesStep::Complete(NativeConversion::Throw(
-                runtime.new_native_error(realm, NativeErrorKind::Internal, "out of memory")?,
+                runtime.new_native_error_jsvalue(
+                    realm,
+                    NativeErrorKind::Internal,
+                    "out of memory",
+                )?,
             )));
         }
         let minimum = match input.mode {
             SpeciesMode::Length(length) => {
-                arguments.push(Value::number(length as f64));
+                arguments.push(
+                    crate::engine::value::number::operations::Number::compact(length as f64).into(),
+                );
                 Some(length)
             }
             SpeciesMode::View {
@@ -426,10 +443,16 @@ impl TypedSpeciesResume {
                 byte_offset,
                 length,
             } => {
-                arguments.push(Value::Object(buffer));
-                arguments.push(Value::number(byte_offset as f64));
+                arguments.push(JsValue::Object(buffer.into_handle()));
+                arguments.push(
+                    crate::engine::value::number::operations::Number::compact(byte_offset as f64)
+                        .into(),
+                );
                 if let Some(length) = length {
-                    arguments.push(Value::number(length as f64));
+                    arguments.push(
+                        crate::engine::value::number::operations::Number::compact(length as f64)
+                            .into(),
+                    );
                 }
                 None
             }
@@ -437,7 +460,7 @@ impl TypedSpeciesResume {
         TypedSpeciesStep::create(runtime, realm, species, arguments, minimum)
     }
     pub(crate) fn resume(
-        self,
+        mut self,
         runtime: &Runtime,
         result: Completion,
     ) -> Result<TypedSpeciesStep, RuntimeError> {
@@ -447,24 +470,29 @@ impl TypedSpeciesResume {
                 return Ok(TypedSpeciesStep::Complete(NativeConversion::Throw(value)));
             }
         };
-        match self.0.phase {
+        match std::mem::replace(&mut self.0.phase, SpeciesPhase::Constructed(None)) {
             SpeciesPhase::Constructor(input) => {
-                if matches!(value, Value::Undefined) {
-                    return Self::selected(runtime, self.0.realm, input, Value::Undefined);
+                if matches!(value, JsValue::Undefined) {
+                    return Self::selected(runtime, self.0.realm, input, JsValue::Undefined);
                 }
-                let Value::Object(object) = value else {
+                let JsValue::Object(id) = value else {
+                    runtime.release_jsvalue(value)?;
                     return Ok(TypedSpeciesStep::Complete(NativeConversion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             "not an object",
                         )?,
                     )));
                 };
+                let object = ObjectRef::from_owned_handle(runtime.clone(), id);
                 Ok(TypedSpeciesStep::Read {
                     object,
                     key: PropertyKey::from(runtime.well_known_symbol(WellKnownSymbol::Species)),
                     resume: Self(Box::new(TypedSpeciesResumeState {
+                        runtime: runtime.clone(),
+                        constructor_value: JsValue::Undefined,
+                        arguments: Vec::new(),
                         realm: self.0.realm,
                         phase: SpeciesPhase::Species(input),
                     })),
@@ -495,21 +523,28 @@ fn finish_species(
                 resume,
             } => resume.resume(
                 runtime,
-                runtime.get_property_in_realm(realm, &object, &key)?,
+                runtime.internal_get_jsvalue(
+                    realm,
+                    &object,
+                    &key,
+                    JsValue::Object(object.clone().into_handle()),
+                )?,
             )?,
             TypedSpeciesStep::Construct {
                 constructor,
-                arguments,
-                resume,
-            } => resume.resume(
-                runtime,
-                runtime.construct_constructor_internal(
-                    realm,
-                    &constructor,
-                    &constructor,
-                    &arguments,
-                )?,
-            )?,
+                mut resume,
+            } => {
+                let arguments = resume.take_arguments();
+                resume.resume(
+                    runtime,
+                    runtime.construct_internal_jsvalue(
+                        realm,
+                        &constructor,
+                        crate::engine::vm::call::ConstructNewTarget::Validated(constructor.clone()),
+                        arguments,
+                    )?,
+                )?
+            }
         };
     }
 }

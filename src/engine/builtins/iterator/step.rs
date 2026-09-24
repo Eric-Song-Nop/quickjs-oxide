@@ -4,9 +4,12 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
     object::{CallableRef, ObjectRef, PropertyKey},
-    value::Value,
+    value::JsValue,
     vm::{Completion, call::NativeInvokeOutcome},
 };
+
+#[cfg(test)]
+use crate::engine::value::Value;
 
 pub(crate) enum NextStep {
     Complete(ObjectIteratorStep),
@@ -81,19 +84,22 @@ impl NextStep {
         }
     }
 
-    pub(crate) fn start(
+    pub(crate) fn start_jsvalue(
         runtime: &Runtime,
         realm: ContextId,
         iterator: ObjectRef,
-        method: Value,
+        method: JsValue,
     ) -> Result<Self, RuntimeError> {
-        let callable = match method {
-            Value::Object(ref object) => runtime.as_callable(object)?,
-            _ => None,
+        let callable = if let JsValue::Object(id) = method {
+            let object = ObjectRef::from_owned_handle(runtime.clone(), id);
+            runtime.as_callable(&object)?
+        } else {
+            runtime.release_jsvalue(method)?;
+            None
         };
         let Some(callable) = callable else {
             return Ok(Self::Complete(ObjectIteratorStep::Throw(
-                runtime.new_native_error(realm, NativeErrorKind::Type, "not a function")?,
+                runtime.new_native_error_jsvalue(realm, NativeErrorKind::Type, "not a function")?,
             )));
         };
         Ok(Self::call(realm, iterator, callable))
@@ -111,7 +117,7 @@ impl NextResume {
         runtime: &Runtime,
         result: NativeInvokeOutcome,
     ) -> Result<NextStep, RuntimeError> {
-        match self.raw_completion(result)? {
+        match self.raw_completion(runtime, result)? {
             Ok(result) => Ok(NextStep::Complete(result)),
             Err(result) => self.resume(runtime, result),
         }
@@ -121,6 +127,7 @@ impl NextResume {
     /// waiting NextStep. Only ordinary returned values need result parsing.
     pub(crate) fn raw_completion(
         &self,
+        runtime: &Runtime,
         result: NativeInvokeOutcome,
     ) -> Result<Result<ObjectIteratorStep, Completion>, RuntimeError> {
         if !matches!(self.0.phase, NextPhase::Result) {
@@ -130,6 +137,7 @@ impl NextResume {
         }
         Ok(match result {
             NativeInvokeOutcome::IteratorNextRaw { value, done } => Ok(if done {
+                runtime.release_jsvalue(value)?;
                 ObjectIteratorStep::Done
             } else {
                 ObjectIteratorStep::Yield(value)
@@ -154,15 +162,17 @@ impl NextResume {
         let realm = self.0.realm;
         match self.0.phase {
             NextPhase::Result => {
-                let Value::Object(object) = value else {
-                    return Ok(NextStep::Complete(ObjectIteratorStep::Throw(
-                        runtime.new_native_error(
-                            realm,
-                            NativeErrorKind::Type,
-                            "iterator must return an object",
-                        )?,
-                    )));
+                let JsValue::Object(id) = &value else {
+                    let error = runtime.new_native_error_jsvalue(
+                        realm,
+                        NativeErrorKind::Type,
+                        "iterator must return an object",
+                    )?;
+                    runtime.release_jsvalue(value)?;
+                    return Ok(NextStep::Complete(ObjectIteratorStep::Throw(error)));
                 };
+                let object = ObjectRef::from_borrowed_handle(runtime.clone(), *id)?;
+                runtime.release_jsvalue(value)?;
                 Ok(NextStep::Read {
                     object: object.clone(),
                     key: runtime
@@ -174,7 +184,9 @@ impl NextResume {
                 })
             }
             NextPhase::Done(object) => {
-                if runtime.value_to_boolean(&value)? {
+                let done = runtime.value_to_boolean_jsvalue(&value)?;
+                runtime.release_jsvalue(value)?;
+                if done {
                     return Ok(NextStep::Complete(ObjectIteratorStep::Done));
                 }
                 Ok(NextStep::Read {
@@ -205,23 +217,29 @@ pub(crate) fn finish_next(
                 resume,
             } => resume.resume(
                 runtime,
-                runtime.get_property_in_realm(realm, &object, &key)?,
+                runtime.internal_get_jsvalue(
+                    realm,
+                    &object,
+                    &key,
+                    JsValue::Object(object.clone().into_handle()),
+                )?,
             )?,
             NextStep::Call {
                 callable,
                 iterator,
                 resume,
             } => {
-                let receiver = Value::Object(iterator);
-                match runtime.try_call_native_iterator_next_raw(
-                    realm,
-                    &callable,
-                    receiver.clone(),
-                )? {
+                let receiver = JsValue::Object(iterator.object_id());
+                match runtime.try_call_native_iterator_next_raw(realm, &callable, &receiver)? {
                     Some(result) => resume.raw(runtime, result)?,
                     None => resume.resume(
                         runtime,
-                        runtime.call_internal(realm, &callable, receiver, &[])?,
+                        runtime.call_internal_jsvalue(
+                            realm,
+                            &callable,
+                            JsValue::Object(iterator.into_handle()),
+                            Vec::new(),
+                        )?,
                     )?,
                 }
             }
@@ -261,6 +279,13 @@ pub(crate) struct CloseResumeState {
     completion: Completion,
     called: bool,
 }
+impl Drop for CloseResumeState {
+    fn drop(&mut self) {
+        let (Completion::Return(value) | Completion::Throw(value)) =
+            std::mem::replace(&mut self.completion, Completion::Return(JsValue::Undefined));
+        let _ = self.iterator.runtime().release_jsvalue(value);
+    }
+}
 impl CloseStep {
     /// A pending Throw suppresses every JavaScript failure in close; a Return
     /// requires a callable return method and an object result.
@@ -270,19 +295,27 @@ impl CloseStep {
         iterator: ObjectRef,
         completion: Completion,
     ) -> Result<Self, RuntimeError> {
+        let resume = CloseResume(Box::new(CloseResumeState {
+            realm,
+            iterator,
+            completion,
+            called: false,
+        }));
         Ok(Self::Read {
-            object: iterator.clone(),
+            object: resume.0.iterator.clone(),
             key: runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Return)?,
-            resume: CloseResume(Box::new(CloseResumeState {
-                realm,
-                iterator,
-                completion,
-                called: false,
-            })),
+            resume,
         })
     }
 }
 impl CloseResume {
+    fn take_completion(&mut self) -> Completion {
+        std::mem::replace(
+            &mut self.0.completion,
+            Completion::Return(JsValue::Undefined),
+        )
+    }
+
     pub(crate) fn resume(
         mut self,
         runtime: &Runtime,
@@ -292,38 +325,42 @@ impl CloseResume {
         let value = match reply {
             Completion::Return(value) => value,
             Completion::Throw(value) => {
-                return Ok(CloseStep::Complete(if preserving {
-                    self.0.completion
-                } else {
-                    Completion::Throw(value)
-                }));
+                if preserving {
+                    runtime.release_jsvalue(value)?;
+                    return Ok(CloseStep::Complete(self.take_completion()));
+                }
+                return Ok(CloseStep::Complete(Completion::Throw(value)));
             }
         };
         if self.0.called {
-            return Ok(CloseStep::Complete(
-                if preserving || matches!(value, Value::Object(_)) {
-                    self.0.completion
-                } else {
-                    Completion::Throw(runtime.new_native_error(
-                        self.0.realm,
-                        NativeErrorKind::Type,
-                        "not an object",
-                    )?)
-                },
-            ));
+            let valid = preserving || matches!(value, JsValue::Object(_));
+            runtime.release_jsvalue(value)?;
+            return Ok(CloseStep::Complete(if valid {
+                self.take_completion()
+            } else {
+                Completion::Throw(runtime.new_native_error_jsvalue(
+                    self.0.realm,
+                    NativeErrorKind::Type,
+                    "not an object",
+                )?)
+            }));
         }
-        if matches!(value, Value::Undefined | Value::Null) {
-            return Ok(CloseStep::Complete(self.0.completion));
+        if matches!(value, JsValue::Undefined | JsValue::Null) {
+            return Ok(CloseStep::Complete(self.take_completion()));
         }
-        let callable = match value {
-            Value::Object(ref object) => runtime.as_callable(object)?,
+        let callable = match &value {
+            JsValue::Object(id) => {
+                let object = ObjectRef::from_borrowed_handle(runtime.clone(), *id)?;
+                runtime.as_callable(&object)?
+            }
             _ => None,
         };
+        runtime.release_jsvalue(value)?;
         let Some(callable) = callable else {
             return Ok(CloseStep::Complete(if preserving {
-                self.0.completion
+                self.take_completion()
             } else {
-                Completion::Throw(runtime.new_native_error(
+                Completion::Throw(runtime.new_native_error_jsvalue(
                     self.0.realm,
                     NativeErrorKind::Type,
                     "not a function",
@@ -352,7 +389,12 @@ pub(crate) fn finish_close(
                 resume,
             } => resume.resume(
                 runtime,
-                runtime.get_property_in_realm(realm, &object, &key)?,
+                runtime.internal_get_jsvalue(
+                    realm,
+                    &object,
+                    &key,
+                    JsValue::Object(object.clone().into_handle()),
+                )?,
             )?,
             CloseStep::Call {
                 callable,
@@ -360,7 +402,12 @@ pub(crate) fn finish_close(
                 resume,
             } => resume.resume(
                 runtime,
-                runtime.call_internal(realm, &callable, Value::Object(iterator), &[])?,
+                runtime.call_internal_jsvalue(
+                    realm,
+                    &callable,
+                    JsValue::Object(iterator.into_handle()),
+                    Vec::new(),
+                )?,
             )?,
         };
     }
@@ -388,10 +435,13 @@ mod raw_completion_tests {
         let id = object.object_id();
         assert!(matches!(
             resume
-                .raw_completion(NativeInvokeOutcome::IteratorNextRaw {
-                    value: Value::Object(object),
-                    done: true,
-                })
+                .raw_completion(
+                    &runtime,
+                    NativeInvokeOutcome::IteratorNextRaw {
+                        value: runtime.unroot_value(&Value::Object(object)).unwrap(),
+                        done: true,
+                    }
+                )
                 .unwrap(),
             Ok(ObjectIteratorStep::Done)
         ));
@@ -403,13 +453,13 @@ mod raw_completion_tests {
         }));
         for reply in [
             NativeInvokeOutcome::IteratorNextRaw {
-                value: Value::Undefined,
+                value: JsValue::Undefined,
                 done: true,
             },
-            NativeInvokeOutcome::Completion(Completion::Throw(Value::Int(7))),
+            NativeInvokeOutcome::Completion(Completion::Throw(JsValue::Int(7))),
         ] {
             assert!(matches!(
-                wrong.raw_completion(reply),
+                wrong.raw_completion(&runtime, reply),
                 Err(RuntimeError::Invariant(
                     "raw iterator reply has the wrong phase"
                 ))
@@ -432,7 +482,7 @@ mod raw_completion_tests {
                 .raw(
                     &runtime,
                     NativeInvokeOutcome::IteratorNextRaw {
-                        value: Value::Undefined,
+                        value: JsValue::Undefined,
                         done: false,
                     }
                 )
@@ -451,25 +501,35 @@ mod raw_completion_tests {
             phase: NextPhase::Result,
         }));
         let marker = Value::Object(runtime.new_object(None).unwrap());
+        let marker_internal = runtime.unroot_value(&marker).unwrap();
         let Ok(ObjectIteratorStep::Yield(value)) = resume
-            .raw_completion(NativeInvokeOutcome::IteratorNextRaw {
-                value: marker.clone(),
-                done: false,
-            })
+            .raw_completion(
+                &runtime,
+                NativeInvokeOutcome::IteratorNextRaw {
+                    value: runtime.dup_jsvalue(&marker_internal).unwrap(),
+                    done: false,
+                },
+            )
             .unwrap()
         else {
             panic!("yield lost");
         };
-        assert_eq!(value, marker);
+        assert_eq!(runtime.root_value(&value).unwrap(), marker);
+        runtime.release_jsvalue(value).unwrap();
         let Ok(ObjectIteratorStep::Throw(value)) = resume
-            .raw_completion(NativeInvokeOutcome::Completion(Completion::Throw(
-                marker.clone(),
-            )))
+            .raw_completion(
+                &runtime,
+                NativeInvokeOutcome::Completion(Completion::Throw(
+                    runtime.dup_jsvalue(&marker_internal).unwrap(),
+                )),
+            )
             .unwrap()
         else {
             panic!("throw lost");
         };
-        assert_eq!(value, marker);
+        assert_eq!(runtime.root_value(&value).unwrap(), marker);
+        runtime.release_jsvalue(value).unwrap();
+        runtime.release_jsvalue(marker_internal).unwrap();
     }
 
     #[test]
@@ -483,11 +543,13 @@ mod raw_completion_tests {
                 realm: context.realm,
                 phase: NextPhase::Result,
             }));
-            let reply = NativeInvokeOutcome::Completion(Completion::Return(result));
+            let reply = NativeInvokeOutcome::Completion(Completion::Return(
+                runtime.unroot_value(&result).unwrap(),
+            ));
             let step = if wrapper {
                 resume.raw(&runtime, reply).unwrap()
             } else {
-                let Err(result) = resume.raw_completion(reply).unwrap() else {
+                let Err(result) = resume.raw_completion(&runtime, reply).unwrap() else {
                     panic!("ordinary result skipped parsing");
                 };
                 assert_eq!(
@@ -501,7 +563,8 @@ mod raw_completion_tests {
             else {
                 panic!("result lost");
             };
-            assert_eq!(value, marker);
+            assert_eq!(runtime.root_value(&value).unwrap(), marker);
+            runtime.release_jsvalue(value).unwrap();
             assert_eq!(
                 context.eval("trace").unwrap(),
                 Value::String(crate::engine::value::JsString::from_static("dv"))

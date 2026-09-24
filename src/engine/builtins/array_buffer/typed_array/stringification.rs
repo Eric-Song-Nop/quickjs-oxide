@@ -10,7 +10,7 @@ use crate::engine::{
     builtins::native::ArrayJoinKind,
     heap::ContextId,
     object::{ObjectRef, PropertyKey},
-    value::{JsString, JsStringBuilder, Value, conversion::NativeConversion},
+    value::{JsString, JsStringBuilder, JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion, ToPrimitiveHint,
         call::{DirectCallTarget, NativeArguments, NativeInvocation},
@@ -45,18 +45,20 @@ impl Runtime {
         arguments: &NativeArguments,
         string_limit: usize,
     ) -> Result<Completion, RuntimeError> {
-        finish(
-            self,
-            realm,
-            TypedStringStep::start_with_limit(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            finish(
                 self,
                 realm,
-                kind,
-                &invocation,
-                arguments,
-                string_limit,
-            )?,
-        )
+                TypedStringStep::start_with_limit(
+                    self,
+                    realm,
+                    kind,
+                    invocation,
+                    arguments,
+                    string_limit,
+                )?,
+            )
+        })
     }
 }
 pub(crate) enum TypedStringStep {
@@ -92,7 +94,7 @@ pub(crate) struct TypedStringResumeState {
 }
 enum Phase {
     Separator,
-    LocaleMethod(Value),
+    LocaleMethod,
     LocaleResult,
     Element,
 }
@@ -126,16 +128,20 @@ impl TypedStringStep {
                 "TypedArray stringification received a constructor invocation",
             ));
         };
-        let target = match runtime.require_typed_array(realm, this_value.clone())? {
+        let target = match runtime.require_typed_array_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
+            NativeConversion::Throw(value) => {
+                return Ok(Self::Complete(Completion::Throw(value)));
+            }
         };
         let length = match runtime.typed_array_validated_length(realm, &target)? {
             NativeConversion::Value(value) => u64::from(value),
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
+            NativeConversion::Throw(value) => {
+                return Ok(Self::Complete(Completion::Throw(value)));
+            }
         };
         let state = TypedStringResume(Box::new(TypedStringResumeState {
-            pending_effect: TypedStringStepPending::default(),
+            pending_effect: TypedStringStepPending::new(runtime.clone()),
             realm,
             target,
             kind,
@@ -148,16 +154,12 @@ impl TypedStringStep {
         }));
         if matches!(kind, ArrayJoinKind::Join)
             && arguments.actual_arg_count != 0
-            && !matches!(arguments.readable.first(), Some(Value::Undefined))
+            && !matches!(arguments.readable.first(), Some(JsValue::Undefined))
         {
             return Ok(Self::request_primitive(
-                arguments
-                    .readable
-                    .first()
-                    .ok_or(RuntimeError::Invariant(
-                        "TypedArray.join separator argv was not padded",
-                    ))?
-                    .clone(),
+                runtime.dup_jsvalue(arguments.readable.first().ok_or(
+                    RuntimeError::Invariant("TypedArray.join separator argv was not padded"),
+                )?)?,
                 state,
             ));
         }
@@ -170,7 +172,8 @@ impl TypedStringResume {
             if self.0.index != 0 {
                 self.0.output.push_js_string(&self.0.separator)?;
             }
-            let Some(element) = runtime.typed_array_read_index(&self.0.target, self.0.index)?
+            let Some(element) =
+                runtime.typed_array_read_index_jsvalue(&self.0.target, self.0.index)?
             else {
                 self.0.index += 1;
                 continue;
@@ -178,7 +181,7 @@ impl TypedStringResume {
             match self.0.kind {
                 ArrayJoinKind::Join => {
                     // Integer-indexed storage returns only primitive numeric values.
-                    let string = match runtime.native_to_js_string(self.0.realm, &element)? {
+                    let string = match runtime.native_to_js_string_jsvalue(self.0.realm, element)? {
                         NativeConversion::Value(value) => value,
                         NativeConversion::Throw(value) => {
                             return Ok(TypedStringStep::Complete(Completion::Throw(value)));
@@ -188,11 +191,19 @@ impl TypedStringResume {
                     self.0.index += 1;
                 }
                 ArrayJoinKind::ToLocaleString => {
+                    self.0.pending_effect.locale_receiver = Some(element);
+                    self.0.phase = Phase::LocaleMethod;
                     let key = runtime.pinned_property_key(
                         crate::engine::atom::pinned::PinnedAtom::ToLocaleString,
                     )?;
-                    self.0.phase = Phase::LocaleMethod(element.clone());
-                    return Ok(TypedStringStep::request_read(element, key, self));
+                    let receiver = runtime.dup_jsvalue(
+                        self.0
+                            .pending_effect
+                            .locale_receiver
+                            .as_ref()
+                            .expect("locale receiver"),
+                    )?;
+                    return Ok(TypedStringStep::request_read(receiver, key, self));
                 }
             }
         }
@@ -200,7 +211,7 @@ impl TypedStringResume {
             self.0.output.push_js_string(&self.0.separator)?;
         }
         Ok(TypedStringStep::Complete(Completion::Return(
-            Value::String(self.0.output.finish()?),
+            runtime.into_jsvalue(Value::String(self.0.output.finish()?))?,
         )))
     }
     pub(crate) fn resume(
@@ -216,7 +227,7 @@ impl TypedStringResume {
         };
         match self.0.phase {
             Phase::Separator => {
-                self.0.separator = match runtime.native_to_js_string(self.0.realm, &value)? {
+                self.0.separator = match runtime.native_to_js_string_jsvalue(self.0.realm, value)? {
                     NativeConversion::Value(value) => value,
                     NativeConversion::Throw(value) => {
                         return Ok(TypedStringStep::Complete(Completion::Throw(value)));
@@ -226,14 +237,16 @@ impl TypedStringResume {
                     u64::from(runtime.typed_array_state(&self.0.target)?.length);
                 self.next(runtime)
             }
-            Phase::LocaleMethod(receiver) => {
-                let callable = match value {
-                    Value::Object(object) => runtime.as_callable(&object)?,
-                    _ => None,
+            Phase::LocaleMethod => {
+                let callable = match &value {
+                    JsValue::Object(id) => runtime.as_callable_object(*id),
+                    _ => Ok(None),
                 };
+                runtime.release_jsvalue(value)?;
+                let callable = callable?;
                 let Some(callable) = callable else {
                     return Ok(TypedStringStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             "not a function",
@@ -241,6 +254,12 @@ impl TypedStringResume {
                     )));
                 };
                 self.0.phase = Phase::LocaleResult;
+                let receiver = self
+                    .0
+                    .pending_effect
+                    .locale_receiver
+                    .take()
+                    .expect("locale receiver");
                 Ok(TypedStringStep::request_call(
                     DirectCallTarget::Callable(callable),
                     receiver,
@@ -253,7 +272,7 @@ impl TypedStringResume {
                 Ok(TypedStringStep::request_primitive(value, self))
             }
             Phase::Element => {
-                let string = match runtime.native_to_js_string(self.0.realm, &value)? {
+                let string = match runtime.native_to_js_string_jsvalue(self.0.realm, value)? {
                     NativeConversion::Value(value) => value,
                     NativeConversion::Throw(value) => {
                         return Ok(TypedStringStep::Complete(Completion::Throw(value)));
@@ -277,8 +296,8 @@ fn finish(
             TypedStringStep::Primitive { mut resume } => {
                 let value = resume.take_primitive_value();
                 {
-                    let result = if matches!(value, Value::Object(_)) {
-                        runtime.to_primitive(realm, value, ToPrimitiveHint::String)?
+                    let result = if matches!(value, JsValue::Object(_)) {
+                        runtime.to_primitive_jsvalue(realm, value, ToPrimitiveHint::String)?
                     } else {
                         Completion::Return(value)
                     };
@@ -290,7 +309,7 @@ fn finish(
                 let key = resume.take_read_key();
                 resume.resume(
                     runtime,
-                    runtime.get_value_property_in_realm(realm, receiver, &key)?,
+                    runtime.get_value_property_in_realm_jsvalue(realm, receiver, &key)?,
                 )?
             }
             TypedStringStep::Call { mut resume } => {
@@ -305,7 +324,7 @@ fn finish(
                     };
                     resume.resume(
                         runtime,
-                        runtime.call_internal(realm, &callable, receiver, &arguments)?,
+                        runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?,
                     )?
                 }
             }
@@ -313,22 +332,60 @@ fn finish(
     }
 }
 
-#[derive(Default)]
 struct TypedStringStepPending {
-    primitive_value: Option<Value>,
-    read_receiver: Option<Value>,
+    locale_receiver: Option<JsValue>,
+    runtime: Runtime,
+    primitive_value: Option<JsValue>,
+    read_receiver: Option<JsValue>,
     read_key: Option<PropertyKey>,
     call_target: Option<DirectCallTarget>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
+}
+impl TypedStringStepPending {
+    fn new(runtime: Runtime) -> Self {
+        Self {
+            runtime,
+            locale_receiver: None,
+            primitive_value: None,
+            read_receiver: None,
+            read_key: None,
+            call_target: None,
+            call_receiver: None,
+            call_arguments: None,
+        }
+    }
+}
+impl Drop for TypedStringStepPending {
+    /// Release the internal edges still held when the request is abandoned.
+    /// Consumption goes through `Option::take`; releases are defer-safe and
+    /// nothrow.
+    fn drop(&mut self) {
+        for value in [
+            self.locale_receiver.take(),
+            self.primitive_value.take(),
+            self.read_receiver.take(),
+            self.call_receiver.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(values) = self.call_arguments.take() {
+            for value in values {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+    }
 }
 impl TypedStringStep {
-    pub(crate) fn request_primitive(value: Value, mut resume: TypedStringResume) -> Self {
+    pub(crate) fn request_primitive(value: JsValue, mut resume: TypedStringResume) -> Self {
         resume.0.pending_effect.primitive_value = Some(value);
         Self::Primitive { resume }
     }
     pub(crate) fn request_read(
-        receiver: Value,
+        receiver: JsValue,
         key: PropertyKey,
         mut resume: TypedStringResume,
     ) -> Self {
@@ -338,8 +395,8 @@ impl TypedStringStep {
     }
     pub(crate) fn request_call(
         target: DirectCallTarget,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: TypedStringResume,
     ) -> Self {
         resume.0.pending_effect.call_target = Some(target);
@@ -349,14 +406,14 @@ impl TypedStringStep {
     }
 }
 impl TypedStringResume {
-    pub(crate) fn take_primitive_value(&mut self) -> Value {
+    pub(crate) fn take_primitive_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .primitive_value
             .take()
             .expect("TypedStringStep Primitive value")
     }
-    pub(crate) fn take_read_receiver(&mut self) -> Value {
+    pub(crate) fn take_read_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .read_receiver
@@ -377,14 +434,14 @@ impl TypedStringResume {
             .take()
             .expect("TypedStringStep Call target")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver
             .take()
             .expect("TypedStringStep Call receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .pending_effect
             .call_arguments

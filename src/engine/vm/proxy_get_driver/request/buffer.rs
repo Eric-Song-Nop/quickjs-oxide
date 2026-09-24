@@ -1,5 +1,6 @@
 //! Mechanical adapters for buffer domain requests.
-use super::{DirectCallTarget, ElementStep, Resume, Step, TypedWriteStep, Value};
+use super::JsValue;
+use super::{DirectCallTarget, ElementStep, Resume, Step, TypedWriteStep};
 
 impl From<ElementStep> for Step {
     fn from(step: ElementStep) -> Self {
@@ -9,7 +10,7 @@ impl From<ElementStep> for Step {
                 let object = resume.take_read_object();
                 let key = resume.take_read_key();
                 Self::Read {
-                    receiver: Some(Value::Object(object.clone())),
+                    receiver: Some(JsValue::Object(object.clone().into_handle())),
                     object: Some(object),
                     key: Some(key),
                     resume: Some(Resume::Element(resume)),
@@ -105,21 +106,20 @@ impl From<crate::engine::builtins::TypedSpeciesStep> for Step {
                 key,
                 resume,
             } => Self::Read {
-                receiver: Some(Value::Object(object.clone())),
+                receiver: Some(JsValue::Object(object.clone().into_handle())),
                 object: Some(object),
                 key: Some(key),
                 resume: Some(Resume::TypedSpecies(resume)),
             },
             T::Construct {
                 constructor,
-                arguments,
-                resume,
+                mut resume,
             } => Self::Construct {
                 new_target: Some(crate::engine::vm::call::ConstructNewTarget::Validated(
                     constructor.clone(),
                 )),
                 target: Some(constructor),
-                arguments: Some(arguments),
+                arguments: Some(resume.take_arguments()),
                 resume: Some(Resume::TypedSpecies(resume)),
             },
         }
@@ -135,7 +135,7 @@ impl From<crate::engine::builtins::TypedIterationStep> for Step {
                 let object = resume.take_read_object();
                 let key = resume.take_read_key();
                 Self::Read {
-                    receiver: Some(Value::Object(object.clone())),
+                    receiver: Some(JsValue::Object(object.clone().into_handle())),
                     object: Some(object),
                     key: Some(key),
                     resume: Some(Resume::TypedIteration(resume)),
@@ -187,7 +187,7 @@ impl From<crate::engine::builtins::TypedSortStep> for Step {
                 resume,
             } => Self::Call {
                 target: Some(DirectCallTarget::Callable(callable)),
-                receiver: Some(Value::Undefined),
+                receiver: Some(JsValue::Undefined),
                 arguments: Some(arguments),
                 resume: Some(Resume::TypedSort(resume)),
             },
@@ -209,7 +209,7 @@ impl From<crate::engine::builtins::BufferConstructorStep> for Step {
                 key,
                 resume,
             } => Self::Read {
-                receiver: Some(Value::Object(object.clone())),
+                receiver: Some(JsValue::Object(object.clone().into_handle())),
                 object: Some(object),
                 key: Some(key),
                 resume: Some(Resume::BufferConstructor(resume)),
@@ -255,7 +255,7 @@ impl From<crate::engine::builtins::TypedSetStep> for Step {
                 key,
                 resume,
             } => Self::Read {
-                receiver: Some(Value::Object(object.clone())),
+                receiver: Some(JsValue::Object(object.clone().into_handle())),
                 object: Some(object),
                 key: Some(key),
                 resume: Some(Resume::TypedSet(resume)),
@@ -405,7 +405,7 @@ impl From<crate::engine::builtins::BufferSliceStep> for Step {
                 key,
                 resume,
             } => Self::Read {
-                receiver: Some(Value::Object(object.clone())),
+                receiver: Some(JsValue::Object(object.clone().into_handle())),
                 object: Some(object),
                 key: Some(key),
                 resume: Some(Resume::BufferSlice(resume)),
@@ -455,7 +455,7 @@ impl From<crate::engine::builtins::Uint8CodecStep> for Step {
                 key,
                 resume,
             } => Self::Read {
-                receiver: Some(Value::Object(object.clone())),
+                receiver: Some(JsValue::Object(object.clone().into_handle())),
                 object: Some(object),
                 key: Some(key),
                 resume: Some(Resume::Uint8Codec(resume)),
@@ -469,12 +469,8 @@ impl From<crate::engine::builtins::TypedIteratorMethodStep> for Step {
         use crate::engine::builtins::TypedIteratorMethodStep as T;
         match step {
             T::Complete(result) => Self::TypedIteratorMethodComplete(Some(result)),
-            T::Read {
-                receiver,
-                key,
-                resume,
-            } => Self::ReadValue {
-                receiver: Some(receiver),
+            T::Read { key, mut resume } => Self::ReadValue {
+                receiver: Some(resume.take_receiver()),
                 key: Some(key),
                 resume: Some(Resume::TypedIteratorMethod(resume)),
             },
@@ -492,18 +488,17 @@ impl From<crate::engine::builtins::TypedCollectStep> for Step {
                 key,
                 resume,
             } => Self::Read {
-                receiver: Some(Value::Object(object.clone())),
+                receiver: Some(JsValue::Object(object.clone().into_handle())),
                 object: Some(object),
                 key: Some(key),
                 resume: Some(Resume::TypedCollect(resume)),
             },
             T::Call {
                 callable,
-                receiver,
-                resume,
+                mut resume,
             } => Self::Call {
                 target: Some(DirectCallTarget::Callable(callable)),
-                receiver: Some(receiver),
+                receiver: Some(resume.take_receiver()),
                 arguments: Some(Vec::new()),
                 resume: Some(Resume::TypedCollect(resume)),
             },

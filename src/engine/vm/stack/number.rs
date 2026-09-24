@@ -5,6 +5,9 @@ use super::{Error, FrameBinding, FrameWindow, SlotStore};
 use crate::engine::value::number::operations::Number;
 
 impl SlotStore {
+    // Keep fused compare-branch at one call level even when the caller's own
+    // inlining decision flips between builds.
+    #[inline]
     pub(super) fn consume_number_pair_current(
         &mut self,
         window: &mut FrameWindow,
@@ -13,14 +16,14 @@ impl SlotStore {
         let offset = window
             .depth
             .checked_sub(2)
-            .ok_or_else(|| Error::internal("owned operand stack underflow"))?;
+            .ok_or_else(Self::operand_stack_underflow)?;
         let index = window.operands().start + offset;
         let [
             Some(FrameBinding::Direct(left)),
             Some(FrameBinding::Direct(right)),
         ] = &self.slots[index..index + 2]
         else {
-            return Err(Error::internal("owned operand slot is not a value"));
+            return Err(Self::operand_slot_not_a_value());
         };
         let (Some(left), Some(right)) = (left.as_number_repr(), right.as_number_repr()) else {
             return Ok(None);
@@ -101,7 +104,7 @@ mod tests {
     use crate::engine::api::Runtime;
     use crate::engine::code::function::metadata::{ClosureVariableKind, VariableDefinition};
     use crate::engine::code::runtime::PublishedFunctionSnapshot;
-    use crate::engine::value::Value;
+    use crate::engine::value::JsValue;
     use crate::engine::vm::stack::FrameStorage;
     use std::rc::Rc;
 
@@ -120,11 +123,12 @@ mod tests {
         let mut slots = SlotStore::new(20);
         let window = slots
             .push_frame(
+                runtime,
                 &owner.frame_layout(),
                 FrameStorage {
                     original_arguments: Vec::new(),
                     parameters: Vec::new(),
-                    locals: vec![FrameBinding::Direct(Value::Int(7))],
+                    locals: vec![FrameBinding::Direct(JsValue::Int(7))],
                     operands: Vec::new(),
                 },
             )
@@ -138,8 +142,10 @@ mod tests {
         let (mut slots, mut window) = frame(&runtime, 2);
         let object = runtime.new_object(None).unwrap();
         let id = object.object_id();
-        slots.push(&mut window, Value::Int(3)).unwrap();
-        slots.push(&mut window, Value::Object(object)).unwrap();
+        slots.push(&mut window, JsValue::Int(3)).unwrap();
+        slots
+            .push(&mut window, JsValue::Object(object.into_handle()))
+            .unwrap();
         assert_eq!(
             slots
                 .run_window(&mut window)
@@ -151,12 +157,12 @@ mod tests {
             None
         );
         assert_eq!(window.depth, 2);
-        assert!(
-            matches!(slots.peek(&window, 0).unwrap(), Value::Object(value) if value.object_id()==id)
-        );
-        drop(slots.pop(&mut window).unwrap());
+        assert!(matches!(slots.peek(&window, 0).unwrap(), JsValue::Object(value) if *value==id));
+        runtime
+            .release_jsvalue(slots.pop(&mut window).unwrap())
+            .unwrap();
         assert!(runtime.0.state.borrow().heap.object(id).is_err());
-        slots.push(&mut window, Value::Int(7)).unwrap();
+        slots.push(&mut window, JsValue::Int(7)).unwrap();
         assert_eq!(
             slots
                 .run_window(&mut window)
@@ -174,14 +180,14 @@ mod tests {
                 .consume_number_pair(|_, _| true)
                 .is_err()
         );
-        slots.clear_frame(window).unwrap();
+        slots.clear_frame(&runtime, window).unwrap();
     }
 
     #[test]
     fn fused_local_result_capacity_failure_leaves_binding_and_stack_unchanged() {
         let runtime = Runtime::new();
         let (mut slots, mut window) = frame(&runtime, 1);
-        slots.push(&mut window, Value::Int(99)).unwrap();
+        slots.push(&mut window, JsValue::Int(99)).unwrap();
         assert!(
             slots
                 .run_window(&mut window)
@@ -191,9 +197,9 @@ mod tests {
         );
         assert!(matches!(
             slots.local(&window, 0).unwrap(),
-            FrameBinding::Direct(Value::Int(7))
+            FrameBinding::Direct(JsValue::Int(7))
         ));
-        assert_eq!(slots.peek(&window, 0).unwrap(), &Value::Int(99));
+        assert_eq!(slots.peek(&window, 0).unwrap(), &JsValue::Int(99));
         assert!(
             slots
                 .run_window(&mut window)
@@ -203,9 +209,9 @@ mod tests {
         );
         assert!(matches!(
             slots.local(&window, 0).unwrap(),
-            FrameBinding::Direct(Value::Int(8))
+            FrameBinding::Direct(JsValue::Int(8))
         ));
-        assert_eq!(slots.pop(&mut window).unwrap(), Value::Int(99));
+        assert_eq!(slots.pop(&mut window).unwrap(), JsValue::Int(99));
         assert!(
             slots
                 .run_window(&mut window)
@@ -213,10 +219,10 @@ mod tests {
                 .update_number_local(0, |previous| (previous.update(false), Some(previous)))
                 .unwrap()
         );
-        assert_eq!(slots.pop(&mut window).unwrap(), Value::Int(8));
+        assert_eq!(slots.pop(&mut window).unwrap(), JsValue::Int(8));
         assert!(matches!(
             slots.local(&window, 0).unwrap(),
-            FrameBinding::Direct(Value::Int(7))
+            FrameBinding::Direct(JsValue::Int(7))
         ));
         slots
             .replace_local(&window, 0, FrameBinding::Uninitialized)
@@ -235,6 +241,6 @@ mod tests {
                 .update_number_local(1, |_| panic!("invalid local must not evaluate"))
                 .is_err()
         );
-        slots.clear_frame(window).unwrap();
+        slots.clear_frame(&runtime, window).unwrap();
     }
 }

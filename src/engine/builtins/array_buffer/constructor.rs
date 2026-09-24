@@ -4,7 +4,7 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
     object::{ObjectRef, PropertyKey},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{
         Completion, ToPrimitiveHint,
         call::{
@@ -16,7 +16,7 @@ use crate::engine::{
 pub(crate) enum BufferConstructorStep {
     Complete(Completion),
     Primitive {
-        value: Value,
+        value: JsValue,
         resume: BufferConstructorResume,
     },
     Read {
@@ -25,7 +25,7 @@ pub(crate) enum BufferConstructorStep {
         resume: BufferConstructorResume,
     },
     Prototype {
-        new_target: Value,
+        new_target: JsValue,
         resume: BufferConstructorResume,
     },
 }
@@ -43,11 +43,32 @@ impl std::ops::DerefMut for BufferConstructorResume {
 }
 const _: () = assert!(std::mem::size_of::<BufferConstructorResume>() <= 8);
 pub(crate) struct BufferConstructorResumeState {
+    runtime: Runtime,
     realm: ContextId,
     shared: bool,
-    new_target: Value,
+    new_target: JsValue,
     options: Option<ObjectRef>,
     phase: ConstructorPhase,
+}
+impl Drop for BufferConstructorResumeState {
+    fn drop(&mut self) {
+        let _ = self
+            .runtime
+            .release_jsvalue(std::mem::replace(&mut self.new_target, JsValue::Undefined));
+    }
+}
+
+pub(super) fn primitive_index(
+    runtime: &Runtime,
+    realm: ContextId,
+    value: JsValue,
+) -> Result<NativeConversion<u64>, RuntimeError> {
+    let number = runtime.number_from_primitive_jsvalue(realm, &value);
+    runtime.release_jsvalue(value)?;
+    match number? {
+        NativeConversion::Value(number) => runtime.index_from_number(realm, number),
+        NativeConversion::Throw(value) => Ok(NativeConversion::Throw(value)),
+    }
 }
 enum ConstructorPhase {
     Length,
@@ -84,44 +105,46 @@ impl BufferConstructorStep {
                 "ArrayBuffer constructor did not receive a constructor invocation",
             ));
         };
-        let value = arguments
-            .readable
-            .first()
-            .ok_or(RuntimeError::Invariant(
-                "ArrayBuffer length argument was not padded",
-            ))?
-            .clone();
         let options = if arguments.actual_arg_count >= 2 {
             match arguments.readable.get(1) {
-                Some(Value::Object(object)) => Some(object.clone()),
+                Some(JsValue::Object(id)) => {
+                    Some(ObjectRef::from_borrowed_handle(runtime.clone(), *id)?)
+                }
                 _ => None,
             }
         } else {
             None
         };
-        let _ = runtime;
-        Ok(Self::Primitive {
-            value,
-            resume: BufferConstructorResume(Box::new(BufferConstructorResumeState {
-                realm,
-                shared: false,
-                new_target: new_target.clone(),
-                options,
-                phase: ConstructorPhase::Length,
-            })),
-        })
+        let mut resume = BufferConstructorResume(Box::new(BufferConstructorResumeState {
+            runtime: runtime.clone(),
+            realm,
+            shared: false,
+            new_target: JsValue::Undefined,
+            options,
+            phase: ConstructorPhase::Length,
+        }));
+        resume.0.new_target = runtime.dup_jsvalue(new_target)?;
+        let value = runtime.dup_jsvalue(arguments.readable.first().ok_or(
+            RuntimeError::Invariant("ArrayBuffer length argument was not padded"),
+        )?)?;
+        Ok(Self::Primitive { value, resume })
     }
 }
 impl BufferConstructorResume {
-    fn lookup(mut self, length: u64, maximum: Option<u64>) -> BufferConstructorStep {
-        BufferConstructorStep::Prototype {
-            new_target: self.0.new_target.clone(),
+    fn lookup(
+        mut self,
+        runtime: &Runtime,
+        length: u64,
+        maximum: Option<u64>,
+    ) -> Result<BufferConstructorStep, RuntimeError> {
+        Ok(BufferConstructorStep::Prototype {
+            new_target: runtime.dup_jsvalue(&self.0.new_target)?,
             resume: {
                 let updated_0 = ConstructorPhase::Prototype { length, maximum };
                 self.0.phase = updated_0;
                 self
             },
-        }
+        })
     }
     pub(crate) fn resume(
         mut self,
@@ -136,12 +159,13 @@ impl BufferConstructorResume {
         };
         match self.0.phase {
             ConstructorPhase::Length => {
-                if matches!(value, Value::Object(_)) {
+                if matches!(value, JsValue::Object(_)) {
+                    runtime.release_jsvalue(value)?;
                     return Err(RuntimeError::Invariant(
                         "ArrayBuffer length conversion returned an object",
                     ));
                 }
-                let length = match runtime.native_to_index(self.0.realm, &value)? {
+                let length = match primitive_index(runtime, self.0.realm, value)? {
                     NativeConversion::Value(value) => value,
                     NativeConversion::Throw(value) => {
                         return Ok(BufferConstructorStep::Complete(Completion::Throw(value)));
@@ -160,12 +184,12 @@ impl BufferConstructorResume {
                         },
                     })
                 } else {
-                    Ok(self.lookup(length, None))
+                    self.lookup(runtime, length, None)
                 }
             }
             ConstructorPhase::Maximum(length) => {
-                if matches!(value, Value::Undefined) {
-                    Ok(self.lookup(length, None))
+                if matches!(value, JsValue::Undefined) {
+                    self.lookup(runtime, length, None)
                 } else {
                     Ok(BufferConstructorStep::Primitive {
                         value,
@@ -178,31 +202,37 @@ impl BufferConstructorResume {
                 }
             }
             ConstructorPhase::MaximumNumber(length) => {
-                if matches!(value, Value::Object(_)) {
+                if matches!(value, JsValue::Object(_)) {
+                    runtime.release_jsvalue(value)?;
                     return Err(RuntimeError::Invariant(
                         "ArrayBuffer maximum conversion returned an object",
                     ));
                 }
-                let maximum = match runtime.native_to_int64(self.0.realm, &value)? {
-                    NativeConversion::Value(value) => value,
+                let number = runtime.number_from_primitive_jsvalue(self.0.realm, &value);
+                runtime.release_jsvalue(value)?;
+                let maximum = match number? {
+                    NativeConversion::Value(number) => super::quickjs_to_int64_free(number),
                     NativeConversion::Throw(value) => {
                         return Ok(BufferConstructorStep::Complete(Completion::Throw(value)));
                     }
                 };
                 if maximum > MAX_SAFE_INTEGER_I64 || length > maximum as u64 {
                     return Ok(BufferConstructorStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Range,
                             "invalid array buffer max length",
                         )?,
                     )));
                 }
-                Ok(self.lookup(length, Some(maximum as u64)))
+                self.lookup(runtime, length, Some(maximum as u64))
             }
-            ConstructorPhase::Prototype { .. } => Err(RuntimeError::Invariant(
-                "ArrayBuffer prototype request received an untyped reply",
-            )),
+            ConstructorPhase::Prototype { .. } => {
+                runtime.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant(
+                    "ArrayBuffer prototype request received an untyped reply",
+                ))
+            }
         }
     }
     pub(crate) fn prototype(
@@ -249,8 +279,8 @@ pub(in crate::engine::builtins) fn finish(
         step = match step {
             BufferConstructorStep::Complete(result) => return Ok(result),
             BufferConstructorStep::Primitive { value, resume } => {
-                let result = if matches!(value, Value::Object(_)) {
-                    runtime.to_primitive(realm, value, ToPrimitiveHint::Number)?
+                let result = if matches!(value, JsValue::Object(_)) {
+                    runtime.to_primitive_jsvalue(realm, value, ToPrimitiveHint::Number)?
                 } else {
                     Completion::Return(value)
                 };
@@ -262,7 +292,12 @@ pub(in crate::engine::builtins) fn finish(
                 resume,
             } => resume.resume(
                 runtime,
-                runtime.get_property_in_realm(realm, &object, &key)?,
+                runtime.internal_get_jsvalue(
+                    realm,
+                    &object,
+                    &key,
+                    JsValue::Object(object.clone().into_handle()),
+                )?,
             )?,
             BufferConstructorStep::Prototype { new_target, resume } => resume.prototype(
                 runtime,

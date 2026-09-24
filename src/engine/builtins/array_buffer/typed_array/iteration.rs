@@ -5,8 +5,8 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     builtins::native::{ArrayIterationKind, TypedArrayElementKind},
     heap::ContextId,
-    object::{CallableRef, DescriptorField, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey},
-    value::{Value, conversion::NativeConversion},
+    object::{CallableRef, ObjectRef, PropertyKey},
+    value::{JsValue, conversion::NativeConversion},
     vm::{
         Completion,
         call::{DirectCallTarget, NativeArguments, NativeInvocation},
@@ -45,9 +45,18 @@ pub(crate) struct TypedIterationResumeState {
 struct IterationInput {
     target: ObjectRef,
     callback: CallableRef,
-    this_arg: Value,
+    this_arg: JsValue,
+    held_value: JsValue,
     element: TypedArrayElementKind,
     length: u64,
+}
+impl Drop for IterationInput {
+    fn drop(&mut self) {
+        let runtime = self.target.runtime();
+        let _ = runtime.release_jsvalue(std::mem::replace(&mut self.this_arg, JsValue::Undefined));
+        let _ =
+            runtime.release_jsvalue(std::mem::replace(&mut self.held_value, JsValue::Undefined));
+    }
 }
 struct IterationState {
     input: IterationInput,
@@ -65,7 +74,6 @@ enum IterationPhase {
     MapSpecies(IterationInput),
     Called {
         state: IterationState,
-        value: Value,
         index: u64,
     },
     Mapped {
@@ -92,42 +100,46 @@ impl TypedIterationStep {
                 "TypedArray.prototype iteration received a constructor invocation",
             ));
         };
-        let target = match runtime.require_typed_array(realm, this_value.clone())? {
+        let target = match runtime.require_typed_array_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
+            NativeConversion::Throw(value) => {
+                return Ok(Self::Complete(Completion::Throw(value)));
+            }
         };
         let length = match runtime.typed_array_validated_length(realm, &target)? {
             NativeConversion::Value(value) => u64::from(value),
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
+            NativeConversion::Throw(value) => {
+                return Ok(Self::Complete(Completion::Throw(value)));
+            }
         };
-        let callback = runtime.callable_from_value(
-            arguments
-                .readable
-                .first()
-                .ok_or(RuntimeError::Invariant(
-                    "TypedArray iteration callback argv was not padded",
-                ))?
-                .clone(),
-        )?;
-        let this_arg = if arguments.actual_arg_count > 1 {
-            arguments
-                .readable
-                .get(1)
-                .ok_or(RuntimeError::Invariant(
-                    "TypedArray iteration thisArg was missing",
-                ))?
-                .clone()
+        let callback_value = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "TypedArray iteration callback argv was not padded",
+        ))?;
+        let callback = if let JsValue::Object(id) = callback_value {
+            runtime.as_callable_object(*id)?
         } else {
-            Value::Undefined
-        };
+            None
+        }
+        .ok_or_else(|| {
+            RuntimeError::Engine(crate::engine::api::Error::new(
+                crate::engine::api::ErrorKind::Type,
+                "not a function",
+            ))
+        })?;
         let element = runtime.typed_array_snapshot(&target)?.element;
-        let input = IterationInput {
+        let mut input = IterationInput {
             target,
             callback,
-            this_arg,
+            this_arg: JsValue::Undefined,
+            held_value: JsValue::Undefined,
             element,
             length,
         };
+        if arguments.actual_arg_count > 1 {
+            input.this_arg = runtime.dup_jsvalue(arguments.readable.get(1).ok_or(
+                RuntimeError::Invariant("TypedArray iteration thisArg was missing"),
+            )?)?;
+        }
         let mode = match kind {
             ArrayIterationKind::Every => IterationMode::Every,
             ArrayIterationKind::Some => IterationMode::Some,
@@ -138,7 +150,7 @@ impl TypedIterationStep {
                     element,
                     length,
                     TypedIterationResume(Box::new(TypedIterationResumeState {
-                        pending_effect: TypedIterationStepPending::default(),
+                        pending_effect: TypedIterationStepPending::new(runtime.clone()),
                         realm,
                         phase: IterationPhase::MapSpecies(input),
                     })),
@@ -167,53 +179,77 @@ impl TypedIterationResume {
         mut state: IterationState,
     ) -> Result<TypedIterationStep, RuntimeError> {
         if state.index == state.input.length {
-            return Ok(TypedIterationStep::Complete(Completion::Return(
-                match state.mode {
-                    IterationMode::Every => Value::Bool(true),
-                    IterationMode::Some => Value::Bool(false),
-                    IterationMode::ForEach => Value::Undefined,
-                    IterationMode::Map(target) => Value::Object(target),
-                    IterationMode::Filter { selected, length } => {
-                        return Ok(TypedIterationStep::request_species(
-                            state.input.target,
-                            state.input.element,
-                            length,
-                            Self(Box::new(TypedIterationResumeState {
-                                pending_effect: TypedIterationStepPending::default(),
-                                realm,
-                                phase: IterationPhase::FilterSpecies(selected),
-                            })),
-                        ));
-                    }
-                },
-            )));
+            let result = match state.mode {
+                IterationMode::Every => JsValue::Bool(true),
+                IterationMode::Some => JsValue::Bool(false),
+                IterationMode::ForEach => JsValue::Undefined,
+                IterationMode::Map(target) => JsValue::Object(target.into_handle()),
+                IterationMode::Filter { selected, length } => {
+                    return Ok(TypedIterationStep::request_species(
+                        state.input.target.clone(),
+                        state.input.element,
+                        length,
+                        Self(Box::new(TypedIterationResumeState {
+                            pending_effect: TypedIterationStepPending::new(runtime.clone()),
+                            realm,
+                            phase: IterationPhase::FilterSpecies(selected),
+                        })),
+                    ));
+                }
+            };
+            return Ok(TypedIterationStep::Complete(Completion::Return(result)));
         }
         let index = state.index;
         state.index += 1;
-        let value = runtime
-            .typed_array_read_index(&state.input.target, index)?
-            .unwrap_or(Value::Undefined);
-        let mut arguments = Vec::new();
-        if arguments.try_reserve_exact(3).is_err() {
+        state.input.held_value = runtime
+            .typed_array_read_index_jsvalue(&state.input.target, index)?
+            .unwrap_or(JsValue::Undefined);
+        let mut resume = Self(Box::new(TypedIterationResumeState {
+            pending_effect: TypedIterationStepPending::new(runtime.clone()),
+            realm,
+            phase: IterationPhase::Called { state, index },
+        }));
+        resume.0.pending_effect.call_arguments = Some(Vec::new());
+        if resume
+            .0
+            .pending_effect
+            .call_arguments
+            .as_mut()
+            .unwrap()
+            .try_reserve_exact(3)
+            .is_err()
+        {
             return iteration_oom(runtime, realm);
         }
-        arguments.push(value.clone());
-        arguments.push(Value::number(index as f64));
-        arguments.push(Value::Object(state.input.target.clone()));
-        Ok(TypedIterationStep::request_call(
-            DirectCallTarget::Callable(state.input.callback.clone()),
-            state.input.this_arg.clone(),
-            arguments,
-            Self(Box::new(TypedIterationResumeState {
-                pending_effect: TypedIterationStepPending::default(),
-                realm,
-                phase: IterationPhase::Called {
-                    state,
-                    value,
-                    index,
-                },
-            })),
-        ))
+        let IterationPhase::Called { state, .. } = &resume.0.phase else {
+            unreachable!()
+        };
+        resume.0.pending_effect.call_receiver = Some(runtime.dup_jsvalue(&state.input.this_arg)?);
+        let value = runtime.dup_jsvalue(&state.input.held_value)?;
+        resume
+            .0
+            .pending_effect
+            .call_arguments
+            .as_mut()
+            .unwrap()
+            .push(value);
+        resume
+            .0
+            .pending_effect
+            .call_arguments
+            .as_mut()
+            .unwrap()
+            .push(crate::engine::value::number::operations::Number::compact(index as f64).into());
+        resume
+            .0
+            .pending_effect
+            .call_arguments
+            .as_mut()
+            .unwrap()
+            .push(JsValue::Object(state.input.target.clone().into_handle()));
+        resume.0.pending_effect.call_target =
+            Some(DirectCallTarget::Callable(state.input.callback.clone()));
+        Ok(TypedIterationStep::Call { resume })
     }
     pub(crate) fn species(
         self,
@@ -240,7 +276,7 @@ impl TypedIterationResume {
                 target.clone(),
                 runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Set)?,
                 Self(Box::new(TypedIterationResumeState {
-                    pending_effect: TypedIterationStepPending::default(),
+                    pending_effect: TypedIterationStepPending::new(runtime.clone()),
                     realm: self.0.realm,
                     phase: IterationPhase::FilterMethod { target, selected },
                 })),
@@ -274,7 +310,7 @@ impl TypedIterationResume {
         Self::next(runtime, self.0.realm, state)
     }
     pub(crate) fn resume(
-        self,
+        mut self,
         runtime: &Runtime,
         result: Completion,
     ) -> Result<TypedIterationStep, RuntimeError> {
@@ -284,81 +320,111 @@ impl TypedIterationResume {
                 return Ok(TypedIterationStep::Complete(Completion::Throw(value)));
             }
         };
+        self.0.pending_effect.element_value = Some(result);
         match self.0.phase {
-            IterationPhase::Called {
-                mut state,
-                value,
-                index,
-            } => {
+            IterationPhase::Called { mut state, index } => {
+                if let IterationMode::Map(target) = &state.mode {
+                    let element = runtime.typed_array_snapshot(target)?.element;
+                    runtime.release_jsvalue(std::mem::replace(
+                        &mut state.input.held_value,
+                        JsValue::Undefined,
+                    ))?;
+                    let result = self.0.pending_effect.element_value.take().unwrap();
+                    return Ok(TypedIterationStep::request_element(
+                        element,
+                        result,
+                        Self(Box::new(TypedIterationResumeState {
+                            pending_effect: TypedIterationStepPending::new(runtime.clone()),
+                            realm: self.0.realm,
+                            phase: IterationPhase::Mapped { state, index },
+                        })),
+                    ));
+                }
+                let truth = if matches!(state.mode, IterationMode::ForEach) {
+                    false
+                } else {
+                    runtime.value_to_boolean_jsvalue(
+                        self.0.pending_effect.element_value.as_ref().unwrap(),
+                    )?
+                };
+                runtime.release_jsvalue(self.0.pending_effect.element_value.take().unwrap())?;
                 match &mut state.mode {
-                    IterationMode::Every if !runtime.value_to_boolean(&result)? => {
+                    IterationMode::Every if !truth => {
                         return Ok(TypedIterationStep::Complete(Completion::Return(
-                            Value::Bool(false),
+                            JsValue::Bool(false),
                         )));
                     }
-                    IterationMode::Some if runtime.value_to_boolean(&result)? => {
+                    IterationMode::Some if truth => {
                         return Ok(TypedIterationStep::Complete(Completion::Return(
-                            Value::Bool(true),
+                            JsValue::Bool(true),
                         )));
                     }
-                    IterationMode::Every | IterationMode::Some | IterationMode::ForEach => {}
-                    IterationMode::Map(target) => {
-                        return Ok(TypedIterationStep::request_element(
-                            runtime.typed_array_snapshot(target)?.element,
-                            result,
-                            Self(Box::new(TypedIterationResumeState {
-                                pending_effect: TypedIterationStepPending::default(),
-                                realm: self.0.realm,
-                                phase: IterationPhase::Mapped { state, index },
-                            })),
-                        ));
-                    }
-                    IterationMode::Filter { selected, length } => {
-                        if runtime.value_to_boolean(&result)? {
-                            let key = runtime.property_key_for_index(*length)?;
-                            if !runtime.define_own_property(
-                                selected,
-                                &key,
-                                &OrdinaryPropertyDescriptor {
-                                    value: DescriptorField::Present(value),
-                                    writable: DescriptorField::Present(true),
-                                    enumerable: DescriptorField::Present(true),
-                                    configurable: DescriptorField::Present(true),
-                                    ..OrdinaryPropertyDescriptor::new()
-                                },
-                            )? {
+                    IterationMode::Filter { selected, length } if truth => {
+                        let key = runtime.property_key_for_index(*length)?;
+                        match runtime.define_selected_set_data(
+                            selected,
+                            &key,
+                            &state.input.held_value,
+                            false,
+                        )? {
+                            crate::engine::object::operations::PropertyDefineOutcome::Defined(
+                                true,
+                            ) => {}
+                            crate::engine::object::operations::PropertyDefineOutcome::Defined(
+                                false,
+                            ) => {
                                 return Err(RuntimeError::Invariant(
                                     "TypedArray filter temporary Array rejected a dense element",
                                 ));
                             }
-                            *length = length.checked_add(1).ok_or(RuntimeError::Invariant(
-                                "TypedArray filter selected length overflowed u64",
-                            ))?;
+                            crate::engine::object::operations::PropertyDefineOutcome::Throw(
+                                value,
+                            ) => {
+                                return Ok(TypedIterationStep::Complete(Completion::Throw(value)));
+                            }
                         }
+                        *length = length.checked_add(1).ok_or(RuntimeError::Invariant(
+                            "TypedArray filter selected length overflowed u64",
+                        ))?;
                     }
+                    _ => {}
                 }
+                runtime.release_jsvalue(std::mem::replace(
+                    &mut state.input.held_value,
+                    JsValue::Undefined,
+                ))?;
                 Self::next(runtime, self.0.realm, state)
             }
             IterationPhase::FilterMethod { target, selected } => {
-                let callable = runtime.callable_from_value(result)?;
+                let callable = match self.0.pending_effect.element_value.as_ref().unwrap() {
+                    JsValue::Object(id) => runtime.as_callable_object(*id)?,
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    RuntimeError::Engine(crate::engine::api::Error::new(
+                        crate::engine::api::ErrorKind::Type,
+                        "not a function",
+                    ))
+                })?;
+                runtime.release_jsvalue(self.0.pending_effect.element_value.take().unwrap())?;
                 let mut arguments = Vec::new();
                 if arguments.try_reserve_exact(1).is_err() {
                     return iteration_oom(runtime, self.0.realm);
                 }
-                arguments.push(Value::Object(selected));
+                arguments.push(JsValue::Object(selected.into_handle()));
                 Ok(TypedIterationStep::request_call(
                     DirectCallTarget::Callable(callable),
-                    Value::Object(target.clone()),
+                    JsValue::Object(target.clone().into_handle()),
                     arguments,
                     Self(Box::new(TypedIterationResumeState {
-                        pending_effect: TypedIterationStepPending::default(),
+                        pending_effect: TypedIterationStepPending::new(runtime.clone()),
                         realm: self.0.realm,
                         phase: IterationPhase::FilterCalled(target),
                     })),
                 ))
             }
             IterationPhase::FilterCalled(target) => Ok(TypedIterationStep::Complete(
-                Completion::Return(Value::Object(target)),
+                Completion::Return(JsValue::Object(target.into_handle())),
             )),
             _ => Err(RuntimeError::Invariant(
                 "TypedArray iteration received an untyped reply",
@@ -368,7 +434,7 @@ impl TypedIterationResume {
 }
 fn iteration_oom(runtime: &Runtime, realm: ContextId) -> Result<TypedIterationStep, RuntimeError> {
     Ok(TypedIterationStep::Complete(Completion::Throw(
-        runtime.new_native_error(realm, NativeErrorKind::Internal, "out of memory")?,
+        runtime.new_native_error_jsvalue(realm, NativeErrorKind::Internal, "out of memory")?,
     )))
 }
 impl Runtime {
@@ -394,19 +460,17 @@ impl Runtime {
                 }
                 TypedIterationStep::Call { mut resume } => {
                     let target = resume.take_call_target();
+                    let DirectCallTarget::Callable(callable) = target else {
+                        return Err(RuntimeError::Invariant(
+                            "TypedArray iteration requested an invalid call target",
+                        ));
+                    };
                     let receiver = resume.take_call_receiver();
                     let arguments = resume.take_call_arguments();
-                    {
-                        let DirectCallTarget::Callable(callable) = target else {
-                            return Err(RuntimeError::Invariant(
-                                "TypedArray iteration requested an invalid call target",
-                            ));
-                        };
-                        resume.resume(
-                            self,
-                            self.call_internal(realm, &callable, receiver, &arguments)?,
-                        )?
-                    }
+                    resume.resume(
+                        self,
+                        self.call_internal_jsvalue(realm, &callable, receiver, arguments)?,
+                    )?
                 }
                 TypedIterationStep::Element { mut resume } => {
                     let element = resume.take_element_element();
@@ -420,25 +484,68 @@ impl Runtime {
                 TypedIterationStep::Read { mut resume } => {
                     let object = resume.take_read_object();
                     let key = resume.take_read_key();
-                    resume.resume(self, self.get_property_in_realm(realm, &object, &key)?)?
+                    resume.resume(
+                        self,
+                        self.internal_get_jsvalue(
+                            realm,
+                            &object,
+                            &key,
+                            JsValue::Object(object.clone().into_handle()),
+                        )?,
+                    )?
                 }
             };
         }
     }
 }
 
-#[derive(Default)]
 struct TypedIterationStepPending {
+    runtime: Runtime,
     species_source: Option<ObjectRef>,
     species_element: Option<TypedArrayElementKind>,
     species_length: Option<u64>,
     call_target: Option<DirectCallTarget>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
     element_element: Option<TypedArrayElementKind>,
-    element_value: Option<Value>,
+    element_value: Option<JsValue>,
     read_object: Option<ObjectRef>,
     read_key: Option<PropertyKey>,
+}
+impl TypedIterationStepPending {
+    fn new(runtime: Runtime) -> Self {
+        Self {
+            runtime,
+            species_source: None,
+            species_element: None,
+            species_length: None,
+            call_target: None,
+            call_receiver: None,
+            call_arguments: None,
+            element_element: None,
+            element_value: None,
+            read_object: None,
+            read_key: None,
+        }
+    }
+}
+impl Drop for TypedIterationStepPending {
+    /// Release the internal edges still held when the request is abandoned.
+    /// Consumption goes through `Option::take`; releases are defer-safe and
+    /// nothrow.
+    fn drop(&mut self) {
+        for value in [self.call_receiver.take(), self.element_value.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(values) = self.call_arguments.take() {
+            for value in values {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+    }
 }
 impl TypedIterationStep {
     pub(crate) fn request_species(
@@ -454,8 +561,8 @@ impl TypedIterationStep {
     }
     pub(crate) fn request_call(
         target: DirectCallTarget,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: TypedIterationResume,
     ) -> Self {
         resume.0.pending_effect.call_target = Some(target);
@@ -465,7 +572,7 @@ impl TypedIterationStep {
     }
     pub(crate) fn request_element(
         element: TypedArrayElementKind,
-        value: Value,
+        value: JsValue,
         mut resume: TypedIterationResume,
     ) -> Self {
         resume.0.pending_effect.element_element = Some(element);
@@ -511,14 +618,14 @@ impl TypedIterationResume {
             .take()
             .expect("TypedIterationStep Call target")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver
             .take()
             .expect("TypedIterationStep Call receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .pending_effect
             .call_arguments
@@ -532,7 +639,7 @@ impl TypedIterationResume {
             .take()
             .expect("TypedIterationStep Element element")
     }
-    pub(crate) fn take_element_value(&mut self) -> Value {
+    pub(crate) fn take_element_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .element_value

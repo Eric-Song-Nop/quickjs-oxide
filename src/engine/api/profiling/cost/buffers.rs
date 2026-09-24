@@ -1,7 +1,7 @@
 //! Producer-local temporary buffer diagnostics. Counts are cumulative; Value
 //! copies, rooted promotions and raw edges are separate, never additive totals.
 use super::current;
-use crate::engine::{heap::RawValue, value::Value};
+use crate::engine::{heap::RawValue, value::JsValue};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CallBufferCost {
@@ -111,7 +111,9 @@ pub(crate) fn record_call_buffer_initialized(name: &'static str, count: usize) {
     cost.slots_initialized = cost.slots_initialized.saturating_add(count as u64);
 }
 
-pub(crate) fn record_call_buffer_copies(name: &'static str, values: &[Value]) {
+/// Internal-handle copy accounting: object/symbol handles own one edge, string
+/// and BigInt handles own one payload edge, and the rest are immediates.
+pub(crate) fn record_call_buffer_js_value_copies(name: &'static str, values: &[JsValue]) {
     let Some(collector) = current() else {
         return;
     };
@@ -121,9 +123,8 @@ pub(crate) fn record_call_buffer_copies(name: &'static str, values: &[Value]) {
     cost.slots_initialized = cost.slots_initialized.saturating_add(values.len() as u64);
     for value in values {
         let counter = match value {
-            Value::Object(_) | Value::Symbol(_) => &mut cost.heap_root_copies,
-            Value::String(_) => &mut cost.primitive_rc_copies,
-            Value::BigInt(value) if value.as_i64().is_none() => &mut cost.primitive_rc_copies,
+            JsValue::Object(_) | JsValue::Symbol(_) => &mut cost.heap_root_copies,
+            JsValue::String(_) | JsValue::BigInt(_) => &mut cost.primitive_rc_copies,
             _ => &mut cost.immediate_copies,
         };
         *counter = counter.saturating_add(1);
@@ -155,7 +156,7 @@ pub(crate) fn record_call_raw_buffer_copies(name: &'static str, values: &[RawVal
             RawValue::String(_) => {
                 cost.raw_primitive_rc_copies = cost.raw_primitive_rc_copies.saturating_add(1);
             }
-            RawValue::BigInt(value) if value.as_i64().is_none() => {
+            RawValue::BigInt(_) => {
                 cost.raw_primitive_rc_copies = cost.raw_primitive_rc_copies.saturating_add(1);
             }
             _ => {}
@@ -182,9 +183,11 @@ mod tests {
         assert_eq!(raw.raw_values_copied, 0);
         assert_eq!(raw.heap_root_copies, 0);
         assert!(costs.call_buffers["bound.rooted_snapshot"].heap_root_copies > 0);
-        assert!(costs.call_buffers["bound.merge"].heap_root_copies > 0);
+        assert_eq!(costs.call_buffers["bound.merge"].heap_root_copies, 0);
+        assert_eq!(costs.call_buffers["bound.merge"].values_copied, 0);
+        assert!(costs.call_buffers["bound.merge"].values_moved > 0);
         assert_eq!(costs.call_buffers["apply.indexed"].values_moved, 2);
-        assert!(costs.call_buffers["arguments.fast_rooted"].buffers_observed > 0);
+        assert!(costs.call_buffers["arguments.fast_internal"].buffers_observed > 0);
         assert!(costs.call_buffers["invoke.argv_carrier"].buffers_observed > 0);
     }
 

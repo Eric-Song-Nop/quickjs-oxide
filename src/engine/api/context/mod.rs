@@ -9,7 +9,7 @@ use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
 
 use crate::engine::api::compile::Compilation;
-#[cfg(any(test, feature = "test262-host"))]
+#[cfg(feature = "test262-host")]
 use crate::engine::builtins::native::NativeFunctionId;
 use crate::engine::builtins::native::PrimitiveKind;
 use crate::engine::code::rooted::FunctionBytecodeRef;
@@ -79,9 +79,9 @@ impl Context {
 
     fn finish_completion(&mut self, completion: Completion) -> Result<Value, RuntimeError> {
         match completion {
-            Completion::Return(value) => Ok(value),
+            Completion::Return(value) => self.runtime.root_and_release_jsvalue(value),
             Completion::Throw(value) => {
-                self.runtime.set_pending_exception(value)?;
+                self.runtime.set_pending_exception_jsvalue(value)?;
                 Err(RuntimeError::Exception)
             }
         }
@@ -110,6 +110,9 @@ impl Context {
         kind: NativeErrorKind,
         message: &str,
     ) -> Result<Value, RuntimeError> {
-        self.runtime.new_native_error(self.realm, kind, message)
+        let error = self
+            .runtime
+            .new_native_error_jsvalue(self.realm, kind, message)?;
+        self.runtime.root_and_release_jsvalue(error)
     }
 }

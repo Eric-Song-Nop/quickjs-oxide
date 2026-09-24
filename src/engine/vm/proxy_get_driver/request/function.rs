@@ -1,5 +1,5 @@
 //! Mechanical adapters for function domain requests.
-use super::{DirectCallTarget, Resume, Step, Value};
+use super::{DirectCallTarget, JsValue, Resume, Step};
 
 impl From<crate::engine::builtins::ArgumentsStep> for Step {
     fn from(step: crate::engine::builtins::ArgumentsStep) -> Self {
@@ -11,13 +11,13 @@ impl From<crate::engine::builtins::ArgumentsStep> for Step {
                 key,
                 resume,
             } => Self::Read {
-                receiver: Some(Value::Object(object.clone())),
+                receiver: Some(JsValue::Object(object.clone().into_handle())),
                 object: Some(object),
                 key: Some(key),
                 resume: Some(Resume::Arguments(resume)),
             },
-            ArgumentsStep::Number { value, resume } => Self::Number {
-                value: Some(value),
+            ArgumentsStep::Number { mut resume } => Self::Number {
+                value: Some(resume.take_number_value()),
                 resume: Some(Resume::Arguments(resume)),
             },
         }
@@ -71,7 +71,7 @@ impl From<crate::engine::builtins::InstanceStep> for Step {
                 let object = resume.take_read_object();
                 let key = resume.take_read_key();
                 Self::Read {
-                    receiver: Some(Value::Object(object.clone())),
+                    receiver: Some(JsValue::Object(object.clone().into_handle())),
                     object: Some(object),
                     key: Some(key),
                     resume: Some(Resume::Instance(resume)),
@@ -104,12 +104,8 @@ impl From<crate::engine::vm::call::prototype::ProtoSourceStep> for Step {
         use crate::engine::vm::call::prototype::ProtoSourceStep as T;
         match step {
             T::Complete(result) => Self::ConstructorSourceComplete(Some(result)),
-            T::ReadValue {
-                receiver,
-                key,
-                resume,
-            } => Self::ReadValue {
-                receiver: Some(receiver),
+            T::ReadValue { key, mut resume } => Self::ReadValue {
+                receiver: Some(resume.take_read_receiver()),
                 key: Some(key),
                 resume: Some(Resume::ConstructorSource(resume)),
             },
@@ -127,7 +123,7 @@ impl From<crate::engine::builtins::BindStep> for Step {
                 key,
                 resume,
             } => Self::Read {
-                receiver: Some(Value::Object(object.clone())),
+                receiver: Some(JsValue::Object(object.clone().into_handle())),
                 object: Some(object),
                 key: Some(key),
                 resume: Some(Resume::Bind(resume)),
@@ -155,7 +151,7 @@ impl From<crate::engine::builtins::FunctionTextStep> for Step {
                 let object = resume.take_read_object();
                 let key = resume.take_read_key();
                 Self::Read {
-                    receiver: Some(Value::Object(object.clone())),
+                    receiver: Some(JsValue::Object(object.clone().into_handle())),
                     object: Some(object),
                     key: Some(key),
                     resume: Some(Resume::FunctionText(resume)),

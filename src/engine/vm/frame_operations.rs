@@ -4,7 +4,7 @@
 #[cfg(test)]
 mod direct;
 mod numeric;
-#[cfg(test)]
+#[cfg(all(test, feature = "profiling"))]
 pub(super) use direct::complete as complete_owned_slot;
 pub(super) use numeric::{
     NumericProgress, commit_output as commit_numeric_output, complete as complete_numeric,
@@ -19,7 +19,7 @@ use super::frame::FrameId;
 use super::run::RunExit;
 use crate::engine::api::error::Error;
 use crate::engine::api::runtime::Runtime;
-use crate::engine::value::Value;
+use crate::engine::value::JsValue;
 use crate::engine::value::conversion::NativeConversion;
 
 #[inline(never)]
@@ -59,7 +59,7 @@ pub(super) fn home_object(
     let depth = execution.slots.depth(&frame.window);
     execution
         .slots
-        .push(&mut frame.window, Value::Object(home))?;
+        .push(&mut frame.window, JsValue::Object(home.into_handle()))?;
     frame.resume_pc = frame
         .fault_pc
         .checked_add(1)
@@ -77,24 +77,33 @@ pub(super) fn get_super(
 ) -> Result<CallStep, Error> {
     let frame = execution.frames.current_mut(id)?;
     let value = execution.slots.peek(&frame.window, 0)?;
-    if let Value::Object(object) = value {
-        if object.belongs_to(runtime) {
-            let value = runtime
-                .get_prototype_of(object)
-                .map_err(runtime_error_to_vm_error)?
-                .map_or(Value::Null, Value::Object);
-            #[cfg(feature = "profiling")]
-            let depth = execution.slots.depth(&frame.window);
-            execution.slots.pop(&mut frame.window)?;
-            execution.slots.push(&mut frame.window, value)?;
-            frame.resume_pc = frame
-                .fault_pc
-                .checked_add(1)
-                .ok_or_else(|| Error::internal("super resume PC overflow"))?;
-            #[cfg(feature = "profiling")]
-            crate::engine::api::profiling::record_owned_instruction(depth);
-            return Ok(CallStep::Entered);
+    let object = match value {
+        JsValue::Object(id) => {
+            crate::engine::object::ObjectRef::from_borrowed_handle(runtime.clone(), *id).ok()
         }
+        _ => None,
+    };
+    if let Some(object) = object {
+        let prototype = runtime
+            .get_prototype_of(&object)
+            .map_err(runtime_error_to_vm_error)?
+            .map_or(JsValue::Null, |prototype| {
+                JsValue::Object(prototype.into_handle())
+            });
+        #[cfg(feature = "profiling")]
+        let depth = execution.slots.depth(&frame.window);
+        let discarded = execution.slots.pop(&mut frame.window)?;
+        runtime
+            .release_jsvalue(discarded)
+            .map_err(runtime_error_to_vm_error)?;
+        execution.slots.push(&mut frame.window, prototype)?;
+        frame.resume_pc = frame
+            .fault_pc
+            .checked_add(1)
+            .ok_or_else(|| Error::internal("super resume PC overflow"))?;
+        #[cfg(feature = "profiling")]
+        crate::engine::api::profiling::record_owned_instruction(depth);
+        return Ok(CallStep::Entered);
     }
     Ok(CallStep::Bridge)
 }
@@ -160,12 +169,14 @@ pub(super) fn for_in(
     let realm = frame.executable.realm;
     let depth = execution.slots.depth(&frame.window);
     let step = if next {
-        let Value::Object(iterator) = execution.slots.peek(&frame.window, 0)? else {
+        let JsValue::Object(id) = execution.slots.peek(&frame.window, 0)? else {
             return Err(Error::internal(
                 "for-in next received a non-object iterator",
             ));
         };
-        super::for_in::operation::ForInStep::next(runtime, realm, iterator)
+        let iterator = crate::engine::object::ObjectRef::from_borrowed_handle(runtime.clone(), *id)
+            .map_err(|error| runtime_error_to_vm_error(error.into()))?;
+        super::for_in::operation::ForInStep::next(runtime, realm, &iterator)
     } else {
         let value = execution.slots.pop(&mut frame.window)?;
         super::for_in::operation::ForInStep::start(runtime, realm, value)
@@ -192,12 +203,12 @@ pub(super) fn numeric(
 
 #[inline(never)]
 pub(super) fn strict_equality(
-    _runtime: &Runtime,
+    runtime: &Runtime,
     execution: &mut RunningExecution,
     id: FrameId,
     negate: bool,
 ) -> Result<CallStep, Error> {
-    super::run::strict_comparison(execution, id, negate)?;
+    super::run::strict_comparison(runtime, execution, id, negate)?;
     Ok(CallStep::Entered)
 }
 
@@ -247,12 +258,16 @@ pub(super) fn reset_captured(
 ) -> Result<CallStep, Error> {
     let frame = execution.frames.current_mut(id)?;
     let reusable = std::mem::take(&mut frame.cold.reusable_captured_locals[usize::from(index)]);
-    let super::bindings::FrameBinding::Captured(root) =
+    let super::bindings::FrameBinding::Captured(var_ref) =
         execution.slots.local(&frame.window, index)?
     else {
         return Err(Error::internal("captured reset lost its cell"));
     };
-    super::bindings::reset_captured_binding(runtime, root, reusable)?;
+    super::bindings::reset_captured_binding(
+        runtime,
+        &crate::engine::heap::roots::VarRefView::from_frame(runtime, *var_ref),
+        reusable,
+    )?;
     frame.resume_pc = frame
         .fault_pc
         .checked_add(1)
@@ -293,7 +308,7 @@ pub(super) fn close_captured(
 
 #[inline(never)]
 pub(super) fn catch(
-    _runtime: &Runtime,
+    runtime: &Runtime,
     execution: &mut RunningExecution,
     id: FrameId,
     exit: RunExit,
@@ -345,7 +360,10 @@ pub(super) fn catch(
             prepare_captured_reuse(frame, &execution.slots)?;
             let value = execution.slots.pop(&mut frame.window)?;
             while execution.slots.depth(&frame.window) > stack_depth {
-                drop(execution.slots.pop(&mut frame.window)?);
+                let discarded = execution.slots.pop(&mut frame.window)?;
+                runtime
+                    .release_jsvalue(discarded)
+                    .map_err(runtime_error_to_vm_error)?;
             }
             execution.slots.push(&mut frame.window, value)?;
         }
@@ -417,11 +435,11 @@ pub(super) fn binding(
                     ClosureSource::ParentArgument(index),
                 )
             };
-            let super::bindings::FrameBinding::Captured(root) = binding else {
+            let super::bindings::FrameBinding::Captured(var_ref) = binding else {
                 return Err(Error::internal("captured access lost its cell"));
             };
             (
-                root.clone(),
+                crate::engine::heap::roots::VarRefView::from_frame(runtime, *var_ref).clone(),
                 ClosureVariable {
                     source,
                     name: definition
@@ -440,7 +458,7 @@ pub(super) fn binding(
     let depth = execution.slots.depth(&frame.window);
     let value = if write {
         Some(if keep {
-            super::stack::copy_value(execution.slots.peek(&frame.window, 0)?)?
+            super::stack::copy_value(runtime, execution.slots.peek(&frame.window, 0)?)?
         } else {
             execution.slots.pop(&mut frame.window)?
         })
@@ -487,7 +505,7 @@ pub(super) fn binding(
                 return Err(error);
             };
             let value = runtime
-                .new_native_error_from_error(realm, kind, &error)
+                .new_native_error_from_error_jsvalue(realm, kind, &error)
                 .map_err(runtime_error_to_vm_error)?;
             Ok(CallStep::Complete(Completion::Throw(value)))
         }
@@ -510,7 +528,7 @@ pub(super) fn lexical_uninitialized(
         !frame.executable.metadata.strip_variable_debug,
     )?;
     let value = runtime
-        .new_native_error_from_error(
+        .new_native_error_from_error_jsvalue(
             frame.executable.realm,
             crate::engine::api::error::NativeErrorKind::Reference,
             &error,
@@ -569,7 +587,7 @@ pub(super) fn initialize_derived(
                 return Err(error);
             };
             let value = runtime
-                .new_native_error_from_error(frame.executable.realm, kind, &error)
+                .new_native_error_from_error_jsvalue(frame.executable.realm, kind, &error)
                 .map_err(runtime_error_to_vm_error)?;
             Ok(CallStep::Complete(Completion::Throw(value)))
         }
@@ -617,12 +635,22 @@ pub(super) fn normalize_this(
     let frame = execution.frames.current_mut(id)?;
     // This conversion only allocates a primitive wrapper; it cannot
     // call JavaScript. Keep its identity across every later handoff.
-    let value = runtime
-        .native_to_object(frame.executable.realm, frame.cold.input.this_value.clone())
+    let this_value = runtime
+        .dup_jsvalue(&frame.cold.input.this_value)
         .map_err(runtime_error_to_vm_error)?;
-    let NativeConversion::Value(object) = value else {
-        return Err(Error::internal("non-null primitive this boxing threw"));
+    let value = runtime
+        .native_to_object_jsvalue(frame.executable.realm, this_value)
+        .map_err(runtime_error_to_vm_error)?;
+    let object = match value {
+        NativeConversion::Value(object) => object,
+        NativeConversion::Throw(value) => {
+            runtime
+                .release_jsvalue(value)
+                .map_err(runtime_error_to_vm_error)?;
+            return Err(Error::internal("non-null primitive this boxing threw"));
+        }
     };
-    frame.cold.normalized_this = Some(Value::Object(object));
+    frame.cold.release_normalized_this();
+    frame.cold.normalized_this = Some(JsValue::Object(object.into_handle()));
     Ok(CallStep::Entered)
 }

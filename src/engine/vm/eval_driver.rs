@@ -4,7 +4,7 @@ use super::{
     call::{BytecodeCallRequest, CallableExecution},
     driver::{CallStep, push_frame},
     eval_bindings::{self, PreparedEvalEnvironment},
-    exception::runtime_error_to_vm_error,
+    exception::{heap_error_to_vm_error, runtime_error_to_vm_error},
     execution::RunningExecution,
     frame::{FrameId, OperationTarget, ReturnTarget, ReturnValue},
 };
@@ -12,7 +12,7 @@ use crate::engine::{
     api::{Error, runtime::Runtime},
     builtins::DirectEvalPreparation,
     code::function::metadata::EvalBindingSource,
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
 };
 
 #[inline(never)]
@@ -29,14 +29,25 @@ pub(super) fn step(
         .slots
         .peek(&frame.window, usize::from(arguments))?;
     if !runtime
-        .is_original_eval(realm, function)
+        .is_original_eval_jsvalue(realm, function)
         .map_err(runtime_error_to_vm_error)?
     {
         return super::driver::enter_call(runtime, execution, id, arguments, false, false);
     }
     let result = prepare_and_enter(runtime, execution, id, arguments, environment);
     if !matches!(result, Ok(CallStep::Entered)) {
-        execution.frames.current_mut(id)?.cold.eval_arguments = None;
+        match execution.frames.current_mut(id) {
+            Ok(frame) => frame.cold.release_eval_arguments(),
+            Err(error) => {
+                if let Ok(CallStep::Complete(
+                    Completion::Return(value) | Completion::Throw(value),
+                )) = result
+                {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                return Err(error);
+            }
+        }
     }
     let Err(error) = result else { return result };
     let Some(kind) =
@@ -46,7 +57,7 @@ pub(super) fn step(
     };
     Ok(CallStep::Complete(Completion::Throw(
         runtime
-            .new_native_error_from_error(realm, kind, &error)
+            .new_native_error_from_error_jsvalue(realm, kind, &error)
             .map_err(runtime_error_to_vm_error)?,
     )))
 }
@@ -62,44 +73,73 @@ fn prepare_and_enter(
     let can_push = execution.frames.can_push();
     let frame = execution.frames.current_mut(id)?;
     let realm = frame.executable.realm;
-    let input = if let Some(values) = &frame.cold.eval_arguments {
-        values.first().cloned().unwrap_or(Value::Undefined)
+    let mut invocation =
+        DirectEvalInvocation::new(runtime, environment, frame.executable.metadata.strict);
+    invocation.input = if let Some(values) = &frame.cold.eval_arguments {
+        values
+            .first()
+            .map(|value| runtime.dup_jsvalue(value))
+            .transpose()
+            .map_err(runtime_error_to_vm_error)?
+            .unwrap_or(JsValue::Undefined)
     } else if arguments == 0 {
-        Value::Undefined
+        JsValue::Undefined
     } else {
-        execution
-            .slots
-            .peek(&frame.window, usize::from(arguments) - 1)?
-            .clone()
+        runtime
+            .dup_jsvalue(
+                execution
+                    .slots
+                    .peek(&frame.window, usize::from(arguments) - 1)?,
+            )
+            .map_err(runtime_error_to_vm_error)?
     };
-    let string = matches!(input, Value::String(_));
-    let this_value = if !string {
-        frame.cold.input.this_value.clone()
+    let string = matches!(invocation.input, JsValue::String(_));
+    invocation.this_value = if !string {
+        runtime
+            .dup_jsvalue(&frame.cold.input.this_value)
+            .map_err(runtime_error_to_vm_error)?
     } else if let Some(value) = frame
         .cold
         .rare
         .get()
         .and_then(|rare| rare.normalized_this.as_ref())
     {
-        value.clone()
+        runtime
+            .dup_jsvalue(value)
+            .map_err(runtime_error_to_vm_error)?
     } else if frame.executable.metadata.strict
-        || matches!(frame.cold.input.this_value, Value::Object(_))
+        || matches!(frame.cold.input.this_value, JsValue::Object(_))
     {
-        frame.cold.input.this_value.clone()
-    } else if matches!(frame.cold.input.this_value, Value::Null | Value::Undefined) {
-        Value::Object(frame.cold.input.callee_global(runtime, realm)?.clone())
+        runtime
+            .dup_jsvalue(&frame.cold.input.this_value)
+            .map_err(runtime_error_to_vm_error)?
+    } else if matches!(
+        frame.cold.input.this_value,
+        JsValue::Null | JsValue::Undefined
+    ) {
+        let id = frame.cold.input.callee_global(runtime, realm)?.object_id();
+        runtime
+            .retain_object_handle(id)
+            .map_err(heap_error_to_vm_error)?;
+        JsValue::Object(id)
     } else {
-        let value = match runtime
-            .native_to_object(realm, frame.cold.input.this_value.clone())
+        match runtime
+            .native_to_object_jsvalue(
+                realm,
+                runtime
+                    .dup_jsvalue(&frame.cold.input.this_value)
+                    .map_err(runtime_error_to_vm_error)?,
+            )
             .map_err(runtime_error_to_vm_error)?
         {
-            NativeConversion::Value(object) => Value::Object(object),
+            NativeConversion::Value(object) => {
+                frame.cold.normalized_this = Some(JsValue::Object(object.clone().into_handle()));
+                JsValue::Object(object.into_handle())
+            }
             NativeConversion::Throw(value) => {
                 return Ok(CallStep::Complete(Completion::Throw(value)));
             }
-        };
-        frame.cold.normalized_this = Some(value.clone());
-        value
+        }
     };
     let prepared = if string {
         frame
@@ -127,13 +167,6 @@ fn prepare_and_enter(
     } else {
         None
     };
-    let invocation = DirectEvalInvocation {
-        input,
-        environment,
-        this_value,
-        new_target: frame.cold.input.new_target.clone(),
-        caller_strict: frame.executable.metadata.strict,
-    };
     let prepared = runtime
         .prepare_direct_eval_original(realm, invocation, prepared, |prepared| {
             eval_bindings::materialize(prepared, &frame.cold.closure_slots, |source, descriptor| {
@@ -156,13 +189,32 @@ fn prepare_and_enter(
     let depth = execution.slots.depth(&frame.window);
     let request = match prepared {
         DirectEvalPreparation::Complete(completion) => {
-            frame.cold.eval_arguments = None;
-            for _ in 0..=arguments {
-                execution.slots.pop(&mut frame.window)?;
+            frame.cold.release_eval_arguments();
+            let cleanup = (|| -> Result<(), Error> {
+                for _ in 0..=arguments {
+                    let discarded = execution.slots.pop(&mut frame.window)?;
+                    runtime
+                        .release_jsvalue(discarded)
+                        .map_err(runtime_error_to_vm_error)?;
+                }
+                frame.resume_pc = frame
+                    .fault_pc
+                    .checked_add(1)
+                    .ok_or_else(|| Error::internal("eval resume PC overflow"))?;
+                Ok(())
+            })();
+            if let Err(error) = cleanup {
+                let (Completion::Return(value) | Completion::Throw(value)) = completion;
+                let _ = runtime.release_jsvalue(value);
+                return Err(error);
             }
             match completion {
-                Completion::Return(value) => {
-                    execution.slots.push(&mut frame.window, value)?;
+                Completion::Return(mut value) => {
+                    let push = execution.slots.push_owned(&mut frame.window, &mut value);
+                    runtime
+                        .release_jsvalue(value)
+                        .map_err(runtime_error_to_vm_error)?;
+                    push?;
                     None
                 }
                 completion => return Ok(CallStep::Complete(completion)),
@@ -170,7 +222,7 @@ fn prepare_and_enter(
         }
         DirectEvalPreparation::Ready {
             callable,
-            this_value,
+            mut invocation,
         } => {
             let CallableExecution::Bytecode {
                 bytecode,
@@ -187,10 +239,14 @@ fn prepare_and_enter(
                     .map(CallStep::Complete)
                     .map_err(runtime_error_to_vm_error);
             }
+            frame.resume_pc = frame
+                .fault_pc
+                .checked_add(1)
+                .ok_or_else(|| Error::internal("eval resume PC overflow"))?;
             Some(BytecodeCallRequest {
                 callable,
-                receiver: this_value,
-                new_target: Value::Undefined,
+                receiver: invocation.take_this(),
+                new_target: JsValue::Undefined,
                 arguments: Vec::new(),
                 bytecode,
                 closure_slots,
@@ -204,10 +260,6 @@ fn prepare_and_enter(
             })
         }
     };
-    frame.resume_pc = frame
-        .fault_pc
-        .checked_add(1)
-        .ok_or_else(|| Error::internal("eval resume PC overflow"))?;
     if let Some(request) = request {
         let entry = request.prepare(runtime, &mut execution.call_storage)?;
         push_frame(execution, entry)?;
@@ -227,10 +279,10 @@ pub(super) fn apply(
     let can_push = execution.frames.can_push();
     let frame = execution.frames.current_mut(id)?;
     let realm = frame.executable.realm;
-    let Value::Object(array) = execution.slots.peek(&frame.window, 0)? else {
+    let JsValue::Object(array_id) = execution.slots.peek(&frame.window, 0)? else {
         return Ok(CallStep::Complete(Completion::Throw(
             runtime
-                .new_native_error(
+                .new_native_error_jsvalue(
                     realm,
                     crate::engine::api::error::NativeErrorKind::Type,
                     "not a object",
@@ -238,37 +290,45 @@ pub(super) fn apply(
                 .map_err(runtime_error_to_vm_error)?,
         )));
     };
+    let array = crate::engine::object::ObjectRef::from_borrowed_handle(runtime.clone(), *array_id)
+        .map_err(heap_error_to_vm_error)?;
     let Some(values) = runtime
-        .prepare_fast_array_arguments(realm, array)
+        .prepare_fast_array_arguments_jsvalue(realm, &array)
         .map_err(runtime_error_to_vm_error)?
     else {
         return Ok(CallStep::Bridge);
     };
-    let mut values = match values {
+    let values = match values {
         NativeConversion::Value(values) => values,
-        NativeConversion::Throw(value) => return Ok(CallStep::Complete(Completion::Throw(value))),
+        NativeConversion::Throw(value) => {
+            return Ok(CallStep::Complete(Completion::Throw(value)));
+        }
+    };
+    let mut owners = ApplyArgumentsOwner {
+        runtime: runtime.clone(),
+        values,
+        receiver: JsValue::Undefined,
     };
     let function = execution.slots.peek(&frame.window, 1)?;
     if runtime
-        .is_original_eval(realm, function)
+        .is_original_eval_jsvalue(realm, function)
         .map_err(runtime_error_to_vm_error)?
     {
         if frame.cold.eval_arguments.is_some() {
             return Err(Error::internal("eval argument snapshot was already active"));
         }
-        frame.cold.eval_arguments = Some(values);
+        frame.cold.eval_arguments = Some(std::mem::take(&mut owners.values));
         return step(runtime, execution, id, 1, environment);
     }
-    let Value::Object(function) = function else {
+    let JsValue::Object(function) = function else {
         return Ok(CallStep::Bridge);
     };
     let Some(mut callable) = runtime
-        .as_callable(function)
+        .as_callable_object(*function)
         .map_err(runtime_error_to_vm_error)?
     else {
         return Ok(CallStep::Bridge);
     };
-    let mut receiver = Value::Undefined;
     let (bytecode, closure_slots) = loop {
         match runtime
             .bytecode_for_callable(&callable)
@@ -283,8 +343,16 @@ pub(super) fn apply(
                 this_value,
                 arguments,
             } => {
-                values = match runtime
-                    .concatenate_bound_arguments(realm, &arguments, &values)
+                let previous = std::mem::replace(&mut owners.receiver, this_value);
+                runtime
+                    .release_jsvalue(previous)
+                    .map_err(runtime_error_to_vm_error)?;
+                owners.values = match runtime
+                    .concatenate_bound_arguments_jsvalue(
+                        realm,
+                        arguments,
+                        std::mem::take(&mut owners.values),
+                    )
                     .map_err(runtime_error_to_vm_error)?
                 {
                     NativeConversion::Value(values) => values,
@@ -293,7 +361,6 @@ pub(super) fn apply(
                     }
                 };
                 callable = target;
-                receiver = this_value;
             }
             _ => return Ok(CallStep::Bridge),
         }
@@ -317,11 +384,15 @@ pub(super) fn apply(
             .map(CallStep::Complete)
             .map_err(runtime_error_to_vm_error);
     }
+    frame.resume_pc = frame
+        .fault_pc
+        .checked_add(1)
+        .ok_or_else(|| Error::internal("apply eval resume PC overflow"))?;
     let request = BytecodeCallRequest {
         callable,
-        receiver,
-        new_target: Value::Undefined,
-        arguments: values,
+        receiver: std::mem::replace(&mut owners.receiver, JsValue::Undefined),
+        new_target: JsValue::Undefined,
+        arguments: std::mem::take(&mut owners.values),
         bytecode,
         closure_slots,
         caller_realm: realm,
@@ -334,15 +405,28 @@ pub(super) fn apply(
     };
     #[cfg(feature = "profiling")]
     let depth = execution.slots.depth(&frame.window);
-    frame.resume_pc = frame
-        .fault_pc
-        .checked_add(1)
-        .ok_or_else(|| Error::internal("apply eval resume PC overflow"))?;
     let entry = request.prepare(runtime, &mut execution.call_storage)?;
     push_frame(execution, entry)?;
     #[cfg(feature = "profiling")]
     crate::engine::api::profiling::record_owned_instruction(depth);
     Ok(CallStep::Entered)
+}
+
+// Own the speculative apply snapshot until it enters the frame or falls back.
+struct ApplyArgumentsOwner {
+    runtime: Runtime,
+    values: Vec<JsValue>,
+    receiver: JsValue,
+}
+impl Drop for ApplyArgumentsOwner {
+    fn drop(&mut self) {
+        for value in self.values.drain(..) {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        let _ = self
+            .runtime
+            .release_jsvalue(std::mem::replace(&mut self.receiver, JsValue::Undefined));
+    }
 }
 
 #[cfg(test)]
@@ -353,7 +437,7 @@ mod capture_tests {
     use crate::engine::code::function::{
         UnlinkedConstant, UnlinkedFunction, UnlinkedVariableDefinition,
     };
-    use crate::engine::value::JsString;
+    use crate::engine::value::{JsString, Value};
     use crate::engine::vm::{
         bindings::FrameBinding,
         execution::ExecutionLimits,
@@ -495,7 +579,7 @@ mod capture_tests {
             .unwrap();
         let child = runtime.test_child_function_bytecode(&parent, 0).unwrap();
         let closure = runtime
-            .new_var_ref(Value::Int(30), false, false, ClosureVariableKind::Normal)
+            .new_var_ref(JsValue::Int(30), false, false, ClosureVariableKind::Normal)
             .unwrap();
         let eval_variable_object = runtime.new_object(None).unwrap();
 
@@ -544,13 +628,17 @@ mod capture_tests {
                     input: prepared.input.into(),
                 }),
                 storage: FrameStorage {
-                    original_arguments: vec![Value::Int(10)],
+                    original_arguments: vec![JsValue::Int(10)],
                     parameters: prepared.arguments,
                     locals: vec![
-                        FrameBinding::Direct(Value::Int(20)),
-                        FrameBinding::Direct(Value::Object(eval_variable_object.clone())),
+                        FrameBinding::Direct(JsValue::Int(20)),
+                        FrameBinding::Direct(
+                            runtime
+                                .into_jsvalue(Value::Object(eval_variable_object.clone()))
+                                .unwrap(),
+                        ),
                     ],
-                    operands: vec![Value::Undefined],
+                    operands: vec![JsValue::Undefined],
                 },
             };
             let mut execution =
@@ -561,12 +649,16 @@ mod capture_tests {
                 .current_mut(id)
                 .unwrap()
                 .cold
-                .eval_arguments = Some(vec![input]);
+                .eval_arguments = Some(vec![runtime.into_jsvalue(input).unwrap()]);
             let outcome = prepare_and_enter(&runtime, &mut execution, id, 0, environment).unwrap();
-            assert_eq!(
-                matches!(outcome, CallStep::Complete(Completion::Throw(_))),
-                throws
-            );
+            let threw = match outcome {
+                CallStep::Complete(Completion::Throw(value)) => {
+                    runtime.release_jsvalue(value).unwrap();
+                    true
+                }
+                _ => false,
+            };
+            assert_eq!(threw, throws);
             if captured {
                 // Preparation entered the compiled child. Retire it without running
                 // it so the caller's cell representation can be inspected in place.
@@ -577,7 +669,7 @@ mod capture_tests {
                     &mut execution,
                     child_id,
                     super::super::run::RunExit::Complete,
-                    Some(Completion::Return(Value::Undefined)),
+                    Some(Completion::Return(JsValue::Undefined)),
                 )
                 .unwrap();
             }
@@ -598,11 +690,11 @@ mod capture_tests {
                 ),
                 captured
             );
-            assert_eq!(runtime.read_var_ref(&closure).unwrap(), Value::Int(30));
+            assert_eq!(runtime.read_var_ref(&closure).unwrap(), JsValue::Int(30));
             if !captured && !throws {
                 assert_eq!(
                     execution.slots.peek(&frame.window, 0).unwrap(),
-                    &Value::Int(42)
+                    &JsValue::Int(42)
                 );
             }
         }

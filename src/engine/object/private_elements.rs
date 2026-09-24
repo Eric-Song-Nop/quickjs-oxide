@@ -11,7 +11,7 @@ use crate::engine::api::error::{Error, ErrorKind, NativeErrorMessage};
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
 
-use crate::engine::atom::{Atom, AtomKind};
+use crate::engine::atom::{Atom, AtomIdx, AtomKind};
 use crate::engine::code::function::metadata::{
     ClosureVariableKind, ConstructorKind, EvalKind, FunctionKind,
 };
@@ -19,7 +19,9 @@ use crate::engine::heap::roots::VarRefRoot;
 use crate::engine::heap::{ObjectId, ObjectPayload, PropertySlot, RawValue, VarRefData};
 use crate::engine::object::shape::{PropertyFlags, ShapeEntry};
 use crate::engine::object::{CallableRef, ObjectRef, PrivateNameRef};
-use crate::engine::value::{JsString, Value};
+#[cfg(test)]
+use crate::engine::value::Value;
+use crate::engine::value::{JsString, JsValue};
 
 impl Runtime {
     /// Allocate a fresh runtime-local identity for one evaluated private name.
@@ -48,58 +50,85 @@ impl Runtime {
         &self,
         receiver: &ObjectRef,
         name: &PrivateNameRef,
-        value: Value,
+        value: JsValue,
     ) -> Result<(), RuntimeError> {
         let _operation = self.operation();
-        self.validate_private_receiver(receiver, name)?;
-        self.validate_value_domain(&value, "private field value")?;
-        let raw = self.raw_property_value(&value)?;
-        let object_id = receiver.object_id();
+        let result = (|| {
+            self.validate_private_receiver(receiver, name)?;
+            let raw = value.as_raw();
+            let object_id = receiver.object_id();
 
-        let duplicate = {
-            let state = self.0.state.borrow();
-            let object = state.heap.object(object_id)?;
-            state.heap.shape(object.shape)?.find(name.atom()).is_some()
-        };
-        if duplicate {
-            return Err(RuntimeError::Engine(self.private_field_error(
-                name,
-                "private class field '",
-                "' already exists",
-            )?));
-        }
-
-        let mut state = self.0.state.borrow_mut();
-        let (prototype, mut entries, mut slots) = {
-            let object = state.heap.object(object_id)?;
-            let shape = state.heap.shape(object.shape)?;
-            // Recheck under the mutable borrow so a future interior mutator
-            // cannot turn the snapshot above into a duplicate transition.
-            if shape.find(name.atom()).is_some() {
-                drop(state);
+            let duplicate = {
+                let state = self.0.state.borrow();
+                let found = state.heap.object(object_id).and_then(|object| {
+                    state
+                        .heap
+                        .shape(object.shape)
+                        .map(|shape| shape.find(AtomIdx::from_raw(name.atom().raw())).is_some())
+                });
+                match found {
+                    Ok(duplicate) => duplicate,
+                    Err(error) => {
+                        drop(state);
+                        return Err(error.into());
+                    }
+                }
+            };
+            if duplicate {
                 return Err(RuntimeError::Engine(self.private_field_error(
                     name,
                     "private class field '",
                     "' already exists",
                 )?));
             }
-            (
-                shape.prototype(),
-                shape.entries().to_vec(),
-                object.slots.clone(),
-            )
-        };
-        entries.push(ShapeEntry {
-            atom: name.atom(),
-            flags: PropertyFlags::data(true, true, true),
-        });
-        slots.push(PropertySlot::Data(raw));
-        state.replace_layout(object_id, prototype, &entries, slots)?;
-        drop(state);
-        // `replace_layout` retained the heap occurrence before this incoming
-        // public root is released.
-        drop(value);
-        Ok(())
+
+            let mut state = self.0.state.borrow_mut();
+            let (prototype, mut entries, mut slots) = {
+                let snapshot = state.heap.object(object_id).and_then(|object| {
+                    state.heap.shape(object.shape).map(|shape| {
+                        (
+                            shape.prototype(),
+                            shape.entries().to_vec(),
+                            object.slots.clone(),
+                        )
+                    })
+                });
+                let (prototype, entries, slots) = match snapshot {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        drop(state);
+                        return Err(error.into());
+                    }
+                };
+                // Recheck under the mutable borrow so a future interior mutator
+                // cannot turn the snapshot above into a duplicate transition.
+                if entries
+                    .iter()
+                    .any(|entry| entry.atom == AtomIdx::from_raw(name.atom().raw()))
+                {
+                    drop(state);
+                    return Err(RuntimeError::Engine(self.private_field_error(
+                        name,
+                        "private class field '",
+                        "' already exists",
+                    )?));
+                }
+                (prototype, entries, slots)
+            };
+            entries.push(ShapeEntry {
+                atom: AtomIdx::from_raw(name.atom().raw()),
+                flags: PropertyFlags::data(true, true, true),
+            });
+            slots.push(PropertySlot::Data(raw));
+            let layout_result = state.replace_layout(object_id, prototype, &entries, slots);
+            drop(state);
+            // The transaction retains only the stored edge. The producer is
+            // released outside this borrow on every exit.
+            layout_result?;
+            Ok(())
+        })();
+        self.release_jsvalue(value)?;
+        result
     }
 
     /// Read one private data field directly from `receiver`'s own shape.
@@ -107,14 +136,14 @@ impl Runtime {
         &self,
         receiver: &ObjectRef,
         name: &PrivateNameRef,
-    ) -> Result<Value, RuntimeError> {
+    ) -> Result<JsValue, RuntimeError> {
         let _operation = self.operation();
         self.validate_private_receiver(receiver, name)?;
         let raw = {
             let state = self.0.state.borrow();
             let object = state.heap.object(receiver.object_id())?;
             let shape = state.heap.shape(object.shape)?;
-            let Some(index) = shape.find(name.atom()) else {
+            let Some(index) = shape.find(AtomIdx::from_raw(name.atom().raw())) else {
                 drop(state);
                 return Err(RuntimeError::Engine(self.private_field_error(
                     name,
@@ -142,7 +171,10 @@ impl Runtime {
                 }
             }
         };
-        self.root_raw_value(&raw)
+        let borrowed = JsValue::from_raw(raw).ok_or(RuntimeError::Invariant(
+            "private field contained a sentinel",
+        ))?;
+        self.dup_jsvalue(&borrowed)
     }
 
     /// Replace one existing private data field directly on `receiver`.
@@ -150,43 +182,59 @@ impl Runtime {
         &self,
         receiver: &ObjectRef,
         name: &PrivateNameRef,
-        value: Value,
+        value: JsValue,
     ) -> Result<(), RuntimeError> {
         let _operation = self.operation();
-        self.validate_private_receiver(receiver, name)?;
-        self.validate_value_domain(&value, "private field value")?;
-        let raw = self.raw_property_value(&value)?;
-        let object_id = receiver.object_id();
-        let index = {
-            let state = self.0.state.borrow();
-            let object = state.heap.object(object_id)?;
-            let shape = state.heap.shape(object.shape)?;
-            let Some(index) = shape.find(name.atom()) else {
-                drop(state);
-                return Err(RuntimeError::Engine(self.private_field_error(
-                    name,
-                    "private class field '",
-                    "' does not exist",
-                )?));
+        let result = (|| {
+            self.validate_private_receiver(receiver, name)?;
+            let raw = value.as_raw();
+            let object_id = receiver.object_id();
+            let index = {
+                let state = self.0.state.borrow();
+                let object = match state.heap.object(object_id) {
+                    Ok(object) => object,
+                    Err(error) => {
+                        drop(state);
+                        return Err(error.into());
+                    }
+                };
+                let shape = match state.heap.shape(object.shape) {
+                    Ok(shape) => shape,
+                    Err(error) => {
+                        drop(state);
+                        return Err(error.into());
+                    }
+                };
+                let Some(index) = shape.find(AtomIdx::from_raw(name.atom().raw())) else {
+                    drop(state);
+                    return Err(RuntimeError::Engine(self.private_field_error(
+                        name,
+                        "private class field '",
+                        "' does not exist",
+                    )?));
+                };
+                let index = usize::try_from(index).map_err(|_| {
+                    RuntimeError::Invariant("private field index does not fit usize")
+                })?;
+                if !matches!(object.slots.get(index), Some(PropertySlot::Data(_))) {
+                    drop(state);
+                    return Err(RuntimeError::Invariant(
+                        "private data field used non-data storage",
+                    ));
+                }
+                index
             };
-            let index = usize::try_from(index)
-                .map_err(|_| RuntimeError::Invariant("private field index does not fit usize"))?;
-            if !matches!(object.slots.get(index), Some(PropertySlot::Data(_))) {
-                return Err(RuntimeError::Invariant(
-                    "private data field used non-data storage",
-                ));
-            }
-            index
-        };
 
-        let replacement = PropertySlot::Data(raw);
-        let mut state = self.0.state.borrow_mut();
-        state.replace_property_slot(object_id, index, replacement)?;
-        drop(state);
-        // `replace_object_slot` retained the heap occurrence before this
-        // incoming public root is released.
-        drop(value);
-        Ok(())
+            let replacement = PropertySlot::Data(raw);
+            let mut state = self.0.state.borrow_mut();
+            let replaced = state.replace_property_slot(object_id, index, replacement);
+            drop(state);
+            // Release the producer edge outside the borrow after any outcome.
+            replaced?;
+            Ok(())
+        })();
+        self.release_jsvalue(value)?;
+        result
     }
 
     /// Test for one private data field on `receiver` without walking its
@@ -200,11 +248,16 @@ impl Runtime {
         self.validate_private_receiver(receiver, name)?;
         let state = self.0.state.borrow();
         let object = state.heap.object(receiver.object_id())?;
-        Ok(state.heap.shape(object.shape)?.find(name.atom()).is_some())
+        Ok(state
+            .heap
+            .shape(object.shape)?
+            .find(AtomIdx::from_raw(name.atom().raw()))
+            .is_some())
     }
 
     /// Capture a private-name identity in its dedicated immutable lexical
     /// VarRef representation.
+    #[cfg(test)]
     pub(crate) fn new_private_var_ref(
         &self,
         name: &PrivateNameRef,
@@ -215,7 +268,42 @@ impl Runtime {
         let mut state = self.0.state.borrow_mut();
         state.atoms.retain(atom)?;
         let data = VarRefData::captured(
-            RawValue::Private(atom),
+            RawValue::Private(state.atoms.unbrand(atom)?),
+            true,
+            true,
+            ClosureVariableKind::PrivateField,
+        );
+        let id = match state.heap.allocate_var_ref(data) {
+            Ok(id) => id,
+            Err(error) => {
+                state.atoms.release(atom)?;
+                return Err(error.into());
+            }
+        };
+        drop(state);
+        Ok(VarRefRoot::from_owned_handle(self.clone(), id))
+    }
+
+    /// Capture a private-name identity already held as an unbranded index.
+    ///
+    /// Trust argument: the caller holds one owned atom edge for `index` (for
+    /// example a frame binding) and transfers a duplicate of it to the new
+    /// cell.
+    pub(crate) fn new_private_var_ref_from_index(
+        &self,
+        index: AtomIdx,
+    ) -> Result<VarRefRoot, RuntimeError> {
+        let _operation = self.operation();
+        let atom = self.0.state.borrow().atoms.brand(index)?;
+        if self.0.state.borrow().atoms.kind(atom)? != AtomKind::Private {
+            return Err(RuntimeError::Invariant(
+                "private-name frame binding contains a non-private atom",
+            ));
+        }
+        let mut state = self.0.state.borrow_mut();
+        state.atoms.retain(atom)?;
+        let data = VarRefData::captured(
+            RawValue::Private(state.atoms.unbrand(atom)?),
             true,
             true,
             ClosureVariableKind::PrivateField,
@@ -262,9 +350,10 @@ impl Runtime {
             }
         }
         state.atoms.retain(atom)?;
+        let index = state.atoms.unbrand(atom)?;
         let cleanup = match state
             .heap
-            .replace_var_ref_value(root.id(), RawValue::Private(atom))
+            .replace_var_ref_value(root.id(), RawValue::Private(index))
         {
             Ok(cleanup) => cleanup,
             Err(error) => {
@@ -300,7 +389,7 @@ impl Runtime {
             }
             match &var_ref.value {
                 RawValue::Private(atom) => {
-                    if state.atoms.kind(*atom)? != AtomKind::Private {
+                    if state.atoms.kind(state.atoms.brand(*atom)?)? != AtomKind::Private {
                         return Err(RuntimeError::Invariant(
                             "private-name VarRef contains a non-private atom",
                         ));
@@ -319,7 +408,55 @@ impl Runtime {
                 }
             }
         };
+        let atom = self.0.state.borrow().atoms.brand(atom)?;
         PrivateNameRef::from_borrowed_atom(self.clone(), atom).map_err(Into::into)
+    }
+
+    /// Root the private-name identity held by an authenticated captured cell
+    /// as an unbranded index, retaining one atom edge for the caller.
+    pub(crate) fn private_name_index_from_raw_var_ref(
+        &self,
+        root: &impl crate::engine::heap::roots::VarRefHandle,
+    ) -> Result<AtomIdx, RuntimeError> {
+        let _operation = self.operation();
+        if !root.belongs_to(self) {
+            return Err(RuntimeError::WrongRuntime("private-name closure variable"));
+        }
+        let index = {
+            let state = self.0.state.borrow();
+            let var_ref = state.heap.var_ref(root.id())?;
+            if var_ref.kind != ClosureVariableKind::PrivateField
+                || !var_ref.is_lexical
+                || !var_ref.is_const
+            {
+                return Err(RuntimeError::Invariant(
+                    "private-name read reached an ordinary VarRef",
+                ));
+            }
+            match &var_ref.value {
+                RawValue::Private(index) => {
+                    if state.atoms.kind(state.atoms.brand(*index)?)? != AtomKind::Private {
+                        return Err(RuntimeError::Invariant(
+                            "private-name VarRef contains a non-private atom",
+                        ));
+                    }
+                    *index
+                }
+                RawValue::Uninitialized => {
+                    return Err(RuntimeError::Invariant(
+                        "private-name VarRef was read before initialization",
+                    ));
+                }
+                _ => {
+                    return Err(RuntimeError::Invariant(
+                        "private-name VarRef contains an ordinary value",
+                    ));
+                }
+            }
+        };
+        let atom = self.0.state.borrow().atoms.brand(index)?;
+        self.0.state.borrow_mut().atoms.retain(atom)?;
+        Ok(index)
     }
 
     const fn is_private_callable_kind(kind: ClosureVariableKind) -> bool {
@@ -335,6 +472,7 @@ impl Runtime {
     /// Capture one class-private callable in its dedicated immutable lexical
     /// cell. Its HomeObject must already be installed: it is the authority
     /// from which QuickJS derives the class-side brand.
+    #[cfg(test)]
     pub(crate) fn new_private_callable_var_ref(
         &self,
         callable: &CallableRef,
@@ -347,6 +485,40 @@ impl Runtime {
             ));
         }
         let (callable_id, home_object) = self.private_callable_parts(callable, kind)?;
+        if home_object.is_none() {
+            return Err(RuntimeError::Invariant(
+                "private callable has no HomeObject",
+            ));
+        }
+        let id = self
+            .0
+            .state
+            .borrow_mut()
+            .heap
+            .allocate_var_ref(VarRefData::captured(
+                RawValue::Object(callable_id),
+                true,
+                true,
+                kind,
+            ))?;
+        Ok(VarRefRoot::from_owned_handle(self.clone(), id))
+    }
+
+    /// Capture one class-private callable already held as a frame-owned object
+    /// handle. Its HomeObject must already be installed, exactly as for the
+    /// rooted entry point.
+    pub(crate) fn new_private_callable_var_ref_from_id(
+        &self,
+        callable_id: ObjectId,
+        kind: ClosureVariableKind,
+    ) -> Result<VarRefRoot, RuntimeError> {
+        let _operation = self.operation();
+        if !Self::is_private_callable_kind(kind) {
+            return Err(RuntimeError::Invariant(
+                "private-callable VarRef received a non-callable binding kind",
+            ));
+        }
+        let (callable_id, home_object) = self.private_callable_parts_from_id(callable_id, kind)?;
         if home_object.is_none() {
             return Err(RuntimeError::Invariant(
                 "private callable has no HomeObject",
@@ -463,6 +635,57 @@ impl Runtime {
         Ok(method)
     }
 
+    /// Root the callable held by an authenticated captured private-callable
+    /// cell as an unbranded object handle, retaining one object edge for the
+    /// caller.
+    pub(crate) fn private_callable_id_from_raw_var_ref(
+        &self,
+        root: &impl crate::engine::heap::roots::VarRefHandle,
+        kind: ClosureVariableKind,
+    ) -> Result<ObjectId, RuntimeError> {
+        let _operation = self.operation();
+        if !root.belongs_to(self) {
+            return Err(RuntimeError::WrongRuntime(
+                "private-callable closure variable",
+            ));
+        }
+        if !Self::is_private_callable_kind(kind) {
+            return Err(RuntimeError::Invariant(
+                "private-callable read received a non-callable binding kind",
+            ));
+        }
+        let method_id = {
+            let state = self.0.state.borrow();
+            let var_ref = state.heap.var_ref(root.id())?;
+            if var_ref.kind != kind || !var_ref.is_lexical || !var_ref.is_const {
+                return Err(RuntimeError::Invariant(
+                    "private-callable read reached an incompatible VarRef",
+                ));
+            }
+            match var_ref.value {
+                RawValue::Object(method) => method,
+                RawValue::Uninitialized => {
+                    return Err(RuntimeError::Invariant(
+                        "private-callable VarRef was read before initialization",
+                    ));
+                }
+                _ => {
+                    return Err(RuntimeError::Invariant(
+                        "private-callable VarRef contains an ordinary value",
+                    ));
+                }
+            }
+        };
+        let (method_id, home_object) = self.private_callable_parts_from_id(method_id, kind)?;
+        if home_object.is_none() {
+            return Err(RuntimeError::Invariant(
+                "private callable lost its HomeObject",
+            ));
+        }
+        self.0.state.borrow_mut().heap.retain_object(method_id)?;
+        Ok(method_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn new_private_method_var_ref(
         &self,
@@ -543,7 +766,11 @@ impl Runtime {
         let duplicate = {
             let state = self.0.state.borrow();
             let object = state.heap.object(receiver_id)?;
-            state.heap.shape(object.shape)?.find(brand).is_some()
+            state
+                .heap
+                .shape(object.shape)?
+                .find(AtomIdx::from_raw(brand.raw()))
+                .is_some()
         };
         if duplicate {
             return Err(RuntimeError::Engine(Error::new(
@@ -556,7 +783,7 @@ impl Runtime {
         let (prototype, mut entries, mut slots) = {
             let object = state.heap.object(receiver_id)?;
             let shape = state.heap.shape(object.shape)?;
-            if shape.find(brand).is_some() {
+            if shape.find(AtomIdx::from_raw(brand.raw())).is_some() {
                 drop(state);
                 return Err(RuntimeError::Engine(Error::new(
                     ErrorKind::Type,
@@ -570,7 +797,7 @@ impl Runtime {
             )
         };
         entries.push(ShapeEntry {
-            atom: brand,
+            atom: AtomIdx::from_raw(brand.raw()),
             flags: PropertyFlags::data(true, true, true),
         });
         slots.push(PropertySlot::Data(RawValue::Undefined));
@@ -594,7 +821,11 @@ impl Runtime {
         let brand = self.private_method_brand_atom(method, kind)?;
         let state = self.0.state.borrow();
         let object = state.heap.object(receiver.object_id())?;
-        Ok(state.heap.shape(object.shape)?.find(brand).is_some())
+        Ok(state
+            .heap
+            .shape(object.shape)?
+            .find(AtomIdx::from_raw(brand.raw()))
+            .is_some())
     }
 
     /// Validate that the method's HomeObject already owns a class-side brand.
@@ -630,7 +861,14 @@ impl Runtime {
         if !method.belongs_to(self) {
             return Err(RuntimeError::WrongRuntime("private callable"));
         }
-        let method_id = method.as_object().object_id();
+        self.private_callable_parts_from_id(method.as_object().object_id(), kind)
+    }
+
+    fn private_callable_parts_from_id(
+        &self,
+        method_id: ObjectId,
+        kind: ClosureVariableKind,
+    ) -> Result<(ObjectId, Option<ObjectId>), RuntimeError> {
         let state = self.0.state.borrow();
         let object = state.heap.object(method_id)?;
         let ObjectPayload::BytecodeFunction {
@@ -745,6 +983,7 @@ impl Runtime {
 mod tests {
     use crate::engine::code::function::metadata::FunctionMetadata;
     use crate::engine::object::{DescriptorField, OrdinaryPropertyDescriptor};
+    use crate::engine::value::JsValue;
 
     use super::*;
     use crate::engine::code::bytecode::Instruction;
@@ -836,7 +1075,7 @@ mod tests {
 
         let object = runtime.new_object(None).unwrap();
         runtime
-            .define_private_field_own(&object, &first, Value::Int(1))
+            .define_private_field_own(&object, &first, JsValue::Int(1))
             .unwrap();
         assert!(runtime.has_private_field_own(&object, &first).unwrap());
         assert!(!runtime.has_private_field_own(&object, &second).unwrap());
@@ -848,7 +1087,7 @@ mod tests {
         let name = private_name(&runtime, "#value");
         let owner = runtime.new_object(None).unwrap();
         runtime
-            .define_private_field_own(&owner, &name, Value::Int(7))
+            .define_private_field_own(&owner, &name, JsValue::Int(7))
             .unwrap();
         let child = runtime.new_object(Some(&owner)).unwrap();
 
@@ -859,19 +1098,19 @@ mod tests {
         );
         assert_type_error(
             runtime
-                .set_private_field_own(&child, &name, Value::Int(8))
+                .set_private_field_own(&child, &name, JsValue::Int(8))
                 .unwrap_err(),
             "private class field '#value' does not exist",
         );
         assert_type_error(
             runtime
-                .define_private_field_own(&owner, &name, Value::Int(9))
+                .define_private_field_own(&owner, &name, JsValue::Int(9))
                 .unwrap_err(),
             "private class field '#value' already exists",
         );
         assert_eq!(
             runtime.get_private_field_own(&owner, &name).unwrap(),
-            Value::Int(7)
+            JsValue::Int(7)
         );
     }
 
@@ -899,14 +1138,14 @@ mod tests {
         runtime.prevent_extensions(&object).unwrap();
 
         runtime
-            .define_private_field_own(&object, &name, Value::Int(41))
+            .define_private_field_own(&object, &name, JsValue::Int(41))
             .unwrap();
         runtime
-            .set_private_field_own(&object, &name, Value::Int(42))
+            .set_private_field_own(&object, &name, JsValue::Int(42))
             .unwrap();
         assert_eq!(
             runtime.get_private_field_own(&object, &name).unwrap(),
-            Value::Int(42)
+            JsValue::Int(42)
         );
         assert_eq!(runtime.own_property_keys(&object).unwrap(), [visible]);
     }
@@ -943,7 +1182,7 @@ mod tests {
         assert_eq!(private_atom_ref_count(&runtime, &name), 1);
         let object = runtime.new_object(None).unwrap();
         runtime
-            .define_private_field_own(&object, &name, Value::Int(1))
+            .define_private_field_own(&object, &name, JsValue::Int(1))
             .unwrap();
         assert_eq!(private_atom_ref_count(&runtime, &name), 2);
         let captured = runtime.new_private_var_ref(&name).unwrap();
@@ -1007,7 +1246,7 @@ mod tests {
             ))
         ));
         assert!(matches!(
-            runtime.write_var_ref(&captured, Value::Int(1)),
+            runtime.write_var_ref(&captured, JsValue::Int(1)),
             Err(RuntimeError::Invariant(
                 "ordinary VarRef write reached a private-element binding"
             ))
@@ -1222,7 +1461,13 @@ mod tests {
         let name = private_name(&runtime, "#self");
         let object = runtime.new_object(None).unwrap();
         runtime
-            .define_private_field_own(&object, &name, Value::Object(object.clone()))
+            .define_private_field_own(
+                &object,
+                &name,
+                runtime
+                    .unroot_value(&Value::Object(object.clone()))
+                    .unwrap(),
+            )
             .unwrap();
 
         drop(name);

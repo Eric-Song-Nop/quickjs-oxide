@@ -4,7 +4,7 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::{ContextId, WeakCollectionKey},
     object::{CallableRef, ObjectRef},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{
         Completion,
         call::{
@@ -16,7 +16,7 @@ use crate::engine::{
 pub(crate) enum WeakConstructorStep {
     Complete(Completion),
     Prototype {
-        new_target: Value,
+        new_target: JsValue,
         resume: WeakConstructorResume,
     },
 }
@@ -34,14 +34,21 @@ impl std::ops::DerefMut for WeakConstructorResume {
 }
 const _: () = assert!(std::mem::size_of::<WeakConstructorResume>() <= 8);
 pub(crate) struct WeakConstructorResumeState {
+    runtime: Runtime,
+    target_owner: JsValue,
     realm: ContextId,
     input: Input,
 }
+impl Drop for WeakConstructorResumeState {
+    fn drop(&mut self) {
+        let _ = self.runtime.release_jsvalue(std::mem::replace(
+            &mut self.target_owner,
+            JsValue::Undefined,
+        ));
+    }
+}
 enum Input {
-    WeakRef {
-        _value: Value,
-        key: WeakCollectionKey,
-    },
+    WeakRef { key: WeakCollectionKey },
     FinalizationRegistry(CallableRef),
 }
 impl WeakConstructorStep {
@@ -62,9 +69,9 @@ impl WeakConstructorStep {
                 }
             }));
         };
-        if matches!(new_target, Value::Undefined) {
+        if matches!(new_target, JsValue::Undefined) {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(
+                runtime.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "constructor requires 'new'",
@@ -74,7 +81,6 @@ impl WeakConstructorStep {
         let value = arguments
             .readable
             .first()
-            .cloned()
             .ok_or(RuntimeError::Invariant(match kind {
                 WeakIntrinsicKind::WeakRef => "WeakRef target argv was not padded",
                 WeakIntrinsicKind::FinalizationRegistry => {
@@ -83,16 +89,16 @@ impl WeakConstructorStep {
             }))?;
         let input = match kind {
             WeakIntrinsicKind::WeakRef => {
-                let Some(key) = runtime.weak_target_key(&value, "WeakRef target")? else {
+                let Some(key) = runtime.weak_target_key(value)? else {
                     return runtime
                         .invalid_weak_target(realm, "invalid target")
                         .map(Self::Complete);
                 };
-                Input::WeakRef { _value: value, key }
+                Input::WeakRef { key }
             }
             WeakIntrinsicKind::FinalizationRegistry => {
                 let callable = match value {
-                    Value::Object(object) => runtime.as_callable(&object)?,
+                    JsValue::Object(id) => runtime.as_callable_object(*id)?,
                     _ => None,
                 };
                 let Some(callable) = callable else {
@@ -103,9 +109,15 @@ impl WeakConstructorStep {
                 Input::FinalizationRegistry(callable)
             }
         };
+        let resume = WeakConstructorResume(Box::new(WeakConstructorResumeState {
+            runtime: runtime.clone(),
+            target_owner: runtime.dup_jsvalue(value)?,
+            realm,
+            input,
+        }));
         Ok(Self::Prototype {
-            new_target: new_target.clone(),
-            resume: WeakConstructorResume(Box::new(WeakConstructorResumeState { realm, input })),
+            new_target: runtime.dup_jsvalue(new_target)?,
+            resume,
         })
     }
 }
@@ -131,14 +143,14 @@ impl WeakConstructorResume {
                 )?
             }
         };
-        let object = match self.0.input {
-            Input::WeakRef { _value, key } => runtime.new_weak_ref_object(&prototype, key)?,
+        let object = match &self.0.input {
+            Input::WeakRef { key } => runtime.new_weak_ref_object(&prototype, *key)?,
             Input::FinalizationRegistry(callback) => {
-                runtime.new_finalization_registry_object(&prototype, &callback, self.0.realm)?
+                runtime.new_finalization_registry_object(&prototype, callback, self.0.realm)?
             }
         };
         Ok(WeakConstructorStep::Complete(Completion::Return(
-            Value::Object(object),
+            JsValue::Object(object.into_handle()),
         )))
     }
 }

@@ -5,7 +5,7 @@ use crate::engine::api::{
 };
 use crate::engine::heap::ContextId;
 use crate::engine::object::CallableRef;
-use crate::engine::value::Value;
+use crate::engine::value::JsValue;
 use crate::engine::vm::{
     Completion,
     call::{NativeArguments, NativeInvocation},
@@ -14,12 +14,12 @@ use crate::engine::vm::{
 pub(crate) enum EvalScriptStep {
     Complete(Completion),
     String {
-        value: Value,
+        value: JsValue,
         resume: EvalScriptResume,
     },
     Call {
         callable: CallableRef,
-        receiver: Value,
+        receiver: JsValue,
     },
 }
 pub(crate) struct EvalScriptResume {
@@ -27,20 +27,23 @@ pub(crate) struct EvalScriptResume {
 }
 impl EvalScriptStep {
     pub(crate) fn start(
+        runtime: &Runtime,
         realm: ContextId,
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Self, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(runtime);
             return Err(RuntimeError::Invariant(
                 "Test262 evalScript received a constructor invocation",
             ));
         };
+        invocation.release(runtime)?;
         let source = arguments.readable.first().ok_or(RuntimeError::Invariant(
             "Test262 evalScript argument was not padded",
         ))?;
         Ok(Self::String {
-            value: source.clone(),
+            value: runtime.dup_jsvalue(source)?,
             resume: EvalScriptResume { realm },
         })
     }
@@ -55,11 +58,22 @@ impl EvalScriptResume {
             Completion::Throw(value) => {
                 return Ok(EvalScriptStep::Complete(Completion::Throw(value)));
             }
-            Completion::Return(Value::String(source)) => source,
-            _ => {
-                return Err(RuntimeError::Invariant(
-                    "evalScript conversion returned a non-string",
-                ));
+            Completion::Return(value) => {
+                let source = match &value {
+                    JsValue::String(id) => runtime
+                        .0
+                        .state
+                        .borrow()
+                        .heap
+                        .string(*id)
+                        .cloned()
+                        .map_err(RuntimeError::from),
+                    _ => Err(RuntimeError::Invariant(
+                        "evalScript conversion returned a non-string",
+                    )),
+                };
+                runtime.release_jsvalue(value)?;
+                source?
             }
         };
         let realm = self.realm;
@@ -67,17 +81,18 @@ impl EvalScriptResume {
         // UTF-16 code-unit stream. Reject an unpaired surrogate explicitly;
         // lossy replacement would silently evaluate different JavaScript.
         let source_units = source.utf16_units().collect::<Vec<_>>();
-        let source =
-            match String::from_utf16(&source_units) {
-                Ok(source) => source,
-                Err(_) => {
-                    return Ok(EvalScriptStep::Complete(Completion::Throw(runtime.new_native_error(
-                    realm,
-                    NativeErrorKind::Internal,
-                    "evalScript source containing a lone UTF-16 surrogate is not implemented",
-                )?)));
-                }
-            };
+        let source = match String::from_utf16(&source_units) {
+            Ok(source) => source,
+            Err(_) => {
+                return Ok(EvalScriptStep::Complete(Completion::Throw(
+                    runtime.new_native_error_jsvalue(
+                        realm,
+                        NativeErrorKind::Internal,
+                        "evalScript source containing a lone UTF-16 surrogate is not implemented",
+                    )?,
+                )));
+            }
+        };
 
         let script = match runtime.compile_in_realm(realm, &source, EVAL_SCRIPT_FILENAME)? {
             Compilation::Published(script) => script,
@@ -89,7 +104,7 @@ impl EvalScriptResume {
         let global_object = runtime.global_object_for_realm(realm)?;
         Ok(EvalScriptStep::Call {
             callable,
-            receiver: Value::Object(global_object),
+            receiver: JsValue::Object(global_object.into_handle()),
         })
     }
 }

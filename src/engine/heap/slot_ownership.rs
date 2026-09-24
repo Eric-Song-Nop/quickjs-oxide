@@ -6,7 +6,7 @@
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
 use crate::engine::heap::{Heap, HeapError, RawId, SlotState};
-use crate::engine::value::Value;
+use crate::engine::value::{JsValue, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SlotReleaseReadiness {
@@ -26,14 +26,72 @@ impl Heap {
         self.slot_release_readiness(RawId::Object(object))
     }
 
+    /// Trusted hot-path release readiness for a live object held by an owning
+    /// root. Identical to [`Heap::slot_object_release_readiness`] except that
+    /// the generation check is omitted; a non-live slot still reports `Drain`
+    /// rather than aborting.
+    #[inline]
+    pub(crate) fn slot_object_release_readiness_fast(
+        &self,
+        object: super::ObjectId,
+    ) -> SlotReleaseReadiness {
+        if !self.zero_queue.is_empty() {
+            return SlotReleaseReadiness::Drain;
+        }
+        match &self.slots[object.index as usize].state {
+            SlotState::Live(node) if node.strong.get() > 1 => SlotReleaseReadiness::Ready,
+            SlotState::Live(node) if node.strong.get() == 1 => {
+                if self.zero_queue.len() == self.zero_queue.capacity() {
+                    SlotReleaseReadiness::QueueCapacity
+                } else {
+                    SlotReleaseReadiness::Drain
+                }
+            }
+            _ => SlotReleaseReadiness::Drain,
+        }
+    }
+
+    /// Leaf retirement has no graph traversal. Unlike an object, a string or
+    /// BigInt node's last reference is retired in place by
+    /// `try_release_leaf_reference`; it never enters the zero queue. The only
+    /// allocation hazard is the free-list push, so the last-owner proof asks
+    /// exactly that question instead of the zero-queue capacity one. Matches
+    /// `try_release_leaf_reference`'s tracing and queue admission.
+    fn slot_leaf_release_readiness(&self, id: RawId) -> Result<SlotReleaseReadiness, HeapError> {
+        let index = self.validate_slot_identity(id)?;
+        if !self.zero_queue.is_empty() {
+            return Ok(SlotReleaseReadiness::Drain);
+        }
+        #[cfg(debug_assertions)]
+        if matches!(id, RawId::String(id) if super::ownership::trace_string_matches(id)) {
+            return self.slot_release_readiness(id);
+        }
+        match &self.slots[index].state {
+            SlotState::Live(node) if node.strong.get() > 1 => Ok(SlotReleaseReadiness::Ready),
+            SlotState::Live(node) if node.strong.get() == 1 => {
+                // reclaim_vacant_slot either retires a generation-saturated
+                // slot in place or pushes onto the free list; only a full
+                // free list can allocate during that push.
+                if self.slots[index].generation == u32::MAX
+                    || self.free.len() < self.free.capacity()
+                {
+                    Ok(SlotReleaseReadiness::Ready)
+                } else {
+                    Ok(SlotReleaseReadiness::QueueCapacity)
+                }
+            }
+            _ => Ok(SlotReleaseReadiness::Drain),
+        }
+    }
+
     fn slot_release_readiness(&self, id: RawId) -> Result<SlotReleaseReadiness, HeapError> {
         let index = self.validate_slot_identity(id)?;
         if !self.zero_queue.is_empty() {
             return Ok(SlotReleaseReadiness::Drain);
         }
         match &self.slots[index].state {
-            SlotState::Live(node) if node.strong > 1 => Ok(SlotReleaseReadiness::Ready),
-            SlotState::Live(node) if node.strong == 1 => {
+            SlotState::Live(node) if node.strong.get() > 1 => Ok(SlotReleaseReadiness::Ready),
+            SlotState::Live(node) if node.strong.get() == 1 => {
                 // release_raw_no_drain would push to this queue. Do not commit
                 // its decrement before deciding whether that push can allocate.
                 Ok(if self.zero_queue.len() == self.zero_queue.capacity() {
@@ -50,6 +108,7 @@ impl Heap {
 }
 
 impl Runtime {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn slot_value_release_readiness(
         &self,
         value: &Value,
@@ -101,10 +160,53 @@ impl Runtime {
         }
     }
 
+    /// Internal-value form of [`Runtime::slot_value_release_readiness`].
+    /// Handles carry no runtime branding, so the domain checks disappear;
+    /// every heap-backed kind reports its node or atom slot readiness.
+    pub(crate) fn slot_value_release_readiness_jsvalue(
+        &self,
+        value: &JsValue,
+    ) -> Result<SlotReleaseReadiness, RuntimeError> {
+        match value {
+            JsValue::Undefined
+            | JsValue::Null
+            | JsValue::Bool(_)
+            | JsValue::Int(_)
+            | JsValue::Float(_)
+            | JsValue::ShortBigInt(_) => return Ok(SlotReleaseReadiness::Ready),
+            JsValue::Object(_) | JsValue::Symbol(_) | JsValue::String(_) | JsValue::BigInt(_) => {}
+        }
+        if self.0.deferred_references.has_pending() {
+            return Ok(SlotReleaseReadiness::Deferred);
+        }
+        let Ok(state) = self.0.state.try_borrow_mut() else {
+            return Ok(SlotReleaseReadiness::Borrowed);
+        };
+        match value {
+            JsValue::Object(id) => Ok(state.heap.slot_release_readiness(RawId::Object(*id))?),
+            JsValue::String(id) => {
+                Ok(state.heap.slot_leaf_release_readiness(RawId::String(*id))?)
+            }
+            JsValue::BigInt(id) => {
+                Ok(state.heap.slot_leaf_release_readiness(RawId::BigInt(*id))?)
+            }
+            JsValue::Symbol(index) => {
+                let atom = state.atoms.brand(*index)?;
+                Ok(match state.atoms.resolve(atom)?.ref_count {
+                    None => SlotReleaseReadiness::Ready,
+                    Some(count) if count > 1 => SlotReleaseReadiness::Ready,
+                    Some(_) => SlotReleaseReadiness::PrimitiveStorage,
+                })
+            }
+            _ => unreachable!("primitive slots returned before borrowing runtime state"),
+        }
+    }
+
     /// Commit exactly one ordinary owning-root release after the no-drain
     /// proof. No callback or reference decrease can intervene between the
     /// preflight and Drop. Ready consumes the Value; every other outcome leaves
     /// it untouched, so the caller may move it to a pending operation safely.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn try_release_slot_value(&self, value: &mut Value) -> Result<bool, RuntimeError> {
         if self.slot_value_release_readiness(value)? != SlotReleaseReadiness::Ready {
             return Ok(false);
@@ -118,6 +220,144 @@ impl Runtime {
         let old = std::mem::replace(value, Value::Undefined);
         drop(old);
         Ok(true)
+    }
+
+    /// Internal-value form of [`Runtime::try_release_slot_value`]: on `Ready`
+    /// the value is replaced with `undefined` and its edges are released.
+    pub(crate) fn try_release_slot_value_jsvalue(
+        &self,
+        value: &mut JsValue,
+    ) -> Result<bool, RuntimeError> {
+        if self.slot_value_release_readiness_jsvalue(value)? != SlotReleaseReadiness::Ready {
+            return Ok(false);
+        }
+        #[cfg(feature = "profiling")]
+        crate::engine::api::profiling::record_owned_storage(
+            crate::engine::api::profiling::OwnedStorageEvent::HotRelease {
+                heap_root: matches!(value, JsValue::Object(_) | JsValue::Symbol(_)),
+            },
+        );
+        let old = std::mem::replace(value, JsValue::Undefined);
+        self.release_jsvalue(old)?;
+        Ok(true)
+    }
+
+    /// Commit one ordinary owning-root release already proven `Ready` in the
+    /// same operation, with no callback, allocation or reference decrease in
+    /// between. The caller owns that proof; debug builds re-check it so a
+    /// broken invariant panics here instead of leaking or double-releasing.
+    pub(crate) fn release_slot_value_jsvalue_ready(
+        &self,
+        value: &mut JsValue,
+    ) -> Result<(), RuntimeError> {
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.slot_value_release_readiness_jsvalue(value)?,
+            SlotReleaseReadiness::Ready,
+            "slot release proof changed without a callback"
+        );
+        #[cfg(feature = "profiling")]
+        crate::engine::api::profiling::record_owned_storage(
+            crate::engine::api::profiling::OwnedStorageEvent::HotRelease {
+                heap_root: matches!(value, JsValue::Object(_) | JsValue::Symbol(_)),
+            },
+        );
+        let old = std::mem::replace(value, JsValue::Undefined);
+        self.release_jsvalue(old)
+    }
+}
+
+#[cfg(test)]
+mod leaf_readiness_tests {
+    use super::*;
+    use crate::engine::value::{JsString, Value, bigint::JsBigInt};
+
+    #[test]
+    fn last_leaf_readiness_requires_allocation_free_retirement() {
+        let mut heap = Heap::default();
+        let id = heap.allocate_bigint(JsBigInt::from(i128::MAX)).unwrap();
+        let raw = RawId::BigInt(id);
+        assert_eq!(
+            heap.slot_leaf_release_readiness(raw).unwrap(),
+            SlotReleaseReadiness::QueueCapacity
+        );
+        heap.free.reserve(1);
+        assert_eq!(
+            heap.slot_leaf_release_readiness(raw).unwrap(),
+            SlotReleaseReadiness::Ready
+        );
+        assert_eq!(heap.try_release_leaf_reference(raw).unwrap(), Some(true));
+        assert!(heap.slot_leaf_release_readiness(raw).is_err());
+        assert!(heap.zero_queue.is_empty());
+    }
+
+    #[test]
+    fn shared_leaf_readiness_is_ready_without_free_list_capacity() {
+        let mut heap = Heap::default();
+        let id = heap.allocate_bigint(JsBigInt::from(i128::MAX)).unwrap();
+        let raw = RawId::BigInt(id);
+        heap.retain_bigint(id).unwrap();
+        assert_eq!(heap.free.capacity(), heap.free.len());
+        assert_eq!(
+            heap.slot_leaf_release_readiness(raw).unwrap(),
+            SlotReleaseReadiness::Ready
+        );
+        assert_eq!(heap.try_release_leaf_reference(raw).unwrap(), Some(false));
+        heap.free.reserve(1);
+        assert_eq!(heap.try_release_leaf_reference(raw).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn owned_leaf_release_keeps_borrow_and_pending_boundaries() {
+        for public in [
+            Value::String(JsString::from_static("leaf")),
+            Value::BigInt(JsBigInt::from(i128::MAX)),
+        ] {
+            let runtime = Runtime::new();
+            let mut value = runtime.into_jsvalue(public).unwrap();
+            runtime.0.state.borrow_mut().heap.free.reserve(2);
+            let ready = runtime
+                .slot_value_release_readiness_jsvalue(&value)
+                .unwrap();
+            let borrowed = {
+                let _state = runtime.0.state.borrow();
+                runtime
+                    .slot_value_release_readiness_jsvalue(&value)
+                    .unwrap()
+            };
+            let doomed = runtime.new_object(None).unwrap();
+            {
+                let _state = runtime.0.state.borrow();
+                drop(doomed);
+            }
+            let deferred = runtime
+                .slot_value_release_readiness_jsvalue(&value)
+                .unwrap();
+            let declined = runtime.try_release_slot_value_jsvalue(&mut value).unwrap();
+            runtime.drain_deferred_references().unwrap();
+            let released = runtime.try_release_slot_value_jsvalue(&mut value).unwrap();
+            runtime.release_jsvalue(value).unwrap();
+            assert_eq!(ready, SlotReleaseReadiness::Ready);
+            assert_eq!(borrowed, SlotReleaseReadiness::Borrowed);
+            assert_eq!(deferred, SlotReleaseReadiness::Deferred);
+            assert!(!declined);
+            assert!(released);
+        }
+    }
+
+    #[test]
+    fn older_zero_queue_prevents_leaf_ready() {
+        let mut heap = Heap::default();
+        let first = heap.allocate_bigint(JsBigInt::from(i128::MAX)).unwrap();
+        let second = heap.allocate_bigint(JsBigInt::from(i128::MAX)).unwrap();
+        heap.free.reserve(2);
+        heap.release_raw_no_drain(RawId::BigInt(first)).unwrap();
+        let readiness = heap
+            .slot_leaf_release_readiness(RawId::BigInt(second))
+            .unwrap();
+        heap.release_reference(RawId::BigInt(second)).unwrap();
+        assert_eq!(readiness, SlotReleaseReadiness::Drain);
+        assert!(heap.zero_queue.is_empty());
     }
 }
 
@@ -255,7 +495,9 @@ mod tests {
         use crate::engine::code::bytecode::Instruction;
         let runtime = Runtime::new();
         let mut context = runtime.new_context();
-        let base = context.eval("globalThis.fieldProbe={x:7}").unwrap();
+        let base = runtime
+            .into_jsvalue(context.eval("globalThis.fieldProbe={x:7}").unwrap())
+            .unwrap();
         let callable = runtime
             .callable_from_value(context.eval("(function(o,v){o.x=v;return o.x})").unwrap())
             .unwrap();
@@ -289,15 +531,16 @@ mod tests {
                 .try_ordinary_field_immediate_read(&base, &code, key)
                 .is_none()
         );
-        assert!(!runtime.try_ordinary_field_immediate_write(&base, &code, key, &Value::Int(17)));
+        assert!(!runtime.try_ordinary_field_immediate_write(&base, &code, key, &JsValue::Int(17)));
         assert_eq!(runtime.0.state.borrow().heap.zero_queue.len(), 1);
         runtime.run_gc().unwrap();
         assert_eq!(context.eval("fieldProbe.x").unwrap(), Value::Int(7));
-        assert!(runtime.try_ordinary_field_immediate_write(&base, &code, key, &Value::Int(17)));
+        assert!(runtime.try_ordinary_field_immediate_write(&base, &code, key, &JsValue::Int(17)));
         assert_eq!(
             runtime.try_ordinary_field_immediate_read(&base, &code, key),
-            Some(Value::Int(17))
+            Some(JsValue::Int(17))
         );
+        runtime.release_jsvalue(base).unwrap();
     }
 
     #[test]
@@ -327,11 +570,19 @@ mod tests {
             .release_raw_no_drain(RawId::Object(queued_id))
             .unwrap();
         assert_eq!(runtime.0.state.borrow().heap.zero_queue.len(), 1);
-        assert!(!runtime.try_typed_array_number_write(&typed, 0, 17.0));
-        assert!(runtime.try_dense_array_immediate_read(&dense, 0).is_none());
-        assert!(runtime.try_array_immediate_read(&dense, 0).is_none());
-        assert!(runtime.try_array_immediate_read(&typed, 0).is_none());
+        let dense_js = runtime.unroot_value(&dense).unwrap();
+        let typed_js = runtime.unroot_value(&typed).unwrap();
+        assert!(!runtime.try_typed_array_number_write(&typed_js, 0, 17.0));
+        assert!(
+            runtime
+                .try_dense_array_immediate_read(&dense_js, 0)
+                .is_none()
+        );
+        assert!(runtime.try_array_immediate_read(&dense_js, 0).is_none());
+        assert!(runtime.try_array_immediate_read(&typed_js, 0).is_none());
         assert_eq!(runtime.0.state.borrow().heap.zero_queue.len(), 1);
+        runtime.release_jsvalue(dense_js).unwrap();
+        runtime.release_jsvalue(typed_js).unwrap();
         for value in [&dense, &typed] {
             let Value::Object(object) = value else {
                 panic!("array receiver");
@@ -387,7 +638,8 @@ mod tests {
             .heap
             .live_node_mut(id)
             .unwrap()
-            .strong = u32::MAX;
+            .strong
+            .set(u32::MAX);
         let result = root.try_clone();
         let count = runtime.0.state.borrow().heap.strong_count(id).unwrap();
         // Restore the actual owner count before assertions can unwind roots.
@@ -398,7 +650,8 @@ mod tests {
             .heap
             .live_node_mut(id)
             .unwrap()
-            .strong = 1;
+            .strong
+            .set(1);
         assert!(result.is_err());
         assert_eq!(count, u32::MAX);
         drop(root);

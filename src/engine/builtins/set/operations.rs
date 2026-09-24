@@ -8,7 +8,7 @@ use crate::engine::{
     },
     heap::{ContextId, ObjectPayload},
     object::{CallableRef, ObjectRef, PropertyKey},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
@@ -62,17 +62,53 @@ const _: () = assert!(std::mem::size_of::<SetResume>() <= 8);
 pub(crate) struct SetResumeState {
     pending_effect: SetStepPending,
     phase: Phase,
+    runtime: Runtime,
     realm: ContextId,
     kind: SetOperation,
     set: ObjectRef,
-    target: Value,
+    target: JsValue,
     size: i64,
     has: Option<CallableRef>,
     keys: Option<CallableRef>,
     result: Option<ObjectRef>,
     index: usize,
-    iterator: Value,
-    next: Value,
+    iterator: JsValue,
+    next: JsValue,
+}
+impl Drop for SetResumeState {
+    /// Release the internal edges the pending effect and resident operands
+    /// still own when the request is abandoned. Consumption goes through
+    /// `Option::take`/`mem::replace`; releases are defer-safe and nothrow.
+    fn drop(&mut self) {
+        if let Some(value) = self.pending_effect.read_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.pending_effect.number_value.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.pending_effect.call_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(values) = self.pending_effect.call_arguments.take() {
+            for value in values {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+        if let Some(Completion::Return(value) | Completion::Throw(value)) =
+            self.pending_effect.parse_result.take()
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Phase::Probe { value, .. } = std::mem::replace(&mut self.phase, Phase::Parse) {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        let target = std::mem::replace(&mut self.target, JsValue::Undefined);
+        let _ = self.runtime.release_jsvalue(target);
+        let iterator = std::mem::replace(&mut self.iterator, JsValue::Undefined);
+        let _ = self.runtime.release_jsvalue(iterator);
+        let next = std::mem::replace(&mut self.next, JsValue::Undefined);
+        let _ = self.runtime.release_jsvalue(next);
+    }
 }
 enum Phase {
     Size,
@@ -85,7 +121,7 @@ enum Phase {
     Parse,
     Probe {
         record: Option<ActiveCollectionRecordGuard>,
-        value: Value,
+        value: JsValue,
     },
     CloseMethod,
     CloseCall,
@@ -100,47 +136,41 @@ impl SetStep {
     ) -> Result<Self, RuntimeError> {
         let set = match runtime.set_receiver(realm, invocation, false)? {
             NativeConversion::Value(set) => set,
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
+            NativeConversion::Throw(value) => {
+                return Ok(Self::Complete(Completion::Throw(value)));
+            }
         };
-        let target = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "Set method operand argv was not padded",
-            ))?;
-        if matches!(target, Value::Null | Value::Undefined) {
-            let base = if matches!(target, Value::Null) {
+        let target_ref = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "Set method operand argv was not padded",
+        ))?;
+        if matches!(target_ref, JsValue::Null | JsValue::Undefined) {
+            let base = if matches!(target_ref, JsValue::Null) {
                 "null"
             } else {
                 "undefined"
             };
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(
+                runtime.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     &format!("cannot read property 'size' of {base}"),
                 )?,
             )));
         }
-        let genuine_size = if let Value::Object(object) = &target {
-            if !object.belongs_to(runtime) {
-                return Err(RuntimeError::WrongRuntime("set-like object"));
-            }
+        let genuine_size = if let JsValue::Object(id) = target_ref {
             let state = runtime.0.state.borrow();
-            if matches!(
-                state.heap.object(object.object_id())?.payload,
-                ObjectPayload::Set { .. }
-            ) {
-                Some(state.heap.set_size(object.object_id())?)
+            if matches!(state.heap.object(*id)?.payload, ObjectPayload::Set { .. }) {
+                Some(state.heap.set_size(*id)?)
             } else {
                 None
             }
         } else {
             None
         };
+        let target = runtime.dup_jsvalue(target_ref)?;
         let mut resume = SetResume(Box::new(SetResumeState {
             pending_effect: SetStepPending::default(),
+            runtime: runtime.clone(),
             realm,
             kind,
             set: set.clone(),
@@ -150,8 +180,8 @@ impl SetStep {
             keys: None,
             result: None,
             index: 0,
-            iterator: Value::Undefined,
-            next: Value::Undefined,
+            iterator: JsValue::Undefined,
+            next: JsValue::Undefined,
             phase: Phase::Size,
         }));
         if let Some(size) = genuine_size {
@@ -167,7 +197,7 @@ impl SetStep {
 impl SetResume {
     fn read(self, runtime: &Runtime, name: &str) -> Result<SetStep, RuntimeError> {
         Ok(SetStep::request_read(
-            self.0.target.clone(),
+            runtime.dup_jsvalue(&self.0.target)?,
             runtime.intern_property_key(name)?,
             self,
         ))
@@ -178,6 +208,15 @@ impl SetResume {
             .clone()
             .ok_or(RuntimeError::Invariant("Set operation result missing"))
     }
+    /// Borrowed identity of the resident result owner for record mutations.
+    fn result_id(&self) -> Result<crate::engine::heap::ObjectId, RuntimeError> {
+        Ok(self
+            .0
+            .result
+            .as_ref()
+            .ok_or(RuntimeError::Invariant("Set operation result missing"))?
+            .object_id())
+    }
     fn complete(self) -> Result<SetStep, RuntimeError> {
         let value = match self.0.kind {
             SetOperation::Disjoint | SetOperation::Subset | SetOperation::Superset => {
@@ -185,7 +224,9 @@ impl SetResume {
             }
             _ => Value::Object(self.result()?),
         };
-        Ok(SetStep::Complete(Completion::Return(value)))
+        Ok(SetStep::Complete(Completion::Return(
+            self.0.runtime.into_jsvalue(value)?,
+        )))
     }
     fn selected(mut self, runtime: &Runtime) -> Result<SetStep, RuntimeError> {
         if matches!(self.0.kind, SetOperation::Difference) {
@@ -195,7 +236,9 @@ impl SetResume {
         if matches!(self.0.kind, SetOperation::Subset) && size > self.0.size
             || matches!(self.0.kind, SetOperation::Superset) && size < self.0.size
         {
-            return Ok(SetStep::Complete(Completion::Return(Value::Bool(false))));
+            return Ok(SetStep::Complete(Completion::Return(
+                self.0.runtime.into_jsvalue(Value::Bool(false))?,
+            )));
         }
         let own = match self.0.kind {
             SetOperation::Subset => true,
@@ -222,27 +265,33 @@ impl SetResume {
                 .keys
                 .clone()
                 .ok_or(RuntimeError::Invariant("Set operation keys missing"))?,
-            self.0.target.clone(),
+            runtime.dup_jsvalue(&self.0.target)?,
             Vec::new(),
             self,
         ))
     }
     fn probe(mut self, runtime: &Runtime) -> Result<SetStep, RuntimeError> {
+        // Borrow the resident owner instead of cloning a root per record; the
+        // resume state keeps `set`/`result` alive across this whole probe.
         let source = if matches!(self.0.kind, SetOperation::Difference) {
-            self.result()?
+            self.0
+                .result
+                .as_ref()
+                .ok_or(RuntimeError::Invariant("Set operation result missing"))?
+                .object_id()
         } else {
-            self.0.set.clone()
+            self.0.set.object_id()
         };
         let Some((record_index, value)) =
-            runtime.next_live_set_record(&source, &mut self.0.index)?
+            runtime.next_live_set_record_id(source, &mut self.0.index)?
         else {
             return self.complete();
         };
         let record = runtime.push_active_collection_record(ActiveCollectionRecord::Set {
-            object: source.object_id(),
+            object: source,
             index: record_index,
         });
-        let arguments = vec![value.clone()];
+        let arguments = vec![runtime.dup_jsvalue(&value)?];
         self.0.phase = Phase::Probe {
             record: Some(record),
             value,
@@ -252,25 +301,29 @@ impl SetResume {
                 .has
                 .clone()
                 .ok_or(RuntimeError::Invariant("Set operation has missing"))?,
-            self.0.target.clone(),
+            runtime.dup_jsvalue(&self.0.target)?,
             arguments,
             self,
         ))
     }
     fn next_step(mut self, runtime: &Runtime) -> Result<SetStep, RuntimeError> {
         let callable = match &self.0.next {
-            Value::Object(object) => runtime.as_callable(object)?,
+            JsValue::Object(id) => runtime.as_callable_object(*id)?,
             _ => None,
         };
         let Some(callable) = callable else {
             return Ok(SetStep::Complete(Completion::Throw(
-                runtime.new_native_error(self.0.realm, NativeErrorKind::Type, "not a function")?,
+                runtime.new_native_error_jsvalue(
+                    self.0.realm,
+                    NativeErrorKind::Type,
+                    "not a function",
+                )?,
             )));
         };
         self.0.phase = Phase::NextCall;
         Ok(SetStep::request_call(
             callable,
-            self.0.iterator.clone(),
+            runtime.dup_jsvalue(&self.0.iterator)?,
             Vec::new(),
             self,
         ))
@@ -292,7 +345,11 @@ impl SetResume {
         if matches!(self.0.phase, Phase::CloseCall)
             || matches!(self.0.phase, Phase::CloseMethod) && matches!(reply, Completion::Throw(_))
         {
-            return Ok(SetStep::Complete(Completion::Return(Value::Bool(false))));
+            let (Completion::Return(value) | Completion::Throw(value)) = reply;
+            runtime.release_jsvalue(value)?;
+            return Ok(SetStep::Complete(Completion::Return(
+                self.0.runtime.into_jsvalue(Value::Bool(false))?,
+            )));
         }
         let value = match reply {
             Completion::Return(value) => value,
@@ -306,22 +363,23 @@ impl SetResume {
             phase @ (Phase::Has | Phase::Keys) => {
                 let has = matches!(phase, Phase::Has);
                 let name = if has { "has" } else { "keys" };
-                if matches!(value, Value::Undefined) {
+                if matches!(value, JsValue::Undefined) {
                     return Ok(SetStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             &format!(".{name} is undefined"),
                         )?,
                     )));
                 }
-                let callable = match value {
-                    Value::Object(ref object) => runtime.as_callable(object)?,
+                let callable = match &value {
+                    JsValue::Object(id) => runtime.as_callable_object(*id)?,
                     _ => None,
                 };
+                runtime.release_jsvalue(value)?;
                 let Some(callable) = callable else {
                     return Ok(SetStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             &format!(".{name} is not a function"),
@@ -338,21 +396,21 @@ impl SetResume {
                 }
             }
             Phase::Iterator => {
-                if matches!(value, Value::Null | Value::Undefined) {
-                    let base = if matches!(value, Value::Null) {
+                if matches!(value, JsValue::Null | JsValue::Undefined) {
+                    let base = if matches!(value, JsValue::Null) {
                         "null"
                     } else {
                         "undefined"
                     };
                     return Ok(SetStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             &format!("cannot read property 'next' of {base}"),
                         )?,
                     )));
                 }
-                self.0.iterator = value.clone();
+                self.0.iterator = runtime.dup_jsvalue(&value)?;
                 self.0.phase = Phase::NextMethod;
                 Ok(SetStep::request_read(
                     value,
@@ -374,36 +432,67 @@ impl SetResume {
                 self.next_step(runtime)
             }
             Phase::Probe { value: item, .. } => {
-                let present = runtime.value_to_boolean(&value)?;
+                let present = runtime.value_to_boolean_jsvalue(&value);
+                runtime.release_jsvalue(value)?;
+                let present = present?;
+                let mut item = Some(item);
                 match self.0.kind {
                     SetOperation::Disjoint if present => {
-                        return Ok(SetStep::Complete(Completion::Return(Value::Bool(false))));
+                        if let Some(item) = item.take() {
+                            runtime.release_jsvalue(item)?;
+                        }
+                        return Ok(SetStep::Complete(Completion::Return(
+                            self.0.runtime.into_jsvalue(Value::Bool(false))?,
+                        )));
                     }
                     SetOperation::Subset if !present => {
-                        return Ok(SetStep::Complete(Completion::Return(Value::Bool(false))));
+                        if let Some(item) = item.take() {
+                            runtime.release_jsvalue(item)?;
+                        }
+                        return Ok(SetStep::Complete(Completion::Return(
+                            self.0.runtime.into_jsvalue(Value::Bool(false))?,
+                        )));
                     }
                     SetOperation::Intersection if present => {
-                        runtime.insert_set_record(&self.result()?, item)?;
+                        if let Some(item) = item.take() {
+                            // The resident result owner outlives this borrowed
+                            // mutation; no per-record root clone is needed.
+                            let result = self.result_id()?;
+                            let inserted = runtime.insert_set_record_borrowed(result, &item);
+                            runtime.release_jsvalue(item)?;
+                            inserted?;
+                        }
                     }
                     SetOperation::Difference if present => {
-                        runtime.delete_set_record(&self.result()?, &item)?;
+                        if let Some(item) = item.take() {
+                            let result = self.result_id()?;
+                            let deleted = runtime.delete_set_record_borrowed(result, &item);
+                            runtime.release_jsvalue(item)?;
+                            deleted?;
+                        }
                     }
                     _ => {}
+                }
+                if let Some(item) = item {
+                    runtime.release_jsvalue(item)?;
                 }
                 self.probe(runtime)
             }
             Phase::CloseMethod => {
-                let callable = match value {
-                    Value::Object(ref object) => runtime.as_callable(object)?,
+                let callable = match &value {
+                    JsValue::Object(id) => runtime.as_callable_object(*id)?,
                     _ => None,
                 };
+                runtime.release_jsvalue(value)?;
                 let Some(callable) = callable else {
-                    return Ok(SetStep::Complete(Completion::Return(Value::Bool(false))));
+                    return Ok(SetStep::Complete(Completion::Return(
+                        self.0.runtime.into_jsvalue(Value::Bool(false))?,
+                    )));
                 };
                 self.0.phase = Phase::CloseCall;
                 Ok(SetStep::request_call(
                     callable,
-                    self.0.iterator.clone(),
+                    runtime.dup_jsvalue(&self.0.iterator)?,
                     Vec::new(),
                     self,
                 ))
@@ -426,7 +515,7 @@ impl SetResume {
         };
         if size.is_nan() {
             return Ok(SetStep::Complete(Completion::Throw(
-                runtime.new_native_error(
+                runtime.new_native_error_jsvalue(
                     self.0.realm,
                     NativeErrorKind::Type,
                     ".size is not a number",
@@ -442,7 +531,7 @@ impl SetResume {
         };
         if size < 0 {
             return Ok(SetStep::Complete(Completion::Throw(
-                runtime.new_native_error(
+                runtime.new_native_error_jsvalue(
                     self.0.realm,
                     NativeErrorKind::Range,
                     ".size must be positive",
@@ -469,11 +558,11 @@ impl SetResume {
         match self.0.kind {
             SetOperation::Disjoint | SetOperation::Superset => {
                 let present = runtime.find_set_record(&self.0.set, &value)?.is_some();
-                drop(value);
+                runtime.release_jsvalue(value)?;
                 if present == matches!(self.0.kind, SetOperation::Disjoint) {
                     self.0.phase = Phase::CloseMethod;
                     return Ok(SetStep::request_read(
-                        self.0.iterator.clone(),
+                        runtime.dup_jsvalue(&self.0.iterator)?,
                         runtime
                             .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Return)?,
                         self,
@@ -486,11 +575,11 @@ impl SetResume {
                 }
             }
             SetOperation::Difference => {
-                runtime.delete_set_record(&self.result()?, &value)?;
+                runtime.delete_set_record(&self.result()?, value)?;
             }
             SetOperation::SymmetricDifference => {
                 if runtime.find_set_record(&self.0.set, &value)?.is_some() {
-                    runtime.delete_set_record(&self.result()?, &value)?;
+                    runtime.delete_set_record(&self.result()?, value)?;
                 } else {
                     runtime.insert_set_record(&self.result()?, value)?;
                 }
@@ -518,12 +607,12 @@ pub(crate) fn finish(
                 let key = resume.take_read_key();
                 resume.resume(
                     runtime,
-                    runtime.get_value_property_in_realm(realm, receiver, &key)?,
+                    runtime.get_value_property_in_realm_jsvalue(realm, receiver, &key)?,
                 )?
             }
             SetStep::Number { mut resume } => {
                 let value = resume.take_number_value();
-                resume.number(runtime, runtime.native_to_number(realm, &value)?)?
+                resume.number(runtime, runtime.native_to_number_jsvalue(realm, value)?)?
             }
             SetStep::Call { mut resume } => {
                 let callable = resume.take_call_callable();
@@ -531,7 +620,7 @@ pub(crate) fn finish(
                 let arguments = resume.take_call_arguments();
                 resume.resume(
                     runtime,
-                    runtime.call_internal(realm, &callable, receiver, &arguments)?,
+                    runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?,
                 )?
             }
             SetStep::Parse { mut resume } => {
@@ -551,28 +640,28 @@ pub(crate) fn finish(
 
 #[derive(Default)]
 struct SetStepPending {
-    read_receiver: Option<Value>,
+    read_receiver: Option<JsValue>,
     read_key: Option<PropertyKey>,
-    number_value: Option<Value>,
+    number_value: Option<JsValue>,
     call_callable: Option<CallableRef>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
     parse_result: Option<Completion>,
 }
 impl SetStep {
-    pub(crate) fn request_read(receiver: Value, key: PropertyKey, mut resume: SetResume) -> Self {
+    pub(crate) fn request_read(receiver: JsValue, key: PropertyKey, mut resume: SetResume) -> Self {
         resume.0.pending_effect.read_receiver = Some(receiver);
         resume.0.pending_effect.read_key = Some(key);
         Self::Read { resume }
     }
-    pub(crate) fn request_number(value: Value, mut resume: SetResume) -> Self {
+    pub(crate) fn request_number(value: JsValue, mut resume: SetResume) -> Self {
         resume.0.pending_effect.number_value = Some(value);
         Self::Number { resume }
     }
     pub(crate) fn request_call(
         callable: CallableRef,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: SetResume,
     ) -> Self {
         resume.0.pending_effect.call_callable = Some(callable);
@@ -586,7 +675,7 @@ impl SetStep {
     }
 }
 impl SetResume {
-    pub(crate) fn take_read_receiver(&mut self) -> Value {
+    pub(crate) fn take_read_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .read_receiver
@@ -600,7 +689,7 @@ impl SetResume {
             .take()
             .expect("SetStep Read key")
     }
-    pub(crate) fn take_number_value(&mut self) -> Value {
+    pub(crate) fn take_number_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .number_value
@@ -614,14 +703,14 @@ impl SetResume {
             .take()
             .expect("SetStep Call callable")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver
             .take()
             .expect("SetStep Call receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .pending_effect
             .call_arguments

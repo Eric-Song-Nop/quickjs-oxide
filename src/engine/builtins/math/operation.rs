@@ -12,7 +12,7 @@ use crate::engine::{
     api::{runtime::Runtime, runtime_error::RuntimeError},
     builtins::native::{MathBinaryKind, MathMinMaxKind, MathUnaryKind},
     heap::ContextId,
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion, number::operations::Number},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
@@ -42,7 +42,7 @@ impl MathKind {
 }
 pub(crate) enum MathStep {
     Complete(Completion),
-    Number { value: Value, resume: MathResume },
+    Number { value: JsValue, resume: MathResume },
 }
 pub(crate) struct MathResume(Box<MathResumeState>);
 impl std::ops::Deref for MathResume {
@@ -59,9 +59,21 @@ impl std::ops::DerefMut for MathResume {
 const _: () = assert!(std::mem::size_of::<MathResume>() <= 8);
 pub(crate) struct MathResumeState {
     kind: MathKind,
-    arguments: std::vec::IntoIter<Value>,
+    arguments: std::collections::VecDeque<JsValue>,
+    owner: Option<Runtime>,
     result: Option<f64>,
     count: usize,
+}
+impl Drop for MathResumeState {
+    fn drop(&mut self) {
+        if let Some(runtime) = &self.owner {
+            for value in self.arguments.drain(..) {
+                let _ = runtime.release_jsvalue(value);
+            }
+        } else {
+            debug_assert!(self.arguments.is_empty());
+        }
+    }
 }
 impl MathStep {
     pub(crate) fn start(
@@ -87,16 +99,27 @@ impl MathStep {
         {
             let mut resume = MathResumeState {
                 kind,
-                arguments: Vec::new().into_iter(),
+                arguments: std::collections::VecDeque::new(),
+                owner: None,
                 result: None,
                 count,
             };
             for (index, value) in values.iter().enumerate() {
-                if matches!(value, Value::Object(_)) {
+                if matches!(value, JsValue::Object(_)) {
                     // The native activation owns original argv. A suspended
                     // continuation needs only the not-yet-converted suffix.
-                    let remaining = values[index..].to_vec();
-                    resume.arguments = remaining.into_iter();
+                    resume
+                        .arguments
+                        .try_reserve(values.len() - index)
+                        .map_err(|_| {
+                            RuntimeError::Invariant("Math remaining argv allocation failed")
+                        })?;
+                    resume.owner = Some(runtime.clone());
+                    for remaining_value in &values[index..] {
+                        resume
+                            .arguments
+                            .push_back(runtime.dup_jsvalue(remaining_value)?);
+                    }
                     #[cfg(feature = "profiling")]
                     crate::engine::api::profiling::record_owned_execution_event(
                         "math_remaining_arguments_owned",
@@ -106,8 +129,8 @@ impl MathStep {
                 // Object arguments above retain the shared waiting protocol.
                 // NativeActivation already owns this primitive: borrow it in
                 // the same conversion kernel used by NumberStep completion.
-                let result = runtime.number_from_primitive(realm, value)?;
-                if let Some(completion) = resume.accept_number(result)? {
+                let result = runtime.number_from_primitive_jsvalue(realm, value)?;
+                if let Some(completion) = resume.accept_number(runtime, result)? {
                     #[cfg(feature = "profiling")]
                     crate::engine::api::profiling::record_owned_execution_event(
                         "math_completed_without_argument_storage",
@@ -125,7 +148,7 @@ impl MathStep {
 }
 impl MathResume {
     fn next(mut self) -> Result<MathStep, RuntimeError> {
-        if let Some(value) = self.0.arguments.next() {
+        if let Some(value) = self.0.arguments.pop_front() {
             return Ok(MathStep::Number {
                 value,
                 resume: self,
@@ -135,9 +158,10 @@ impl MathResume {
     }
     pub(crate) fn number(
         mut self,
+        runtime: &Runtime,
         result: NativeConversion<f64>,
     ) -> Result<MathStep, RuntimeError> {
-        if let Some(completion) = self.accept_number(result)? {
+        if let Some(completion) = self.accept_number(runtime, result)? {
             Ok(MathStep::Complete(completion))
         } else {
             self.next()
@@ -148,7 +172,7 @@ impl MathResumeState {
     fn finish(self) -> Result<MathStep, RuntimeError> {
         let value = match self.kind {
             MathKind::MinMax(kind) if self.result.is_none() => {
-                return Ok(MathStep::Complete(Completion::Return(Value::Float(
+                return Ok(MathStep::Complete(Completion::Return(JsValue::Float(
                     match kind {
                         MathMinMaxKind::Min => f64::INFINITY,
                         MathMinMaxKind::Max => f64::NEG_INFINITY,
@@ -156,7 +180,7 @@ impl MathResumeState {
                 ))));
             }
             MathKind::Hypot if self.count == 0 => {
-                return Ok(MathStep::Complete(Completion::Return(Value::Int(0))));
+                return Ok(MathStep::Complete(Completion::Return(JsValue::Int(0))));
             }
             MathKind::Hypot if self.count == 1 => self
                 .result
@@ -166,11 +190,14 @@ impl MathResumeState {
                 .result
                 .ok_or(RuntimeError::Invariant("Math result missing"))?,
         };
-        Ok(MathStep::Complete(Completion::Return(Value::number(value))))
+        Ok(MathStep::Complete(Completion::Return(
+            Number::compact(value).into(),
+        )))
     }
     /// One numerical accumulation kernel for immediate and suspended inputs.
     fn accept_number(
         &mut self,
+        _runtime: &Runtime,
         result: NativeConversion<f64>,
     ) -> Result<Option<Completion>, RuntimeError> {
         let value = match result {
@@ -182,7 +209,7 @@ impl MathResumeState {
         self.result = Some(match self.kind {
             MathKind::Unary(kind) => quickjs_unary(kind, value),
             MathKind::Clz32 => {
-                return Ok(Some(Completion::Return(Value::Int(
+                return Ok(Some(Completion::Return(JsValue::Int(
                     Runtime::to_uint32_number(value).leading_zeros() as i32,
                 ))));
             }
@@ -197,7 +224,7 @@ impl MathResumeState {
                 if let Some(left) = self.result {
                     let product = Runtime::to_uint32_number(left)
                         .wrapping_mul(Runtime::to_uint32_number(value));
-                    return Ok(Some(Completion::Return(Value::Int(i32::from_ne_bytes(
+                    return Ok(Some(Completion::Return(JsValue::Int(i32::from_ne_bytes(
                         product.to_ne_bytes(),
                     )))));
                 } else {
@@ -240,7 +267,7 @@ pub(crate) fn finish(
         step = match step {
             MathStep::Complete(result) => return Ok(result),
             MathStep::Number { value, resume } => {
-                resume.number(runtime.native_to_number(realm, &value)?)?
+                resume.number(runtime, runtime.native_to_number_jsvalue(realm, value)?)?
             }
         };
     }

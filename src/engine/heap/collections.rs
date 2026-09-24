@@ -307,13 +307,22 @@ impl Heap {
         id: ObjectId,
         key: &RawValue,
     ) -> Result<Option<usize>, HeapError> {
+        Ok(self.map_find_entry(id, key)?.map(|(index, _)| index))
+    }
+
+    /// Reuse the record already visited by SameValueZero lookup.
+    pub(crate) fn map_find_entry(
+        &self,
+        id: ObjectId,
+        key: &RawValue,
+    ) -> Result<Option<(usize, &MapRecord)>, HeapError> {
         if !is_map_storable_value(key) {
             return Err(HeapError::Invariant(
                 "Map lookup contains an internal value sentinel",
             ));
         }
         match &self.object(id)?.payload {
-            ObjectPayload::Map { records } => Ok(records.find(key)),
+            ObjectPayload::Map { records } => Ok(records.find_entry(self, key)),
             _ => Err(HeapError::Invariant(
                 "Map lookup reached an object with the wrong class",
             )),
@@ -355,8 +364,13 @@ impl Heap {
                 "Map record contains an internal value sentinel",
             ));
         }
-        match &self.object(id)?.payload {
-            ObjectPayload::Map { records } => records.preflight_insert()?,
+        let hash = match &self.object(id)?.payload {
+            ObjectPayload::Map { records } => {
+                records.preflight_insert()?;
+                // Hash before the mutable payload borrow: string and BigInt
+                // keys resolve through the heap.
+                records.precompute_insert_hash(self, &key)
+            }
             _ => {
                 return Err(HeapError::Invariant(
                     "Map insertion reached an object with the wrong class",
@@ -371,7 +385,7 @@ impl Heap {
         let ObjectPayload::Map { records } = &mut self.object_mut(id)?.payload else {
             unreachable!("Map payload was validated before retaining record edges")
         };
-        records.insert(MapRecord { key, value });
+        records.insert_hashed(MapRecord { key, value }, hash);
         Ok(HeapCleanup::default())
     }
 
@@ -620,7 +634,7 @@ impl Heap {
             ));
         }
         match &self.object(id)?.payload {
-            ObjectPayload::Set { records } => Ok(records.find(key)),
+            ObjectPayload::Set { records } => Ok(records.find(self, key)),
             _ => Err(HeapError::Invariant(
                 "Set lookup reached an object with the wrong class",
             )),
@@ -661,8 +675,11 @@ impl Heap {
                 "Set record contains an internal value sentinel",
             ));
         }
-        match &self.object(id)?.payload {
-            ObjectPayload::Set { records } => records.preflight_insert()?,
+        let hash = match &self.object(id)?.payload {
+            ObjectPayload::Set { records } => {
+                records.preflight_insert()?;
+                records.precompute_insert_hash(self, &key)
+            }
             _ => {
                 return Err(HeapError::Invariant(
                     "Set insertion reached an object with the wrong class",
@@ -676,10 +693,13 @@ impl Heap {
         let ObjectPayload::Set { records } = &mut self.object_mut(id)?.payload else {
             unreachable!("Set payload was validated before retaining record edges")
         };
-        records.insert(MapRecord {
-            key,
-            value: RawValue::Undefined,
-        });
+        records.insert_hashed(
+            MapRecord {
+                key,
+                value: RawValue::Undefined,
+            },
+            hash,
+        );
         Ok(HeapCleanup::default())
     }
 

@@ -1,7 +1,8 @@
 //! Mechanical adapters for object domain requests.
+use super::JsValue;
 use super::{
     ArrayLengthStep, DescriptorStep, ProxyBooleanStep, ProxyDefineStep, ProxyGetStep, ProxyOwnStep,
-    ProxyPrototypeStep, ProxySetStep, Resume, SetStep, Step, Value, set_completion,
+    ProxyPrototypeStep, ProxySetStep, Resume, SetStep, Step, set_completion,
 };
 
 impl From<ProxyGetStep> for Step {
@@ -287,7 +288,7 @@ impl From<SetStep> for Step {
                 Self::Define {
                     object: Some(object),
                     key: Some(key),
-                    descriptor: Some(descriptor),
+                    descriptor: Some(descriptor.into()),
                     resume: Some(Resume::OrdinarySet(resume)),
                 }
             }
@@ -380,7 +381,7 @@ impl From<ProxyDefineStep> for Step {
                 Self::Define {
                     object: Some(object),
                     key: Some(key),
-                    descriptor: Some(descriptor),
+                    descriptor: Some(descriptor.into()),
                     resume: Some(Resume::Define(resume)),
                 }
             }
@@ -530,7 +531,7 @@ impl From<crate::engine::object::ProxyConstructStep> for Step {
                 let object = resume.take_read_object();
                 let key = resume.take_read_key();
                 Self::Read {
-                    receiver: Some(Value::Object(object.clone())),
+                    receiver: Some(JsValue::Object(object.clone().into_handle())),
                     object: Some(object),
                     key: Some(key),
                     resume: Some(Resume::ProxyConstruct(resume)),
@@ -580,7 +581,7 @@ impl From<crate::engine::object::object_literal::element::LiteralDefinitionStep>
                 Self::DefineOrdinary {
                     object: Some(object),
                     key: Some(key),
-                    descriptor: Some(descriptor),
+                    descriptor: Some(descriptor.into()),
                     resume: Some(Resume::LiteralDefinition(resume)),
                 }
             }

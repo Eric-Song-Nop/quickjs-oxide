@@ -79,9 +79,11 @@ pub(super) fn run(
                     return Err(invariant("property return attempted replay"));
                 }
             },
-            #[cfg(test)]
+            #[cfg(all(test, feature = "profiling"))]
             RunExit::ReleaseOperand { .. } => {
-                if !crate::engine::vm::frame_operations::complete_owned_slot(execution, id, exit)? {
+                if !crate::engine::vm::frame_operations::complete_owned_slot(
+                    runtime, execution, id, exit,
+                )? {
                     return Err(invariant(
                         "direct slot completion changed its frame protocol",
                     ));
@@ -190,10 +192,10 @@ pub(super) fn run(
                 let frame = execution.frames.current_mut(id)?;
                 if !matches!(
                     execution.slots.peek(&frame.window, 1)?,
-                    crate::engine::value::Value::Null | crate::engine::value::Value::Undefined
+                    crate::engine::value::JsValue::Null | crate::engine::value::JsValue::Undefined
                 ) && matches!(
                     execution.slots.peek(&frame.window, 0)?,
-                    crate::engine::value::Value::Object(_)
+                    crate::engine::value::JsValue::Object(_)
                 ) {
                     return Ok(Boundary::Exit(exit));
                 }
@@ -213,7 +215,7 @@ pub(super) fn run(
                 if key.is_none()
                     && matches!(
                         execution.slots.peek(&frame.window, 1)?,
-                        crate::engine::value::Value::Object(_)
+                        crate::engine::value::JsValue::Object(_)
                     )
                 {
                     return Ok(Boundary::Exit(exit));

@@ -20,7 +20,7 @@ fn dependency_free_module_links_then_evaluates_with_module_semantics() {
 
     let snapshot = module_evaluation_snapshot(&mut context, &module);
     assert_eq!(snapshot.state, PromiseState::Fulfilled);
-    assert_eq!(snapshot.result, RawValue::Undefined);
+    assert!(matches!(snapshot.result, RawValue::Undefined));
     assert_script_true(
         &mut context,
         r#"
@@ -39,19 +39,19 @@ fn dependency_free_module_links_then_evaluates_with_module_semantics() {
 fn module_identity_evaluates_once_and_caches_abrupt_completion() {
     let runtime = Runtime::new();
     let mut context = runtime.new_context();
-    context.eval("globalThis.__moduleRuns = 0").unwrap();
+    drop(context.eval("globalThis.__moduleRuns = 0").unwrap());
     let once = context
         .compile_module("globalThis.__moduleRuns += 1")
         .unwrap();
-    context.execute_module(&once).unwrap();
-    context.execute_module(&once).unwrap();
+    drop(context.execute_module(&once).unwrap());
+    drop(context.execute_module(&once).unwrap());
     assert_script_true(&mut context, "__moduleRuns === 1");
 
     let abrupt = context.compile_module("throw 42").unwrap();
     let first = module_evaluation_promise(&mut context, &abrupt);
     let first_snapshot = promise_snapshot(&runtime, &first);
     assert_eq!(first_snapshot.state, PromiseState::Rejected);
-    assert_eq!(first_snapshot.result, RawValue::Int(42));
+    assert!(matches!(first_snapshot.result, RawValue::Int(42)));
     let second = module_evaluation_promise(&mut context, &abrupt);
     assert_eq!(first.object_id(), second.object_id());
 }
@@ -140,7 +140,7 @@ fn direct_eval_uses_module_live_cells_without_leaking_eval_var() {
         )
         .unwrap();
 
-    context.execute_module(&module).unwrap();
+    drop(context.execute_module(&module).unwrap());
     assert_script_true(
         &mut context,
         r#"
@@ -168,6 +168,6 @@ fn nested_var_preserves_quickjs_module_function_redeclaration_order() {
         )
         .unwrap();
 
-    context.execute_module(&module).unwrap();
+    drop(context.execute_module(&module).unwrap());
     assert_script_true(&mut context, "__moduleRedeclaredAnswer === 42");
 }

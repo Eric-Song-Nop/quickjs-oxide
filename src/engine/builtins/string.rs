@@ -17,7 +17,7 @@ use crate::engine::object::{ObjectRef, SymbolRef};
 #[cfg(test)]
 use crate::engine::object::{PropertyKey, WellKnownSymbol};
 use crate::engine::value::{
-    CreateHtmlStringBuffer, JsString, JsStringBuilder, JsStringError, Value,
+    CreateHtmlStringBuffer, JsString, JsStringBuilder, JsStringError, JsValue, Value,
 };
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
@@ -406,19 +406,39 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         let canonical_key = self.intern_property_key(canonical)?;
         let value = match self.get_property_in_realm(realm, string_prototype, &canonical_key)? {
-            Completion::Return(value @ Value::Object(_)) => value,
-            Completion::Return(_) => {
+            Completion::Return(JsValue::Object(id)) => {
+                ObjectRef::from_owned_handle(self.clone(), id)
+            }
+            Completion::Return(value) => {
+                self.release_jsvalue(value)?;
                 return Err(RuntimeError::Invariant(
                     "String canonical alias target was not callable",
                 ));
             }
-            Completion::Throw(_) => {
+            Completion::Throw(value) => {
+                self.release_jsvalue(value)?;
                 return Err(RuntimeError::Invariant(
                     "String canonical alias initialization threw during bootstrap",
                 ));
             }
         };
-        self.define_function_data_property(string_prototype, alias, value, true, true)
+        let key = self.intern_property_key(alias)?;
+        if !self.define_raw_property(
+            string_prototype,
+            &key,
+            &crate::engine::object::property::PropertyDescriptor {
+                value: Some(crate::engine::heap::RawValue::Object(value.object_id())),
+                writable: Some(true),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        )? {
+            return Err(RuntimeError::Invariant(
+                "String prototype alias definition rejected",
+            ));
+        }
+        Ok(())
     }
 
     /// Publish the complete own table of QuickJS's `%String%` constructor.
@@ -490,11 +510,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "String static did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         match selector {
             StringStaticKind::FromCharCode => self.call_string_from_char_code(realm, arguments),
             StringStaticKind::FromCodePoint => self.call_string_from_code_point(realm, arguments),
@@ -517,11 +539,13 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "String codePointRange did not receive a generic invocation",
             ));
         };
+        invocation.release(self)?;
         factory::finish(
             self,
             realm,
@@ -604,17 +628,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        search::finish(
-            self,
-            realm,
-            search::StringSearchStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            search::finish(
                 self,
                 realm,
-                search::StringSearchKind::Index(selector),
-                &invocation,
-                arguments,
-            )?,
-        )
+                search::StringSearchStep::start(
+                    self,
+                    realm,
+                    search::StringSearchKind::Index(selector),
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
     fn finish_string_index_of(
         &self,
@@ -655,21 +681,21 @@ impl Runtime {
             }
         };
 
-        Ok(Completion::Return(Value::Int(result)))
+        Ok(Completion::Return(self.into_jsvalue(Value::Int(result))?))
     }
 
     /// Internal-class fallback of pinned QuickJS `js_is_regexp` after an
     /// object has produced `undefined` for `Symbol.match`.
     ///
-    pub(crate) fn is_regexp_from_match(
+    pub(crate) fn is_regexp_from_match_jsvalue(
         &self,
         object: &ObjectRef,
-        matcher: &Value,
+        matcher: &JsValue,
     ) -> Result<bool, RuntimeError> {
-        if matches!(matcher, Value::Undefined) {
+        if matches!(matcher, JsValue::Undefined) {
             self.native_object_has_regexp_brand(object)
         } else {
-            self.value_to_boolean(matcher)
+            self.value_to_boolean_jsvalue(matcher)
         }
     }
 
@@ -729,17 +755,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        search::finish(
-            self,
-            realm,
-            search::StringSearchStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            search::finish(
                 self,
                 realm,
-                search::StringSearchKind::Includes(selector),
-                &invocation,
-                arguments,
-            )?,
-        )
+                search::StringSearchStep::start(
+                    self,
+                    realm,
+                    search::StringSearchKind::Includes(selector),
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
     fn finish_string_includes(
         &self,
@@ -776,7 +804,7 @@ impl Runtime {
                 start >= 0 && string_region_matches(&source, &needle, start)
             }
         };
-        Ok(Completion::Return(Value::Bool(found)))
+        Ok(Completion::Return(self.into_jsvalue(Value::Bool(found))?))
     }
 
     /// Rust port of pinned QuickJS `js_string_split` for the generic
@@ -790,51 +818,53 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        split::finish(
-            self,
-            realm,
-            split::StringSplitStep::start(self, realm, &invocation, arguments)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            split::finish(
+                self,
+                realm,
+                split::StringSplitStep::start(self, realm, invocation, arguments)?,
+            )
+        })
     }
     fn finish_string_split(
         &self,
         realm: ContextId,
         source: JsString,
         result: ObjectRef,
-        separator: &Value,
+        separator: &crate::engine::value::JsValue,
         separator_string: JsString,
         limit: u32,
     ) -> Result<Completion, RuntimeError> {
         let mut length = 0_u32;
         if limit == 0 {
-            return Ok(Completion::Return(Value::Object(result)));
+            return Ok(Completion::Return(
+                self.into_jsvalue(Value::Object(result))?,
+            ));
         }
-        if matches!(separator, Value::Undefined) {
-            if let Some(value) = self.define_string_split_element(
-                realm,
-                &result,
-                &mut length,
-                Value::String(source.clone()),
-            )? {
+        if matches!(separator, crate::engine::value::JsValue::Undefined) {
+            if let Some(value) =
+                self.define_string_split_element(realm, &result, &mut length, source.clone())?
+            {
                 return Ok(Completion::Throw(value));
             }
-            return Ok(Completion::Return(Value::Object(result)));
+            return Ok(Completion::Return(
+                self.into_jsvalue(Value::Object(result))?,
+            ));
         }
 
         let source_len = source.len();
         let separator_len = separator_string.len();
         if source_len == 0 {
             if separator_len != 0 {
-                if let Some(value) = self.define_string_split_element(
-                    realm,
-                    &result,
-                    &mut length,
-                    Value::String(source),
-                )? {
+                if let Some(value) =
+                    self.define_string_split_element(realm, &result, &mut length, source)?
+                {
                     return Ok(Completion::Throw(value));
                 }
             }
-            return Ok(Completion::Return(Value::Object(result)));
+            return Ok(Completion::Return(
+                self.into_jsvalue(Value::Object(result))?,
+            ));
         }
 
         if separator_len == 0 {
@@ -843,7 +873,7 @@ impl Runtime {
                     realm,
                     &result,
                     &mut length,
-                    Value::String(source.sub_string(index, index + 1)),
+                    source.sub_string(index, index + 1),
                 )? {
                     return Ok(Completion::Throw(value));
                 }
@@ -851,7 +881,9 @@ impl Runtime {
                     break;
                 }
             }
-            return Ok(Completion::Return(Value::Object(result)));
+            return Ok(Completion::Return(
+                self.into_jsvalue(Value::Object(result))?,
+            ));
         }
 
         let source_len_i32 = i32::try_from(source_len).map_err(|_| {
@@ -871,15 +903,17 @@ impl Runtime {
                 realm,
                 &result,
                 &mut length,
-                Value::String(source.sub_string(
+                source.sub_string(
                     usize::try_from(start).expect("non-negative split start fits usize"),
                     usize::try_from(end).expect("non-negative split end fits usize"),
-                )),
+                ),
             )? {
                 return Ok(Completion::Throw(value));
             }
             if length == limit {
-                return Ok(Completion::Return(Value::Object(result)));
+                return Ok(Completion::Return(
+                    self.into_jsvalue(Value::Object(result))?,
+                ));
             }
             start = end + separator_len_i32;
         }
@@ -887,14 +921,16 @@ impl Runtime {
             realm,
             &result,
             &mut length,
-            Value::String(source.sub_string(
+            source.sub_string(
                 usize::try_from(start).expect("non-negative split tail start fits usize"),
                 source_len,
-            )),
+            ),
         )? {
             return Ok(Completion::Throw(value));
         }
-        Ok(Completion::Return(Value::Object(result)))
+        Ok(Completion::Return(
+            self.into_jsvalue(Value::Object(result))?,
+        ))
     }
 
     /// CreateDataProperty on the fresh result Array. `JsString::MAX_LEN` keeps
@@ -905,13 +941,18 @@ impl Runtime {
         realm: ContextId,
         result: &ObjectRef,
         length: &mut u32,
-        value: Value,
-    ) -> Result<Option<Value>, RuntimeError> {
+        value: JsString,
+    ) -> Result<Option<JsValue>, RuntimeError> {
         let index = *length;
         let next = index.checked_add(1).ok_or(RuntimeError::Invariant(
             "String split output index exceeded Uint32",
         ))?;
-        if let Some(value) = self.create_array_data_property(realm, result, index, value)? {
+        if let Some(value) = self.create_array_data_property(
+            realm,
+            result,
+            index,
+            self.into_jsvalue(Value::String(value))?,
+        )? {
             return Ok(Some(value));
         }
         *length = next;
@@ -928,17 +969,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        search::finish(
-            self,
-            realm,
-            search::StringSearchStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            search::finish(
                 self,
                 realm,
-                search::StringSearchKind::Subrange(selector),
-                &invocation,
-                arguments,
-            )?,
-        )
+                search::StringSearchStep::start(
+                    self,
+                    realm,
+                    search::StringSearchKind::Subrange(selector),
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
     fn finish_string_subrange(
         &self,
@@ -988,9 +1031,9 @@ impl Runtime {
             .map_err(|_| RuntimeError::Invariant("String subrange start became negative"))?;
         let range_end = usize::try_from(range_end)
             .map_err(|_| RuntimeError::Invariant("String subrange end became negative"))?;
-        Ok(Completion::Return(Value::String(
+        Ok(Completion::Return(self.into_jsvalue(Value::String(
             source.sub_string(range_start, range_end),
-        )))
+        ))?))
     }
 
     /// Rust port of pinned QuickJS `js_string_repeat`, including its distinct
@@ -1018,18 +1061,20 @@ impl Runtime {
         arguments: &NativeArguments,
         string_limit: usize,
     ) -> Result<Completion, RuntimeError> {
-        text::finish(
-            self,
-            realm,
-            text::StringTextStep::start_with_limit(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            text::finish(
                 self,
                 realm,
-                text::StringTextKind::Repeat,
-                &invocation,
-                Some(arguments),
-                string_limit,
-            )?,
-        )
+                text::StringTextStep::start_with_limit(
+                    self,
+                    realm,
+                    text::StringTextKind::Repeat,
+                    invocation,
+                    Some(arguments),
+                    string_limit,
+                )?,
+            )
+        })
     }
     fn finish_string_repeat(
         &self,
@@ -1039,7 +1084,7 @@ impl Runtime {
         string_limit: usize,
     ) -> Result<Completion, RuntimeError> {
         if !(0..=2_147_483_647).contains(&count) {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "invalid repeat count",
@@ -1050,21 +1095,23 @@ impl Runtime {
         let repeated = match source.repeat_with_limit(count, string_limit) {
             Ok(value) => value,
             Err(JsStringError::TooLong) => {
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Range,
                     "invalid string length",
                 )?));
             }
             Err(JsStringError::OutOfMemory) => {
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Internal,
                     "out of memory",
                 )?));
             }
         };
-        Ok(Completion::Return(Value::String(repeated)))
+        Ok(Completion::Return(
+            self.into_jsvalue(Value::String(repeated))?,
+        ))
     }
 
     /// Rust port of pinned QuickJS `js_string_pad`. The typed selector mirrors
@@ -1094,18 +1141,20 @@ impl Runtime {
         arguments: &NativeArguments,
         string_limit: usize,
     ) -> Result<Completion, RuntimeError> {
-        text::finish(
-            self,
-            realm,
-            text::StringTextStep::start_with_limit(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            text::finish(
                 self,
                 realm,
-                text::StringTextKind::Pad(selector),
-                &invocation,
-                Some(arguments),
-                string_limit,
-            )?,
-        )
+                text::StringTextStep::start_with_limit(
+                    self,
+                    realm,
+                    text::StringTextKind::Pad(selector),
+                    invocation,
+                    Some(arguments),
+                    string_limit,
+                )?,
+            )
+        })
     }
     fn finish_string_pad(
         &self,
@@ -1117,7 +1166,9 @@ impl Runtime {
         string_limit: usize,
     ) -> Result<Completion, RuntimeError> {
         if filler.as_ref().is_some_and(JsString::is_empty) {
-            return Ok(Completion::Return(Value::String(source)));
+            return Ok(Completion::Return(
+                self.into_jsvalue(Value::String(source))?,
+            ));
         }
 
         let target = usize::try_from(target)
@@ -1130,21 +1181,23 @@ impl Runtime {
         ) {
             Ok(value) => value,
             Err(JsStringError::TooLong) => {
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Range,
                     "invalid string length",
                 )?));
             }
             Err(JsStringError::OutOfMemory) => {
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Internal,
                     "out of memory",
                 )?));
             }
         };
-        Ok(Completion::Return(Value::String(padded)))
+        Ok(Completion::Return(
+            self.into_jsvalue(Value::String(padded))?,
+        ))
     }
 
     /// Rust port of pinned QuickJS `js_string_trim`. The selector retains its
@@ -1156,18 +1209,20 @@ impl Runtime {
         selector: StringTrimKind,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        text::finish(
-            self,
-            realm,
-            text::StringTextStep::start_with_limit(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            text::finish(
                 self,
                 realm,
-                text::StringTextKind::Trim(selector),
-                &invocation,
-                None,
-                JsString::MAX_LEN,
-            )?,
-        )
+                text::StringTextStep::start_with_limit(
+                    self,
+                    realm,
+                    text::StringTextKind::Trim(selector),
+                    invocation,
+                    None,
+                    JsString::MAX_LEN,
+                )?,
+            )
+        })
     }
     fn finish_string_trim(
         &self,
@@ -1183,7 +1238,7 @@ impl Runtime {
         let trimmed = match source.trim_whitespace(trim_start, trim_end) {
             Ok(value) => value,
             Err(JsStringError::OutOfMemory) => {
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Internal,
                     "out of memory",
@@ -1195,7 +1250,9 @@ impl Runtime {
                 ));
             }
         };
-        Ok(Completion::Return(Value::String(trimmed)))
+        Ok(Completion::Return(
+            self.into_jsvalue(Value::String(trimmed))?,
+        ))
     }
 
     /// Rust port of pinned QuickJS `js_string_toLowerCase`. Its magic bit
@@ -1217,18 +1274,20 @@ impl Runtime {
         invocation: NativeInvocation,
         string_limit: usize,
     ) -> Result<Completion, RuntimeError> {
-        text::finish(
-            self,
-            realm,
-            text::StringTextStep::start_with_limit(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            text::finish(
                 self,
                 realm,
-                text::StringTextKind::Case(selector),
-                &invocation,
-                None,
-                string_limit,
-            )?,
-        )
+                text::StringTextStep::start_with_limit(
+                    self,
+                    realm,
+                    text::StringTextKind::Case(selector),
+                    invocation,
+                    None,
+                    string_limit,
+                )?,
+            )
+        })
     }
     fn finish_string_case(
         &self,
@@ -1248,14 +1307,16 @@ impl Runtime {
                     JsStringError::TooLong => "string too long",
                     JsStringError::OutOfMemory => "out of memory",
                 };
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Internal,
                     message,
                 )?));
             }
         };
-        Ok(Completion::Return(Value::String(converted)))
+        Ok(Completion::Return(
+            self.into_jsvalue(Value::String(converted))?,
+        ))
     }
 
     /// Rust port of pinned QuickJS `js_string_normalize`. Receiver coercion
@@ -1282,18 +1343,20 @@ impl Runtime {
         arguments: &NativeArguments,
         string_limit: usize,
     ) -> Result<Completion, RuntimeError> {
-        text::finish(
-            self,
-            realm,
-            text::StringTextStep::start_with_limit(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            text::finish(
                 self,
                 realm,
-                text::StringTextKind::Normalize,
-                &invocation,
-                Some(arguments),
-                string_limit,
-            )?,
-        )
+                text::StringTextStep::start_with_limit(
+                    self,
+                    realm,
+                    text::StringTextKind::Normalize,
+                    invocation,
+                    Some(arguments),
+                    string_limit,
+                )?,
+            )
+        })
     }
     fn finish_string_normalize(
         &self,
@@ -1313,14 +1376,16 @@ impl Runtime {
                     JsStringError::TooLong => "string too long",
                     JsStringError::OutOfMemory => "out of memory",
                 };
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Internal,
                     message,
                 )?));
             }
         };
-        Ok(Completion::Return(Value::String(normalized)))
+        Ok(Completion::Return(
+            self.into_jsvalue(Value::String(normalized))?,
+        ))
     }
 
     /// Rust port of pinned QuickJS `js_string_localeCompare`. QuickJS's
@@ -1334,18 +1399,20 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        text::finish(
-            self,
-            realm,
-            text::StringTextStep::start_with_limit(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            text::finish(
                 self,
                 realm,
-                text::StringTextKind::LocaleCompare,
-                &invocation,
-                Some(arguments),
-                JsString::MAX_LEN,
-            )?,
-        )
+                text::StringTextStep::start_with_limit(
+                    self,
+                    realm,
+                    text::StringTextKind::LocaleCompare,
+                    invocation,
+                    Some(arguments),
+                    JsString::MAX_LEN,
+                )?,
+            )
+        })
     }
     fn finish_string_locale_compare(
         &self,
@@ -1359,7 +1426,7 @@ impl Runtime {
         ) {
             Ok(value) => value,
             Err(JsStringError::OutOfMemory) => {
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Internal,
                     "out of memory",
@@ -1377,7 +1444,7 @@ impl Runtime {
         ) {
             Ok(value) => value,
             Err(JsStringError::OutOfMemory) => {
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Internal,
                     "out of memory",
@@ -1399,7 +1466,9 @@ impl Runtime {
                 std::cmp::Ordering::Equal => 0,
                 std::cmp::Ordering::Greater => 1,
             });
-        Ok(Completion::Return(Value::Int(comparison)))
+        Ok(Completion::Return(
+            self.into_jsvalue(Value::Int(comparison))?,
+        ))
     }
 
     /// Rust port of pinned QuickJS `js_string_CreateHTML`. Receiver coercion
@@ -1430,18 +1499,20 @@ impl Runtime {
         arguments: &NativeArguments,
         string_limit: usize,
     ) -> Result<Completion, RuntimeError> {
-        text::finish(
-            self,
-            realm,
-            text::StringTextStep::start_with_limit(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            text::finish(
                 self,
                 realm,
-                text::StringTextKind::Html(selector),
-                &invocation,
-                Some(arguments),
-                string_limit,
-            )?,
-        )
+                text::StringTextStep::start_with_limit(
+                    self,
+                    realm,
+                    text::StringTextKind::Html(selector),
+                    invocation,
+                    Some(arguments),
+                    string_limit,
+                )?,
+            )
+        })
     }
     fn finish_string_create_html(
         &self,
@@ -1457,13 +1528,15 @@ impl Runtime {
                     JsStringError::TooLong => "string too long",
                     JsStringError::OutOfMemory => "out of memory",
                 };
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Internal,
                     message,
                 )?));
             }
         };
-        Ok(Completion::Return(Value::String(result)))
+        Ok(Completion::Return(
+            self.into_jsvalue(Value::String(result))?,
+        ))
     }
 }

@@ -23,7 +23,7 @@ use crate::engine::object::{
     WellKnownSymbol,
 };
 use crate::engine::value::conversion::NativeConversion;
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
 
@@ -239,18 +239,6 @@ impl Runtime {
 
     /// Pinned QuickJS `JS_ToInt64`: number-hint coercion followed by its
     /// representation-level modulo-2^64 conversion.
-    pub(crate) fn native_to_int64(
-        &self,
-        realm: ContextId,
-        value: &Value,
-    ) -> Result<NativeConversion<i64>, RuntimeError> {
-        let number = match self.native_to_number(realm, value)? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(NativeConversion::Throw(value)),
-        };
-        Ok(NativeConversion::Value(quickjs_to_int64_free(number)))
-    }
-
     fn call_array_buffer_constructor(
         &self,
         realm: ContextId,
@@ -271,14 +259,14 @@ impl Runtime {
         max_byte_length: Option<u64>,
     ) -> Result<Completion, RuntimeError> {
         if length > MAX_ARRAY_BUFFER_LENGTH {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "invalid array buffer length",
             )?));
         }
         if max_byte_length.is_some_and(|maximum| maximum > MAX_ARRAY_BUFFER_LENGTH) {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "invalid max array buffer length",
@@ -293,13 +281,15 @@ impl Runtime {
             .map_err(|_| RuntimeError::Invariant("validated ArrayBuffer maximum overflowed u32"))?;
         let Some(object) = self.new_array_buffer_object(&prototype, length, max_byte_length)?
         else {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Internal,
                 "out of memory",
             )?));
         };
-        Ok(Completion::Return(Value::Object(object)))
+        Ok(Completion::Return(
+            self.into_jsvalue(Value::Object(object))?,
+        ))
     }
 
     pub(in crate::engine::builtins) fn call_array_buffer_is_view(
@@ -317,17 +307,17 @@ impl Runtime {
                 "ArrayBuffer.isView argument was not padded",
             ));
         };
-        let is_view = if let Value::Object(object) = value {
+        let is_view = if let JsValue::Object(id) = value {
             let state = self.0.state.borrow();
             matches!(
-                state.heap.object(object.object_id())?.payload,
+                state.heap.object(*id)?.payload,
                 ObjectPayload::DataView(_) | ObjectPayload::TypedArray(_)
             )
         } else {
             false
         };
         // Proxies intentionally do not forward this internal-slot brand test.
-        Ok(Completion::Return(Value::Bool(is_view)))
+        Ok(Completion::Return(JsValue::Bool(is_view)))
     }
 
     pub(in crate::engine::builtins) fn call_array_buffer_species(
@@ -339,7 +329,7 @@ impl Runtime {
                 "ArrayBuffer species did not receive a getter invocation",
             ));
         };
-        Ok(Completion::Return(this_value.clone()))
+        Ok(Completion::Return(self.dup_jsvalue(this_value)?))
     }
 
     pub(in crate::engine::builtins) fn call_array_buffer_getter(
@@ -353,22 +343,24 @@ impl Runtime {
                 "ArrayBuffer prototype getter received a non-getter invocation",
             ));
         };
-        let object = match self.require_array_buffer_borrowed(realm, this_value)? {
+        let object = match self.require_array_buffer_jsvalue(realm, this_value)? {
             NativeConversion::Value(object) => object,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        let snapshot = self.array_buffer_snapshot(object)?;
+        let snapshot = self.array_buffer_snapshot(&object)?;
         let value = match kind {
-            ArrayBufferNativeKind::ByteLength => Value::Int(
+            ArrayBufferNativeKind::ByteLength => JsValue::Int(
                 i32::try_from(snapshot.byte_length)
                     .expect("ArrayBuffer length is bounded by i32::MAX"),
             ),
-            ArrayBufferNativeKind::MaxByteLength => Value::Int(
+            ArrayBufferNativeKind::MaxByteLength => JsValue::Int(
                 i32::try_from(snapshot.max_byte_length.unwrap_or(snapshot.byte_length))
                     .expect("ArrayBuffer maximum is bounded by i32::MAX"),
             ),
-            ArrayBufferNativeKind::Resizable => Value::Bool(snapshot.max_byte_length.is_some()),
-            ArrayBufferNativeKind::Detached => Value::Bool(snapshot.detached),
+            ArrayBufferNativeKind::Resizable => JsValue::Bool(snapshot.max_byte_length.is_some()),
+            ArrayBufferNativeKind::Detached => JsValue::Bool(snapshot.detached),
             ArrayBufferNativeKind::Constructor
             | ArrayBufferNativeKind::IsView
             | ArrayBufferNativeKind::Species
@@ -410,21 +402,21 @@ impl Runtime {
     ) -> Result<Completion, RuntimeError> {
         let current = self.array_buffer_snapshot(&object)?;
         if current.detached {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer is detached",
             )?));
         }
         let Some(maximum) = current.max_byte_length else {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "array buffer is not resizable",
             )?));
         };
         if new_length < 0 || new_length > i64::from(maximum) {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "invalid array buffer length",
@@ -439,13 +431,13 @@ impl Runtime {
             .heap
             .resize_array_buffer_bytes(object.object_id(), new_length)?;
         if !resized {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Internal,
                 "out of memory",
             )?));
         }
-        Ok(Completion::Return(Value::Undefined))
+        Ok(Completion::Return(JsValue::Undefined))
     }
 
     fn call_array_buffer_slice(
@@ -470,15 +462,26 @@ impl Runtime {
     pub(in crate::engine::builtins) fn array_buffer_slice_source(
         &self,
         realm: ContextId,
-        value: Value,
+        value: &JsValue,
     ) -> Result<NativeConversion<(ObjectRef, i64)>, RuntimeError> {
-        let source = match self.require_array_buffer(realm, value)? {
-            NativeConversion::Value(source) => source,
-            NativeConversion::Throw(value) => return Ok(NativeConversion::Throw(value)),
+        let JsValue::Object(id) = value else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+                realm,
+                NativeErrorKind::Type,
+                "ArrayBuffer object expected",
+            )?));
         };
+        let source = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
+        if self.array_buffer_snapshot_if_branded(&source)?.is_none() {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+                realm,
+                NativeErrorKind::Type,
+                "ArrayBuffer object expected",
+            )?));
+        }
         let initial = self.array_buffer_snapshot(&source)?;
         if initial.detached {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer is detached",
@@ -496,7 +499,7 @@ impl Runtime {
     ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
         let prototype = self.array_buffer_default_prototype(realm)?;
         let Some(object) = self.new_array_buffer_object(&prototype, new_length, None)? else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Internal,
                 "out of memory",
@@ -514,7 +517,7 @@ impl Runtime {
         new_length: u32,
     ) -> Result<Completion, RuntimeError> {
         if target.object_id() == source.object_id() {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "cannot use identical ArrayBuffer",
@@ -523,7 +526,7 @@ impl Runtime {
         let target_snapshot = match self.array_buffer_snapshot_if_branded(&target)? {
             Some(snapshot) => snapshot,
             None => {
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "ArrayBuffer object expected",
@@ -531,14 +534,14 @@ impl Runtime {
             }
         };
         if target_snapshot.detached {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer is detached",
             )?));
         }
         if target_snapshot.byte_length < new_length {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "new ArrayBuffer is too small",
@@ -565,7 +568,7 @@ impl Runtime {
             !data.detached && end <= data.bytes.len()
         };
         if !source_is_live {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer is detached",
@@ -577,7 +580,9 @@ impl Runtime {
             start,
             new_length_usize,
         )?;
-        Ok(Completion::Return(Value::Object(target)))
+        Ok(Completion::Return(
+            self.into_jsvalue(Value::Object(target))?,
+        ))
     }
 
     fn call_array_buffer_transfer(
@@ -607,7 +612,7 @@ impl Runtime {
     ) -> Result<Completion, RuntimeError> {
         let current = self.array_buffer_snapshot(&source)?;
         if current.detached {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer is detached",
@@ -619,14 +624,14 @@ impl Runtime {
             current.max_byte_length
         };
         if result_maximum.is_some_and(|maximum| new_length > u64::from(maximum)) {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "invalid array buffer length",
             )?));
         }
         if new_length > MAX_ARRAY_BUFFER_LENGTH {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "invalid array buffer length",
@@ -636,7 +641,7 @@ impl Runtime {
             .map_err(|_| RuntimeError::Invariant("transfer length overflowed usize"))?;
         let prototype = self.array_buffer_default_prototype(realm)?;
         let Some(target) = self.new_array_buffer_object(&prototype, 0, result_maximum)? else {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Internal,
                 "out of memory",
@@ -648,13 +653,15 @@ impl Runtime {
             new_length,
         )?;
         if !transferred {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Internal,
                 "out of memory",
             )?));
         }
-        Ok(Completion::Return(Value::Object(target)))
+        Ok(Completion::Return(
+            self.into_jsvalue(Value::Object(target))?,
+        ))
     }
 
     fn array_buffer_default_prototype(&self, realm: ContextId) -> Result<ObjectRef, RuntimeError> {
@@ -672,34 +679,21 @@ impl Runtime {
         Ok(ObjectRef::from_borrowed_handle(self.clone(), prototype)?)
     }
 
-    fn require_array_buffer(
+    fn require_array_buffer_jsvalue(
         &self,
         realm: ContextId,
-        value: Value,
+        value: &JsValue,
     ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
-        self.require_array_buffer_borrowed(realm, &value)
-            .map(|result| match result {
-                NativeConversion::Value(object) => NativeConversion::Value(object.clone()),
-                NativeConversion::Throw(value) => NativeConversion::Throw(value),
-            })
-    }
-    fn require_array_buffer_borrowed<'a>(
-        &self,
-        realm: ContextId,
-        value: &'a Value,
-    ) -> Result<NativeConversion<&'a ObjectRef>, RuntimeError> {
-        let Value::Object(object) = value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        let JsValue::Object(id) = value else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer object expected",
             )?));
         };
-        if !object.belongs_to(self) {
-            return Err(RuntimeError::WrongRuntime("ArrayBuffer"));
-        }
-        if self.array_buffer_snapshot_if_branded(object)?.is_none() {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        let object = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
+        if self.array_buffer_snapshot_if_branded(&object)?.is_none() {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer object expected",
@@ -863,8 +857,9 @@ impl Runtime {
         let value = arguments.readable.first().ok_or(RuntimeError::Invariant(
             "Test262 detachArrayBuffer argument was not padded",
         ))?;
-        self.detach_array_buffer_value(value)?;
-        Ok(Completion::Return(Value::Undefined))
+        let value = self.root_value(value)?;
+        self.detach_array_buffer_value(&value)?;
+        Ok(Completion::Return(JsValue::Undefined))
     }
 }
 

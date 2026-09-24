@@ -3,7 +3,7 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::{ContextId, HeapError, IteratorConcatData, IteratorConcatItem, ObjectData, RawValue},
     object::{CallableRef, ObjectRef, PropertyKey, WellKnownSymbol},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation, NativeInvokeOutcome},
@@ -17,35 +17,36 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        match finish(
-            self,
-            realm,
-            ConcatStep::start(self, realm, ConcatKind::Create, &invocation, arguments)?,
-        )? {
-            NativeInvokeOutcome::Completion(result) => Ok(result),
-            NativeInvokeOutcome::IteratorNextRaw { .. } => {
-                Err(RuntimeError::Invariant("concat creation returned raw next"))
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            match finish(
+                self,
+                realm,
+                ConcatStep::start(self, realm, ConcatKind::Create, invocation, arguments)?,
+            )? {
+                NativeInvokeOutcome::Completion(result) => Ok(result),
+                NativeInvokeOutcome::IteratorNextRaw { .. } => {
+                    Err(RuntimeError::Invariant("concat creation returned raw next"))
+                }
             }
-        }
+        })
     }
 
     fn new_iterator_concat(
         &self,
         realm: ContextId,
-        inputs: &[(ObjectRef, Value)],
+        inputs: &[(ObjectRef, JsValue)],
     ) -> Result<ObjectRef, RuntimeError> {
         let prototype = self.iterator_realm_data(realm)?.concat_prototype;
         let prototype = ObjectRef::from_borrowed_handle(self.clone(), prototype)?;
         let items = inputs
             .iter()
             .map(|(iterable, method)| {
-                Ok(Some(IteratorConcatItem {
+                Some(IteratorConcatItem {
                     iterable: iterable.object_id(),
-                    method: self.raw_property_value(method)?,
-                }))
+                    method: method.as_raw(),
+                })
             })
-            .collect::<Result<Vec<_>, RuntimeError>>()?;
-
+            .collect::<Vec<_>>();
         let mut state = self.0.state.borrow_mut();
         let shape = state.get_or_create_shape(Some(prototype.object_id()), &[])?;
         let retained_atoms =
@@ -72,7 +73,6 @@ impl Runtime {
             };
         let cleanup = state.heap.release_shape(shape)?;
         state.apply_cleanup(cleanup)?;
-        drop(state);
         Ok(ObjectRef::from_owned_handle(self.clone(), object))
     }
 
@@ -87,11 +87,13 @@ impl Runtime {
         };
         match snapshot {
             Ok(snapshot) => Ok(NativeConversion::Value(snapshot)),
-            Err(HeapError::Invariant(_)) => Ok(NativeConversion::Throw(self.new_native_error(
-                realm,
-                NativeErrorKind::Type,
-                "not an Iterator Concat",
-            )?)),
+            Err(HeapError::Invariant(_)) => {
+                Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+                    realm,
+                    NativeErrorKind::Type,
+                    "not an Iterator Concat",
+                )?))
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -124,9 +126,9 @@ impl Runtime {
     fn set_iterator_concat_next(
         &self,
         concat: &ObjectRef,
-        next: &Value,
+        next: &JsValue,
     ) -> Result<(), RuntimeError> {
-        let raw = self.raw_property_value(next)?;
+        let raw = next.as_raw();
         let mut state = self.0.state.borrow_mut();
         let retained_atoms = state.retain_raw_value_atoms([&raw])?;
         let cleanup = match state.heap.set_iterator_concat_next(concat.object_id(), raw) {
@@ -136,7 +138,8 @@ impl Runtime {
                 return Err(error.into());
             }
         };
-        state.apply_cleanup(cleanup)
+        state.apply_cleanup(cleanup)?;
+        Ok(())
     }
 
     fn advance_iterator_concat(&self, concat: &ObjectRef) -> Result<(), RuntimeError> {
@@ -158,9 +161,11 @@ impl Runtime {
     ) -> Result<Completion, RuntimeError> {
         match self.call_iterator_concat_next_raw(realm, invocation)? {
             NativeInvokeOutcome::Completion(completion) => Ok(completion),
-            NativeInvokeOutcome::IteratorNextRaw { value, done } => Ok(Completion::Return(
-                Value::Object(self.new_iterator_result(realm, value, done)?),
-            )),
+            NativeInvokeOutcome::IteratorNextRaw { value, done } => {
+                Ok(Completion::Return(self.into_jsvalue(Value::Object(
+                    self.new_iterator_result_jsvalue(realm, value, done)?,
+                ))?))
+            }
         }
     }
 
@@ -190,25 +195,27 @@ impl Runtime {
         realm: ContextId,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        match finish(
-            self,
-            realm,
-            ConcatStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            match finish(
                 self,
                 realm,
-                ConcatKind::Return,
-                &invocation,
-                &NativeArguments {
-                    actual_arg_count: 0,
-                    readable: Vec::new(),
-                },
-            )?,
-        )? {
-            NativeInvokeOutcome::Completion(result) => Ok(result),
-            NativeInvokeOutcome::IteratorNextRaw { .. } => {
-                Err(RuntimeError::Invariant("concat return returned raw next"))
+                ConcatStep::start(
+                    self,
+                    realm,
+                    ConcatKind::Return,
+                    invocation,
+                    &NativeArguments {
+                        actual_arg_count: 0,
+                        readable: Vec::new(),
+                    },
+                )?,
+            )? {
+                NativeInvokeOutcome::Completion(result) => Ok(result),
+                NativeInvokeOutcome::IteratorNextRaw { .. } => {
+                    Err(RuntimeError::Invariant("concat return returned raw next"))
+                }
             }
-        }
+        })
     }
 }
 
@@ -267,6 +274,7 @@ impl std::ops::DerefMut for ConcatResume {
 }
 const _: () = assert!(std::mem::size_of::<ConcatResume>() <= 8);
 pub(crate) struct ConcatResumeState {
+    runtime: Runtime,
     pending_effect: ConcatStepPending,
     realm: ContextId,
     phase: ConcatPhase,
@@ -274,8 +282,7 @@ pub(crate) struct ConcatResumeState {
 }
 enum ConcatPhase {
     Input {
-        remaining: std::vec::IntoIter<Value>,
-        inputs: Vec<(ObjectRef, Value)>,
+        owner: ConcatInputs,
         current: ObjectRef,
     },
     Iterator,
@@ -283,6 +290,31 @@ enum ConcatPhase {
     Next,
     ReturnMethod(ObjectRef),
     ReturnResult,
+}
+struct ConcatInputs {
+    runtime: Runtime,
+    remaining: std::vec::IntoIter<JsValue>,
+    inputs: Vec<(ObjectRef, JsValue)>,
+}
+impl Drop for ConcatInputs {
+    fn drop(&mut self) {
+        for value in self.remaining.by_ref() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        for (_, value) in self.inputs.drain(..) {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
+}
+impl Drop for ConcatResumeState {
+    fn drop(&mut self) {
+        if let Some(value) = self.pending_effect.call_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.pending_effect.next_method.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
 }
 impl ConcatStep {
     pub(crate) fn start(
@@ -298,16 +330,27 @@ impl ConcatStep {
                     "Iterator.concat did not receive a generic invocation",
                 ));
             }
-            // The continuation owns its inputs after the native argv expires.
-            let inputs = arguments.readable[..arguments.actual_arg_count].to_vec();
-            return ConcatResume::input(
-                runtime,
-                realm,
-                inputs.into_iter(),
-                Vec::with_capacity(arguments.actual_arg_count),
-            );
+            let mut owner = ConcatInputs {
+                runtime: runtime.clone(),
+                remaining: Vec::new().into_iter(),
+                inputs: Vec::with_capacity(arguments.actual_arg_count),
+            };
+            let mut values = Vec::with_capacity(arguments.actual_arg_count);
+            for value in &arguments.readable[..arguments.actual_arg_count] {
+                match runtime.dup_jsvalue(value) {
+                    Ok(value) => values.push(value),
+                    Err(error) => {
+                        for value in values {
+                            let _ = runtime.release_jsvalue(value);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            owner.remaining = values.into_iter();
+            return ConcatResume::input(runtime, realm, owner);
         }
-        let concat = match runtime.iterator_receiver(realm, invocation.clone())? {
+        let concat = match runtime.iterator_receiver(realm, invocation)? {
             NativeConversion::Value(concat) => concat,
             NativeConversion::Throw(value) => {
                 return Ok(Self::Complete(NativeInvokeOutcome::Completion(
@@ -325,7 +368,7 @@ impl ConcatStep {
         };
         if snapshot.running {
             return Ok(Self::Complete(NativeInvokeOutcome::Completion(
-                Completion::Throw(runtime.new_native_error(
+                Completion::Throw(runtime.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "already running",
@@ -335,7 +378,7 @@ impl ConcatStep {
         if matches!(kind, ConcatKind::Return) && snapshot.iterator.is_none() {
             runtime.clear_iterator_concat(&concat)?;
             return Ok(Self::Complete(NativeInvokeOutcome::Completion(
-                Completion::Return(Value::Undefined),
+                Completion::Return(JsValue::Undefined),
             )));
         }
         runtime.set_iterator_concat_running(&concat, true)?;
@@ -346,6 +389,7 @@ impl ConcatStep {
             clear: false,
         };
         let mut resume = ConcatResume(Box::new(ConcatResumeState {
+            runtime: runtime.clone(),
             pending_effect: ConcatStepPending::default(),
             realm,
             phase: ConcatPhase::Next,
@@ -378,43 +422,40 @@ impl ConcatResume {
     fn input(
         runtime: &Runtime,
         realm: ContextId,
-        mut remaining: std::vec::IntoIter<Value>,
-        inputs: Vec<(ObjectRef, Value)>,
+        mut owner: ConcatInputs,
     ) -> Result<ConcatStep, RuntimeError> {
-        let Some(input) = remaining.next() else {
+        let Some(input) = owner.remaining.next() else {
             return Ok(ConcatStep::Complete(NativeInvokeOutcome::Completion(
-                Completion::Return(Value::Object(runtime.new_iterator_concat(realm, &inputs)?)),
+                Completion::Return(JsValue::Object(
+                    runtime
+                        .new_iterator_concat(realm, &owner.inputs)?
+                        .into_handle(),
+                )),
             )));
         };
-        let Value::Object(current) = input else {
-            return Ok(ConcatStep::Complete(NativeInvokeOutcome::Completion(
-                Completion::Throw(runtime.new_native_error(
-                    realm,
-                    NativeErrorKind::Type,
-                    "not an object",
-                )?),
-            )));
+        let current = match input {
+            JsValue::Object(id) => ObjectRef::from_owned_handle(runtime.clone(), id),
+            other => {
+                runtime.release_jsvalue(other)?;
+                return Ok(ConcatStep::Complete(NativeInvokeOutcome::Completion(
+                    Completion::Throw(runtime.new_native_error_jsvalue(
+                        realm,
+                        NativeErrorKind::Type,
+                        "not an object",
+                    )?),
+                )));
+            }
         };
-        Ok({
-            let __pending_field_object = current.clone();
-            let __pending_field_key =
-                PropertyKey::from(runtime.well_known_symbol(WellKnownSymbol::Iterator));
-            let __pending_field_resume = Self(Box::new(ConcatResumeState {
-                pending_effect: ConcatStepPending::default(),
-                realm,
-                guard: None,
-                phase: ConcatPhase::Input {
-                    remaining,
-                    inputs,
-                    current,
-                },
-            }));
-            ConcatStep::request_read(
-                __pending_field_object,
-                __pending_field_key,
-                __pending_field_resume,
-            )
-        })
+        let object = current.clone();
+        let key = PropertyKey::from(runtime.well_known_symbol(WellKnownSymbol::Iterator));
+        let resume = Self(Box::new(ConcatResumeState {
+            runtime: runtime.clone(),
+            pending_effect: ConcatStepPending::default(),
+            realm,
+            guard: None,
+            phase: ConcatPhase::Input { owner, current },
+        }));
+        Ok(ConcatStep::request_read(object, key, resume))
     }
     fn concat(&self) -> Result<&ObjectRef, RuntimeError> {
         self.0
@@ -442,7 +483,7 @@ impl ConcatResume {
         };
         if snapshot.index >= snapshot.items.len() {
             return self.complete(NativeInvokeOutcome::IteratorNextRaw {
-                value: Value::Undefined,
+                value: JsValue::Undefined,
                 done: true,
             });
         }
@@ -460,11 +501,13 @@ impl ConcatResume {
                 "Iterator Concat current input was already released",
             ))?;
         let iterable = ObjectRef::from_borrowed_handle(runtime.clone(), item.iterable)?;
-        let callable = match runtime
-            .iterator_callable_value(self.0.realm, runtime.root_raw_value(&item.method)?)?
-        {
+        let method = runtime.dup_iterator_raw(&item.method)?;
+        let callable = runtime.iterator_callable_jsvalue(self.0.realm, &method);
+        runtime.release_jsvalue(method)?;
+        let callable = match callable? {
             NativeConversion::Value(callable) => callable,
-            NativeConversion::Throw(_) => {
+            NativeConversion::Throw(discarded) => {
+                runtime.release_jsvalue(discarded)?;
                 return Err(RuntimeError::Invariant(
                     "Iterator Concat captured method lost its callable brand",
                 ));
@@ -473,7 +516,7 @@ impl ConcatResume {
         self.0.phase = ConcatPhase::Iterator;
         Ok({
             let __pending_field_callable = callable;
-            let __pending_field_receiver = Value::Object(iterable);
+            let __pending_field_receiver = runtime.into_jsvalue(Value::Object(iterable))?;
             let __pending_field_resume = self;
             ConcatStep::request_call(
                 __pending_field_callable,
@@ -509,7 +552,7 @@ impl ConcatResume {
                 )
             });
         }
-        let method = runtime.root_raw_value(&snapshot.next)?;
+        let method = runtime.dup_iterator_raw(&snapshot.next)?;
         self.0.phase = ConcatPhase::Next;
         Ok({
             let __pending_field_iterator = iterator;
@@ -534,45 +577,45 @@ impl ConcatResume {
             }
         };
         match std::mem::replace(&mut self.0.phase, ConcatPhase::Next) {
-            ConcatPhase::Input {
-                remaining,
-                mut inputs,
-                current,
-            } => {
-                if let NativeConversion::Throw(value) =
-                    runtime.iterator_callable_value(self.0.realm, value.clone())?
-                {
-                    return self
-                        .complete(NativeInvokeOutcome::Completion(Completion::Throw(value)));
+            ConcatPhase::Input { mut owner, current } => {
+                let callable = runtime.iterator_callable_jsvalue(self.0.realm, &value);
+                match callable {
+                    Ok(NativeConversion::Value(_)) => owner.inputs.push((current, value)),
+                    Ok(NativeConversion::Throw(error)) => {
+                        runtime.release_jsvalue(value)?;
+                        return self
+                            .complete(NativeInvokeOutcome::Completion(Completion::Throw(error)));
+                    }
+                    Err(error) => {
+                        let _ = runtime.release_jsvalue(value);
+                        return Err(error);
+                    }
                 }
-                inputs.push((current, value));
-                Self::input(runtime, self.0.realm, remaining, inputs)
+                Self::input(runtime, self.0.realm, owner)
             }
             ConcatPhase::Iterator => {
-                let Value::Object(iterator) = value else {
-                    let error = runtime.new_native_error(
-                        self.0.realm,
-                        NativeErrorKind::Type,
-                        "not an object",
-                    )?;
-                    return self
-                        .complete(NativeInvokeOutcome::Completion(Completion::Throw(error)));
+                let iterator = match value {
+                    JsValue::Object(id) => ObjectRef::from_owned_handle(runtime.clone(), id),
+                    other => {
+                        runtime.release_jsvalue(other)?;
+                        let error = runtime.new_native_error_jsvalue(
+                            self.0.realm,
+                            NativeErrorKind::Type,
+                            "not an object",
+                        )?;
+                        return self
+                            .complete(NativeInvokeOutcome::Completion(Completion::Throw(error)));
+                    }
                 };
                 runtime.set_iterator_concat_iterator(self.concat()?, &iterator)?;
                 self.method(runtime, iterator)
             }
             ConcatPhase::Method(iterator) => {
-                runtime.set_iterator_concat_next(self.concat()?, &value)?;
-                Ok({
-                    let __pending_field_iterator = iterator;
-                    let __pending_field_method = value;
-                    let __pending_field_resume = self;
-                    ConcatStep::request_next(
-                        __pending_field_iterator,
-                        __pending_field_method,
-                        __pending_field_resume,
-                    )
-                })
+                if let Err(error) = runtime.set_iterator_concat_next(self.concat()?, &value) {
+                    let _ = runtime.release_jsvalue(value);
+                    return Err(error);
+                }
+                Ok(ConcatStep::request_next(iterator, value, self))
             }
             ConcatPhase::ReturnMethod(iterator) => {
                 self.0
@@ -580,7 +623,9 @@ impl ConcatResume {
                     .as_mut()
                     .ok_or(RuntimeError::Invariant("concat return owner missing"))?
                     .clear = true;
-                let callable = match runtime.iterator_callable_value(self.0.realm, value)? {
+                let callable = runtime.iterator_callable_jsvalue(self.0.realm, &value);
+                runtime.release_jsvalue(value)?;
+                let callable = match callable? {
                     NativeConversion::Value(callable) => callable,
                     NativeConversion::Throw(value) => {
                         return self
@@ -588,21 +633,19 @@ impl ConcatResume {
                     }
                 };
                 self.0.phase = ConcatPhase::ReturnResult;
-                Ok({
-                    let __pending_field_callable = callable;
-                    let __pending_field_receiver = Value::Object(iterator);
-                    let __pending_field_resume = self;
-                    ConcatStep::request_call(
-                        __pending_field_callable,
-                        __pending_field_receiver,
-                        __pending_field_resume,
-                    )
-                })
+                Ok(ConcatStep::request_call(
+                    callable,
+                    JsValue::Object(iterator.into_handle()),
+                    self,
+                ))
             }
             ConcatPhase::ReturnResult => {
                 self.complete(NativeInvokeOutcome::Completion(Completion::Return(value)))
             }
-            ConcatPhase::Next => Err(RuntimeError::Invariant("concat next received completion")),
+            ConcatPhase::Next => {
+                runtime.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant("concat next received completion"))
+            }
         }
     }
     pub(crate) fn next(
@@ -648,7 +691,7 @@ pub(crate) fn finish(
                 let receiver = resume.take_call_receiver();
                 resume.resume(
                     runtime,
-                    runtime.call_internal(realm, &callable, receiver, &[])?,
+                    runtime.call_internal_jsvalue(realm, &callable, receiver, Vec::new())?,
                 )?
             }
             ConcatStep::Next { mut resume } => {
@@ -659,7 +702,7 @@ pub(crate) fn finish(
                     super::step::finish_next(
                         runtime,
                         realm,
-                        super::step::NextStep::start(runtime, realm, iterator, method)?,
+                        super::step::NextStep::start_jsvalue(runtime, realm, iterator, method)?,
                     )?,
                 )?
             }
@@ -672,9 +715,9 @@ struct ConcatStepPending {
     read_object: Option<ObjectRef>,
     read_key: Option<PropertyKey>,
     call_callable: Option<CallableRef>,
-    call_receiver: Option<Value>,
+    call_receiver: Option<JsValue>,
     next_iterator: Option<ObjectRef>,
-    next_method: Option<Value>,
+    next_method: Option<JsValue>,
 }
 impl ConcatStep {
     pub(crate) fn request_read(
@@ -688,7 +731,7 @@ impl ConcatStep {
     }
     pub(crate) fn request_call(
         callable: CallableRef,
-        receiver: Value,
+        receiver: JsValue,
         mut resume: ConcatResume,
     ) -> Self {
         resume.0.pending_effect.call_callable = Some(callable);
@@ -697,7 +740,7 @@ impl ConcatStep {
     }
     pub(crate) fn request_next(
         iterator: ObjectRef,
-        method: Value,
+        method: JsValue,
         mut resume: ConcatResume,
     ) -> Self {
         resume.0.pending_effect.next_iterator = Some(iterator);
@@ -727,7 +770,7 @@ impl ConcatResume {
             .take()
             .expect("ConcatStep Call callable")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver
@@ -741,7 +784,7 @@ impl ConcatResume {
             .take()
             .expect("ConcatStep Next iterator")
     }
-    pub(crate) fn take_next_method(&mut self) -> Value {
+    pub(crate) fn take_next_method(&mut self) -> JsValue {
         self.0
             .pending_effect
             .next_method

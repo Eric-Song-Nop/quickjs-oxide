@@ -4,7 +4,7 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
     object::{CallableRef, ObjectRef, PropertyKey},
-    value::{JsString, Value, conversion::NativeConversion},
+    value::{JsString, JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
@@ -55,20 +55,22 @@ impl BindStep {
             ));
         };
         let target = match this_value {
-            Value::Object(object) => runtime.as_callable(object)?,
+            JsValue::Object(id) => {
+                let object = ObjectRef::from_borrowed_handle(runtime.clone(), *id)?;
+                runtime.as_callable(&object)?
+            }
             _ => None,
         };
         let Some(target) = target else {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(realm, NativeErrorKind::Type, "not a function")?,
+                runtime.new_native_error_jsvalue(realm, NativeErrorKind::Type, "not a function")?,
             )));
         };
         let count = arguments.actual_arg_count.saturating_sub(1);
-        let forwarded = if arguments.actual_arg_count > 1 {
-            &arguments.readable[1..arguments.actual_arg_count]
-        } else {
-            &[]
-        };
+        let forwarded = arguments
+            .readable
+            .get(1..arguments.actual_arg_count)
+            .unwrap_or(&[]);
         let bound =
             runtime.new_bound_function(realm, &target, &arguments.readable[0], forwarded)?;
         Ok(Self::Own {
@@ -97,17 +99,31 @@ impl BindResume {
                     .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Length)?,
                 resume: self,
             }),
-            NativeConversion::Value(false) => self.length(runtime, Value::Int(0)),
+            NativeConversion::Value(false) => self.length(runtime, JsValue::Int(0)),
         }
     }
-    fn length(mut self, runtime: &Runtime, value: Value) -> Result<BindStep, RuntimeError> {
-        runtime.define_function_data_property(
-            self.0.bound.as_object(),
-            "length",
-            value,
-            false,
-            true,
-        )?;
+    fn length(mut self, runtime: &Runtime, value: JsValue) -> Result<BindStep, RuntimeError> {
+        let defined = (|| {
+            let key =
+                runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Length)?;
+            runtime.define_raw_property(
+                self.0.bound.as_object(),
+                &key,
+                &crate::engine::object::property::PropertyDescriptor {
+                    value: Some(value.as_raw()),
+                    writable: Some(false),
+                    enumerable: Some(false),
+                    configurable: Some(true),
+                    ..Default::default()
+                },
+            )
+        })();
+        runtime.release_jsvalue(value)?;
+        if !defined? {
+            return Err(RuntimeError::Invariant(
+                "bound function length definition rejected",
+            ));
+        }
         self.0.name = true;
         Ok(BindStep::Read {
             object: self.0.target.clone(),
@@ -125,14 +141,20 @@ impl BindResume {
             result @ Completion::Throw(_) => return Ok(BindStep::Complete(result)),
         };
         if !self.0.name {
-            let length = bound_function_length(&value, self.0.count)?;
-            return self.length(runtime, length);
+            let length = bound_function_length(&value, self.0.count);
+            runtime.release_jsvalue(value)?;
+            return self.length(runtime, length?);
         }
-        let name = match value {
-            Value::String(name) => name,
-            _ => JsString::from_static(""),
-        };
-        let name = JsString::from_static("bound ").try_concat(&name)?;
+        let name = (|| {
+            let state = runtime.0.state.borrow();
+            let name = match &value {
+                JsValue::String(id) => state.heap.string(*id)?,
+                _ => &JsString::from_static(""),
+            };
+            Ok::<_, RuntimeError>(JsString::from_static("bound ").try_concat(name)?)
+        })();
+        runtime.release_jsvalue(value)?;
+        let name = name?;
         runtime.define_function_data_property(
             self.0.bound.as_object(),
             "name",
@@ -140,8 +162,8 @@ impl BindResume {
             false,
             true,
         )?;
-        Ok(BindStep::Complete(Completion::Return(Value::Object(
-            self.0.bound.into_object(),
+        Ok(BindStep::Complete(Completion::Return(JsValue::Object(
+            self.0.bound.into_object().into_handle(),
         ))))
     }
 }

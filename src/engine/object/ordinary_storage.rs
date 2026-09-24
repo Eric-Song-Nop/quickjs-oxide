@@ -4,12 +4,12 @@
 mod ic;
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
-use crate::engine::atom::Atom;
+use crate::engine::atom::{Atom, AtomIdx};
 use crate::engine::heap::runtime::RuntimeState;
 use crate::engine::heap::{ObjectId, ObjectKind, ObjectPayload, PropertySlot};
 use crate::engine::object::shape::PropertyFlags;
 use crate::engine::object::{ObjectRef, PropertyKey};
-use crate::engine::value::Value;
+use crate::engine::value::{JsValue, Value};
 
 /// Affine native payload fact selected together with an own property value.
 /// Its callee remains retained by the result/operand owner; consumption checks
@@ -20,15 +20,17 @@ pub(crate) struct LinkedNativeSelection {
     data: crate::engine::builtins::native::NativeFunctionData,
 }
 impl LinkedNativeSelection {
-    pub(crate) fn into_parts(
+    pub(crate) fn into_parts_jsvalue(
         self,
-        function: &ObjectRef,
+        runtime: &Runtime,
+        function: ObjectId,
     ) -> Option<crate::engine::builtins::native::NativeFunctionData> {
-        (function.belongs_to(&self.runtime) && function.object_id() == self.function)
+        (runtime.domain_id() == self.runtime.domain_id() && function == self.function)
             .then_some(self.data)
     }
 }
 
+#[derive(Clone, Copy)]
 struct OwnSlot {
     index: usize,
     flags: PropertyFlags,
@@ -42,6 +44,29 @@ fn is_ordinary(data: &crate::engine::heap::ObjectData) -> bool {
     )
 }
 
+/// These payloads keep every own property in their ordinary shape/slot
+/// arrays, so their reads can use the borrowed probe instead of the
+/// owned-descriptor kernel. Functions matter for the
+/// `Get(constructor, "prototype")` step of every `new` expression; strong
+/// collections and their iterators matter for uncached method reads such as
+/// `set.has`. Lazy slots (`name`, `length`, function `prototype`) are
+/// AutoInit entries and decline per slot below; collection records live in
+/// the payload, never as virtual own properties.
+fn reads_are_slot_faithful(data: &crate::engine::heap::ObjectData) -> bool {
+    matches!(
+        &data.payload,
+        ObjectPayload::NativeFunction { .. }
+            | ObjectPayload::BoundFunction { .. }
+            | ObjectPayload::BytecodeFunction { .. }
+            | ObjectPayload::Map { .. }
+            | ObjectPayload::Set { .. }
+            | ObjectPayload::WeakMap { .. }
+            | ObjectPayload::WeakSet { .. }
+            | ObjectPayload::MapIterator { .. }
+            | ObjectPayload::SetIterator { .. }
+    )
+}
+
 // The caller keeps the state borrowed until the located slot is consumed.
 fn locate(
     state: &RuntimeState,
@@ -50,7 +75,7 @@ fn locate(
 ) -> Result<Option<OwnSlot>, RuntimeError> {
     let data = state.heap.object(object)?;
     let shape = state.heap.shape(data.shape)?;
-    let Some(index) = shape.find(atom) else {
+    let Some(index) = shape.find(AtomIdx::from_raw(atom.raw())) else {
         return Ok(None);
     };
     let index = index as usize;
@@ -95,7 +120,7 @@ fn select_set_slot(
                     && shape
                         .entries()
                         .first()
-                        .is_some_and(|entry| entry.atom != atom)
+                        .is_some_and(|entry| entry.atom != AtomIdx::from_raw(atom.raw()))
             }
             _ => false,
         };
@@ -181,56 +206,30 @@ pub(super) fn prototypes_allow_dense_append(
 /// Continue an already-selected missing own property without releasing the
 /// borrow. Any exotic boundary declines before changing the receiver; the
 /// ordinary state machine then performs its original observable protocol.
+///
+/// A `Define` result means the define is validated and still missing: the
+/// caller ends the borrow and commits the existing value handle through
+/// [`Runtime::store_property_slot`]. No callback or mutation can run between
+/// this selection and that commit, so splitting the borrow is unobservable.
 fn set_missing_local(
-    runtime: &Runtime,
     state: &mut RuntimeState,
     receiver: ObjectId,
     atom: Atom,
-    value: &Value,
+    _value: &JsValue,
     prototype: Option<ObjectId>,
 ) -> Result<MissingSelection, RuntimeError> {
     match select_missing_prototypes(state, atom, prototype)? {
         MissingSelection::Define => {}
         selected => return Ok(selected),
     }
-    use crate::engine::object::property::{
-        PropertyDescriptor, validate_and_apply_property_descriptor,
-    };
-    let descriptor = PropertyDescriptor {
-        value: Some(value),
-        writable: Some(true),
-        enumerable: Some(true),
-        configurable: Some(true),
-        ..PropertyDescriptor::new()
-    };
-    // Use the same descriptor permissions as DefineOwnProperty. Rejection stays
-    // on the existing rejection path, which preserves its precise error reason.
-    if validate_and_apply_property_descriptor(
-        state.heap.object(receiver)?.extensible,
-        &descriptor,
-        None,
-        &&Value::Undefined,
-        |a, b| Value::same_value(a, b),
-    )
-    .is_err()
-    {
+    // A complete new data descriptor has no compatibility comparison; the
+    // shared descriptor algorithm rejects it exactly when not extensible.
+    if !state.heap.object(receiver)?.extensible {
         return Ok(MissingSelection::Complete(SetProbe::Rejected(
             crate::engine::object::operations::PropertySetRejection::NotExtensible,
         )));
     }
-    let replacement = PropertySlot::Data(runtime.raw_property_value(value)?);
-    state.store_selected_property_slot(
-        receiver,
-        atom,
-        PropertyFlags::data(true, true, true),
-        replacement,
-        None,
-    )?;
-    #[cfg(feature = "profiling")]
-    crate::engine::api::profiling::record_owned_execution_event(
-        "set_missing_committed_from_selection",
-    );
-    Ok(MissingSelection::Complete(SetProbe::Stored(true)))
+    Ok(MissingSelection::Define)
 }
 
 #[derive(Clone, Copy)]
@@ -271,7 +270,7 @@ impl Runtime {
         &self,
         object: &ObjectRef,
         key: &PropertyKey,
-        value: &Value,
+        value: &JsValue,
         receiver_is_target: bool,
     ) -> Result<SetProbe, RuntimeError> {
         self.ordinary_set_probe_inner(object, key, value, receiver_is_target, true)
@@ -284,7 +283,7 @@ impl Runtime {
         &self,
         object: &ObjectRef,
         key: &PropertyKey,
-        value: &Value,
+        value: &JsValue,
     ) -> Result<SetProbe, RuntimeError> {
         self.ordinary_set_probe_inner(object, key, value, true, false)
     }
@@ -293,7 +292,7 @@ impl Runtime {
         &self,
         object: &ObjectRef,
         key: &PropertyKey,
-        value: &Value,
+        value: &JsValue,
         receiver_is_target: bool,
         _walk_missing: bool,
     ) -> Result<SetProbe, RuntimeError> {
@@ -307,6 +306,13 @@ impl Runtime {
             DenseAppend(u32),
 
             SpecialAt(ObjectId, SpecialKind),
+
+            /// A validated missing define on the target: commit after the
+            /// borrow, once the value conversion can take it.
+            Define,
+
+            /// A selected writable own data slot awaiting replacement.
+            DataReplace(OwnSlot),
         }
         let selected = {
             let mut state = self.0.state.borrow_mut();
@@ -347,7 +353,6 @@ impl Runtime {
                     BorrowedSet::Missing(prototype) => {
                         if receiver_is_target {
                             match set_missing_local(
-                                self,
                                 &mut state,
                                 id,
                                 key.atom(),
@@ -358,9 +363,7 @@ impl Runtime {
                                 MissingSelection::Special(id, kind) => {
                                     Selected::SpecialAt(id, kind)
                                 }
-                                MissingSelection::Define => {
-                                    unreachable!("missing receiver definition is consumed locally")
-                                }
+                                MissingSelection::Define => Selected::Define,
                             }
                         } else {
                             Selected::Missing(prototype)
@@ -373,9 +376,7 @@ impl Runtime {
                         if !receiver_is_target {
                             return Ok(SetProbe::Writable);
                         }
-                        let replacement = PropertySlot::Data(self.raw_property_value(value)?);
-                        replace_data(&mut state, id, slot, replacement)?;
-                        return Ok(SetProbe::Stored(true));
+                        Selected::DataReplace(slot)
                     }
                     BorrowedSet::Setter(set) => Selected::Setter(set),
                     BorrowedSet::Special(kind) => return Ok(SetProbe::Special(kind)),
@@ -386,7 +387,7 @@ impl Runtime {
             Selected::Dense(index) => {
                 // No callback or owner release occurs between selection and
                 // this authoritative transaction, which rechecks dense bounds.
-                self.replace_dense_array_value(object, index, value)?;
+                self.replace_dense_array_value_jsvalue(object, index, value)?;
                 SetProbe::Stored(true)
             }
 
@@ -401,6 +402,35 @@ impl Runtime {
                     None => SetProbe::Stored(true),
                     Some(reason) => SetProbe::Rejected(reason),
                 }
+            }
+            Selected::Define => {
+                // Retain the existing handle into storage; the borrowed input
+                // owns its producer edge throughout this transaction.
+                let stored = self.store_property_slot(
+                    object,
+                    key,
+                    PropertyFlags::data(true, true, true),
+                    PropertySlot::Data(value.as_raw()),
+                );
+                stored?;
+                #[cfg(feature = "profiling")]
+                crate::engine::api::profiling::record_owned_execution_event(
+                    "set_missing_committed_from_selection",
+                );
+                SetProbe::Stored(true)
+            }
+            Selected::DataReplace(slot) => {
+                let raw = value.as_raw();
+                let mut state = self.0.state.borrow_mut();
+                let replaced = replace_data(
+                    &mut state,
+                    object.object_id(),
+                    slot,
+                    PropertySlot::Data(raw),
+                );
+                drop(state);
+                replaced?;
+                return Ok(SetProbe::Stored(true));
             }
             Selected::Setter(set) => SetProbe::Setter(set),
             Selected::Missing(prototype) => SetProbe::Missing(
@@ -422,7 +452,7 @@ fn replace_data(
 }
 
 pub(super) enum ReadProbe {
-    Value(Value),
+    Value(JsValue),
     Getter(Option<crate::engine::object::CallableRef>),
     Missing(Option<ObjectRef>),
     Special(SpecialKind),
@@ -496,21 +526,26 @@ impl Runtime {
         object: &ObjectRef,
         key: &PropertyKey,
     ) -> Result<ReadProbe, RuntimeError> {
-        self.ordinary_read_probe_atom(object, key.atom(), false, None)
+        if !object.belongs_to(self) {
+            return Err(RuntimeError::WrongRuntime("property object"));
+        }
+        self.ordinary_read_probe_atom(object.object_id(), key.atom(), false, None)
     }
 
-    pub(super) fn ordinary_read_probe_selected(
+    pub(super) fn ordinary_read_probe_selected_id(
         &self,
-        object: &ObjectRef,
+        object: ObjectId,
         key: &PropertyKey,
         native: Option<&mut Option<LinkedNativeSelection>>,
     ) -> Result<ReadProbe, RuntimeError> {
         self.ordinary_read_probe_atom(object, key.atom(), false, native)
     }
 
+    // The caller owns the receiver throughout this non-reentrant probe.
+    // Output values/getters/prototypes acquire their own edges below.
     fn ordinary_read_probe_atom(
         &self,
-        object: &ObjectRef,
+        id: ObjectId,
         atom: Atom,
         own_only: bool,
         mut native: Option<&mut Option<LinkedNativeSelection>>,
@@ -525,7 +560,6 @@ impl Runtime {
         let mut native_data = None;
         let selected = {
             let state = self.0.state.borrow();
-            let id = object.object_id();
             let data = state.heap.object(id)?;
             let is_array = matches!(
                 (data.kind, &data.payload),
@@ -538,7 +572,7 @@ impl Runtime {
                 && let Some(value) = data.dense_array_value(index)
             {
                 Selected::Value(value.clone())
-            } else if !is_ordinary(data) && !is_array {
+            } else if !is_ordinary(data) && !is_array && !reads_are_slot_faithful(data) {
                 return Ok(ReadProbe::Special(special_kind(data)));
             } else {
                 match locate(&state, id, atom)? {
@@ -580,24 +614,21 @@ impl Runtime {
         };
         Ok(match selected {
             Selected::Value(value) => {
-                let value = self.root_raw_value(&value)?;
-                if let (Some(output), Some(data), Value::Object(function)) =
+                // The slot owns the borrowed handle until this retain completes.
+                // No callback or mutation occurs between selection and duplication.
+                let borrowed = JsValue::from_raw(value).ok_or(RuntimeError::Invariant(
+                    "internal sentinel in ordinary data property",
+                ))?;
+                let value = self.dup_jsvalue(&borrowed)?;
+                if let (Some(output), Some(data), JsValue::Object(function)) =
                     (native.as_mut(), native_data, &value)
                 {
                     **output = Some(LinkedNativeSelection {
                         runtime: self.clone(),
-                        function: function.object_id(),
+                        function: *function,
                         data,
                     });
                 }
-                #[cfg(feature = "profiling")]
-                crate::engine::api::profiling::record_owned_execution_event(match &value {
-                    Value::Object(_) => "property_read_root_materialized.Object",
-                    Value::Symbol(_) => "property_read_root_materialized.Symbol",
-                    Value::String(_) => "property_read_root_materialized.String",
-                    Value::BigInt(_) => "property_read_root_materialized.BigInt",
-                    _ => "property_read_root_materialized.Immediate",
-                });
                 ReadProbe::Value(value)
             }
             Selected::Getter(get) => ReadProbe::Getter(
@@ -635,28 +666,58 @@ impl Runtime {
         {
             return Ok(None);
         }
-        let mut state = self.0.state.borrow_mut();
+        // Select before conversion: declined fast paths must not allocate nodes.
         let id = object.object_id();
-        if !is_ordinary(state.heap.object(id)?) {
-            return Ok(None);
-        }
-        let Some(slot) = locate(&state, id, key.atom())? else {
-            return Ok(None);
+        let slot = {
+            let state = self.0.state.borrow();
+            if !is_ordinary(state.heap.object(id)?) {
+                return Ok(None);
+            }
+            let Some(slot) = locate(&state, id, key.atom())? else {
+                return Ok(None);
+            };
+            if !matches!(
+                state.heap.object(id)?.slots[slot.index],
+                PropertySlot::Data(_)
+            ) {
+                return Ok(None);
+            }
+            slot
         };
-        let PropertySlot::Data(old) = &state.heap.object(id)?.slots[slot.index] else {
-            return Ok(None);
+        // Conversion can allocate, but cannot execute JS or mutate this layout.
+        let converted = self.raw_property_value(value)?;
+        let raw = converted.raw();
+        let mut state = self.0.state.borrow_mut();
+        let old = match state.heap.object(id) {
+            Ok(data) => match &data.slots[slot.index] {
+                PropertySlot::Data(old) => old,
+                _ => {
+                    drop(state);
+                    return Ok(None);
+                }
+            },
+            Err(error) => {
+                drop(state);
+                return Err(error.into());
+            }
         };
-        let raw = self.raw_property_value(value)?;
         if !crate::engine::object::property::data_value_update_allowed(
             slot.flags.configurable,
             slot.flags.writable,
             old,
             &raw,
-            crate::engine::value::collection_key::same_value,
+            |left, right| {
+                crate::engine::value::collection_key::same_value(&state.heap, left, right)
+            },
         ) {
+            drop(state);
             return Ok(Some(false));
         }
-        replace_data(&mut state, id, slot, PropertySlot::Data(raw))?;
+        let replaced = replace_data(&mut state, id, slot, PropertySlot::Data(raw));
+        drop(state);
+        // The slot retained its own copy edge on success; a rejected update
+        // kept nothing. The guard balances the producer edge either way.
+        replaced?;
         Ok(Some(true))
     }
 }
@@ -665,6 +726,26 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::engine::object::{DescriptorField, OrdinaryPropertyDescriptor};
+
+    #[test]
+    fn ordinary_read_duplicates_existing_string_node_without_materialization() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let Value::Object(object) = context.eval("({value:'payload'})").unwrap() else {
+            unreachable!()
+        };
+        let key = runtime.intern_property_key("value").unwrap();
+        let before = runtime.heap_counts().string_nodes;
+        let first = runtime.ordinary_read_probe(&object, &key).unwrap();
+        let second = runtime.ordinary_read_probe(&object, &key).unwrap();
+        let (ReadProbe::Value(first), ReadProbe::Value(second)) = (first, second) else {
+            unreachable!()
+        };
+        assert!(matches!((&first, &second), (JsValue::String(a), JsValue::String(b)) if a == b));
+        assert_eq!(runtime.heap_counts().string_nodes, before);
+        runtime.release_jsvalue(first).unwrap();
+        runtime.release_jsvalue(second).unwrap();
+    }
 
     #[test]
     fn ordinary_property_replacement_preserves_roots_and_rejects_foreign_values() {
@@ -785,13 +866,13 @@ mod dense_set_tests {
         };
         let array_id = array.object_id();
         let key = runtime.intern_property_key("0").unwrap();
-        let ReadProbe::Value(Value::Object(old)) =
+        let ReadProbe::Value(JsValue::Object(old)) =
             runtime.ordinary_read_probe(&array, &key).unwrap()
         else {
             panic!("expected old value")
         };
-        let old_id = old.object_id();
-        drop(old);
+        let old_id = old;
+        runtime.release_jsvalue(JsValue::Object(old)).unwrap();
         let replacement = runtime.new_object(None).unwrap();
         let replacement_id = replacement.object_id();
         let released = runtime.new_object(None).unwrap();
@@ -807,8 +888,8 @@ mod dense_set_tests {
             Some(context.realm),
             array.clone(),
             key.clone(),
-            Value::Object(replacement),
-            Value::Object(array.clone()),
+            runtime.into_jsvalue(Value::Object(replacement)).unwrap(),
+            runtime.into_jsvalue(Value::Object(array.clone())).unwrap(),
             |_| panic!("dense overwrite suspended"),
         )
         .unwrap();
@@ -823,24 +904,22 @@ mod dense_set_tests {
         let other = Runtime::new();
         let foreign = other.new_object(None).unwrap();
         assert!(matches!(
-            SetStep::start_into(
-                &runtime,
+            runtime.prepare_set_property_with_receiver_in_realm(
                 Some(context.realm),
-                array.clone(),
-                key.clone(),
+                &array,
+                &key,
                 Value::Object(foreign),
                 Value::Object(array.clone()),
-                |_| panic!("foreign write suspended")
             ),
             Err(RuntimeError::WrongRuntime(_))
         ));
-        let ReadProbe::Value(Value::Object(current)) =
+        let ReadProbe::Value(JsValue::Object(current)) =
             runtime.ordinary_read_probe(&array, &key).unwrap()
         else {
             panic!("replacement disappeared")
         };
-        assert_eq!(current.object_id(), replacement_id);
-        drop(current);
+        assert_eq!(current, replacement_id);
+        runtime.release_jsvalue(JsValue::Object(current)).unwrap();
         drop(array);
         drop(key);
         runtime.run_gc().unwrap();
@@ -861,6 +940,24 @@ fn immediate_value(raw: &crate::engine::heap::RawValue) -> Option<Value> {
         RawValue::Bool(value) => Value::Bool(*value),
         RawValue::Int(value) => Value::Int(*value),
         RawValue::Float(value) => Value::Float(*value),
+        RawValue::ShortBigInt(value) => {
+            Value::BigInt(crate::engine::value::bigint::JsBigInt::from(*value))
+        }
+        _ => return None,
+    })
+}
+
+/// Scalar projection for an immediate leaf result: the returned internal
+/// value owns no heap edge, matching [`immediate_value`].
+fn immediate_value_jsvalue(raw: &crate::engine::heap::RawValue) -> Option<JsValue> {
+    use crate::engine::heap::RawValue;
+    Some(match raw {
+        RawValue::Undefined => JsValue::Undefined,
+        RawValue::Null => JsValue::Null,
+        RawValue::Bool(value) => JsValue::Bool(*value),
+        RawValue::Int(value) => JsValue::Int(*value),
+        RawValue::Float(value) => JsValue::Float(*value),
+        RawValue::ShortBigInt(value) => JsValue::ShortBigInt(*value),
         _ => return None,
     })
 }
@@ -887,43 +984,55 @@ impl Runtime {
     /// every decline leaves input owners, lazy properties and prototypes alone.
     pub(crate) fn try_ordinary_field_immediate_read(
         &self,
-        base: &Value,
+        base: &JsValue,
         executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
         index: u32,
-    ) -> Option<Value> {
+    ) -> Option<JsValue> {
         use crate::engine::heap::SlotReleaseReadiness;
         let atom = linked_field_atom(self, executable, index)?;
         if !matches!(
-            self.slot_value_release_readiness(base),
+            self.slot_value_release_readiness_jsvalue(base),
             Ok(SlotReleaseReadiness::Ready)
         ) {
             return None;
         }
         let state = self.0.state.try_borrow().ok()?;
-        if let Value::String(string) = base {
-            let info = state.atoms.resolve(atom).ok()?;
-            let crate::engine::atom::AtomSpelling::Text(name) = info.spelling else {
+        if let JsValue::String(id) = base {
+            // The executable owns a same-runtime interned atom; the pinned
+            // spelling has that same canonical identity. No text traversal is
+            // needed for each primitive string length read.
+            if atom
+                != state
+                    .pinned_atoms
+                    .get(crate::engine::atom::pinned::PinnedAtom::Length)
+            {
                 return None;
-            };
-            return (info.kind == crate::engine::atom::AtomKind::String
-                && name.len() == 6
-                && name.utf16_units().eq("length".encode_utf16()))
-            .then(|| Value::number(string.len() as f64));
+            }
+            let length = state.heap.string_fast(*id).len();
+            return Some(if let Ok(length) = i32::try_from(length) {
+                JsValue::Int(length)
+            } else {
+                JsValue::Float(length as f64)
+            });
         }
-        let Value::Object(object) = base else {
+        let JsValue::Object(object) = base else {
             return None;
         };
-        let id = object.object_id();
+        let id = *object;
         let data = state.heap.object(id).ok()?;
         if matches!(
             (data.kind, &data.payload),
             (ObjectKind::Array, ObjectPayload::Array { .. })
         ) {
             let first = state.heap.shape(data.shape).ok()?.entries().first()?;
-            if first.atom == atom {
+            if first.atom == AtomIdx::from_raw(atom.raw()) {
                 let (length, _) =
                     Self::array_length_state_in_heap(&state.heap, id, atom).ok()??;
-                return Some(Self::array_length_value(length));
+                return Some(if let Ok(length) = i32::try_from(length) {
+                    JsValue::Int(length)
+                } else {
+                    JsValue::Float(f64::from(length))
+                });
             }
             return None;
         }
@@ -934,7 +1043,7 @@ impl Runtime {
         let PropertySlot::Data(value) = &data.slots[slot.index] else {
             return None;
         };
-        immediate_value(value)
+        immediate_value_jsvalue(value)
     }
     /// A published function already owns its static key. Only the selected
     /// result/getter is promoted here; fallback will acquire an owning key.
@@ -945,12 +1054,15 @@ impl Runtime {
         executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
         index: u32,
     ) -> Result<Option<crate::engine::object::OrdinaryRead>, RuntimeError> {
-        self.prepare_linked_own_read_selected(base, executable, index, None)
+        let internal = self.unroot_value(base)?;
+        let result = self.prepare_linked_own_read_selected(&internal, executable, index, None);
+        self.release_jsvalue(internal)?;
+        result
     }
 
     pub(crate) fn prepare_linked_own_read_selected(
         &self,
-        base: &Value,
+        base: &JsValue,
         executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
         index: u32,
         native: Option<&mut Option<LinkedNativeSelection>>,
@@ -958,21 +1070,21 @@ impl Runtime {
         let Some(atom) = linked_field_atom(self, executable, index) else {
             return Ok(None);
         };
-        let Value::Object(object) = base else {
+        let JsValue::Object(object) = base else {
             return Ok(None);
         };
         let _operation = self.operation();
-        self.validate_value_domain(base, "property receiver")?;
+        // The borrowed base already pins this object until probing finishes.
         Ok(
-            match self.ordinary_read_probe_atom(object, atom, true, native)? {
+            match self.ordinary_read_probe_atom(*object, atom, true, native)? {
                 ReadProbe::Value(value) => {
                     Some(crate::engine::object::OrdinaryRead::Complete(Some(value)))
                 }
                 ReadProbe::Getter(None) => Some(crate::engine::object::OrdinaryRead::Complete(
-                    Some(Value::Undefined),
+                    Some(JsValue::Undefined),
                 )),
                 ReadProbe::Getter(Some(getter)) => {
-                    let receiver = base.clone();
+                    let receiver = self.dup_jsvalue(base)?;
                     #[cfg(feature = "profiling")]
                     crate::engine::api::profiling::record_owned_execution_event(
                         "linked_read_owner_clone.ReceiverObject",
@@ -988,26 +1100,31 @@ impl Runtime {
     #[cfg(test)]
     pub(crate) fn try_ordinary_field_immediate_write(
         &self,
-        base: &Value,
+        base: &JsValue,
         executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
         index: u32,
-        value: &Value,
+        value: &JsValue,
     ) -> bool {
         use crate::engine::heap::SlotReleaseReadiness;
         if !matches!(
             value,
-            Value::Undefined | Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+            JsValue::Undefined
+                | JsValue::Null
+                | JsValue::Bool(_)
+                | JsValue::Int(_)
+                | JsValue::Float(_)
+                | JsValue::ShortBigInt(_)
         ) {
             return false;
         }
         let Some(atom) = linked_field_atom(self, executable, index) else {
             return false;
         };
-        let Value::Object(object) = base else {
+        let JsValue::Object(object) = base else {
             return false;
         };
         if !matches!(
-            self.slot_value_release_readiness(base),
+            self.slot_value_release_readiness_jsvalue(base),
             Ok(SlotReleaseReadiness::Ready)
         ) {
             return false;
@@ -1015,7 +1132,7 @@ impl Runtime {
         let Ok(mut state) = self.0.state.try_borrow_mut() else {
             return false;
         };
-        let id = object.object_id();
+        let id = *object;
         let Ok(data) = state.heap.object(id) else {
             return false;
         };
@@ -1034,9 +1151,9 @@ impl Runtime {
         if immediate_value(old).is_none() {
             return false;
         }
-        let Ok(raw) = self.raw_property_value(value) else {
-            return false;
-        };
+        // `value` was matched to a scalar above, so this id copy allocates
+        // nothing and never takes the state borrow the caller still holds.
+        let raw = value.as_raw();
         // The canonical transaction validates shape storage before publication.
         // With scalar old/new values it retains/releases no edges or atoms;
         // the already-empty zero queue makes post-commit cleanup infallible.
@@ -1050,55 +1167,58 @@ impl Runtime {
     /// Every decline leaves owners and storage untouched; the general property
     /// lookup retains all missing/exotic/reference-valued cases.
     #[cfg(test)]
-    pub(crate) fn try_dense_array_immediate_read(&self, base: &Value, index: u32) -> Option<Value> {
+    pub(crate) fn try_dense_array_immediate_read(
+        &self,
+        base: &JsValue,
+        index: u32,
+    ) -> Option<JsValue> {
         self.try_array_immediate_read_kind(base, index, false)
     }
 
     /// One release proof and heap borrow select either existing array kernel.
-    pub(crate) fn try_array_immediate_read(&self, base: &Value, index: u32) -> Option<Value> {
+    pub(crate) fn try_array_immediate_read(&self, base: &JsValue, index: u32) -> Option<JsValue> {
         self.try_array_immediate_read_kind(base, index, true)
     }
 
     fn try_array_immediate_read_kind(
         &self,
-        base: &Value,
+        base: &JsValue,
         index: u32,
         include_typed: bool,
-    ) -> Option<Value> {
+    ) -> Option<JsValue> {
         use crate::engine::heap::SlotReleaseReadiness;
-        let Value::Object(object) = base else {
+        let JsValue::Object(object) = base else {
             return None;
         };
         if !matches!(
-            self.slot_value_release_readiness(base),
+            self.slot_value_release_readiness_jsvalue(base),
             Ok(SlotReleaseReadiness::Ready)
         ) {
             return None;
         }
         let mut state = self.0.state.try_borrow_mut().ok()?;
-        let data = state.heap.object(object.object_id()).ok()?;
+        let data = state.heap.object(*object).ok()?;
         if matches!(
             (data.kind, &data.payload),
             (ObjectKind::Array, ObjectPayload::Array { .. })
         ) {
-            return immediate_value(data.dense_array_value(index)?);
+            return immediate_value_jsvalue(data.dense_array_value(index)?);
         }
         if !include_typed {
             return None;
         }
         if matches!(data.payload, ObjectPayload::Arguments { .. }) {
             let atom = Atom::from_immediate_integer(index)?;
-            let slot = locate(&state, object.object_id(), atom).ok()??;
+            let slot = locate(&state, *object, atom).ok()??;
             return match &data.slots[slot.index] {
-                PropertySlot::Data(value) => immediate_value(value),
+                PropertySlot::Data(value) => immediate_value_jsvalue(value),
                 PropertySlot::VarRef(cell) => {
-                    immediate_value(&state.heap.var_ref(*cell).ok()?.value)
+                    immediate_value_jsvalue(&state.heap.var_ref(*cell).ok()?.value)
                 }
                 PropertySlot::Accessor { .. } | PropertySlot::AutoInit(_) => None,
             };
         }
-        let value =
-            Self::typed_array_number_read_in_heap(&mut state.heap, object.object_id(), index)?;
+        let value = Self::typed_array_number_read_in_heap(&mut state.heap, *object, index)?;
         #[cfg(feature = "profiling")]
         crate::engine::api::profiling::record_owned_execution_event("typed_array_number_read_leaf");
         Some(value)
@@ -1120,23 +1240,22 @@ mod dense_array_read_tests {
     #[test]
     fn dense_array_read_leaf_reads_scalars_without_changing_owners() {
         let runtime = Runtime::new();
-        let base = receiver(&runtime, "[undefined,null,true,17,-0,NaN]");
-        let keep = base.clone();
-        let Value::Object(object) = &base else {
+        let base = runtime
+            .into_jsvalue(receiver(&runtime, "[undefined,null,true,17,-0,1n,NaN]"))
+            .unwrap();
+        let keep = runtime.dup_jsvalue(&base).unwrap();
+        let JsValue::Object(object) = &base else {
             panic!("array");
         };
-        let count = runtime
-            .0
-            .state
-            .borrow()
-            .heap
-            .object_strong_count(object.object_id());
+        let object = *object;
+        let count = runtime.0.state.borrow().heap.object_strong_count(object);
         for (index, expected) in [
             Value::Undefined,
             Value::Null,
             Value::Bool(true),
             Value::Int(17),
             Value::Float(-0.0),
+            Value::BigInt(crate::engine::value::bigint::JsBigInt::one()),
         ]
         .iter()
         .enumerate()
@@ -1144,31 +1263,24 @@ mod dense_array_read_tests {
             let result = runtime
                 .try_dense_array_immediate_read(&base, index as u32)
                 .unwrap();
-            assert!(result.same_quickjs_representation(expected));
+            assert!(
+                runtime
+                    .root_value(&result)
+                    .unwrap()
+                    .same_quickjs_representation(expected)
+            );
         }
         assert!(
-            matches!(runtime.try_dense_array_immediate_read(&base, 5), Some(Value::Float(v)) if v.is_nan())
+            matches!(runtime.try_dense_array_immediate_read(&base, 6), Some(JsValue::Float(v)) if v.is_nan())
         );
         assert_eq!(
-            runtime
-                .0
-                .state
-                .borrow()
-                .heap
-                .object_strong_count(object.object_id()),
+            runtime.0.state.borrow().heap.object_strong_count(object),
             count
         );
-        drop(keep);
+        runtime.release_jsvalue(keep).unwrap();
         assert!(runtime.try_dense_array_immediate_read(&base, 0).is_none());
-        assert!(
-            runtime
-                .0
-                .state
-                .borrow()
-                .heap
-                .object(object.object_id())
-                .is_ok()
-        );
+        assert!(runtime.0.state.borrow().heap.object(object).is_ok());
+        runtime.release_jsvalue(base).unwrap();
     }
 
     #[test]
@@ -1179,51 +1291,39 @@ mod dense_array_read_tests {
             "Object.defineProperty([1], '0', {writable:false})",
             "[{}]",
             "['x']",
-            "[1n]",
+            // Short BigInts are edge-free; this case must retain a heap payload.
+            "[9223372036854775808n]",
             "[Symbol()]",
             "new Proxy([1], {get(){throw 72}})",
             "new Uint8Array([1])",
             "({0:1,length:1})",
         ] {
             let runtime = Runtime::new();
-            let base = receiver(&runtime, expression);
-            let keep = base.clone();
-            let Value::Object(object) = &base else {
+            let base = runtime
+                .into_jsvalue(receiver(&runtime, expression))
+                .unwrap();
+            let keep = runtime.dup_jsvalue(&base).unwrap();
+            let JsValue::Object(object) = &base else {
                 panic!("object");
             };
-            let count = runtime
-                .0
-                .state
-                .borrow()
-                .heap
-                .object_strong_count(object.object_id());
-            assert!(
-                runtime.try_dense_array_immediate_read(&base, 0).is_none(),
-                "{expression}"
-            );
-            assert_eq!(
-                runtime
-                    .0
-                    .state
-                    .borrow()
-                    .heap
-                    .object_strong_count(object.object_id()),
-                count
-            );
-            assert!(
-                runtime
-                    .0
-                    .state
-                    .borrow()
-                    .heap
-                    .object(object.object_id())
-                    .is_ok()
-            );
-            drop(keep);
+            let object = *object;
+            let count = runtime.0.state.borrow().heap.object_strong_count(object);
+            let result = runtime.try_dense_array_immediate_read(&base, 0);
+            let declined = result.is_none();
+            if let Some(value) = result {
+                runtime.release_jsvalue(value).unwrap();
+            }
+            let count_after = runtime.0.state.borrow().heap.object_strong_count(object);
+            let still_live = runtime.0.state.borrow().heap.object(object).is_ok();
+            runtime.release_jsvalue(keep).unwrap();
+            runtime.release_jsvalue(base).unwrap();
+            assert!(declined, "{expression}");
+            assert_eq!(count_after, count);
+            assert!(still_live);
         }
         let runtime = Runtime::new();
-        let base = receiver(&runtime, "[1]");
-        let _keep = base.clone();
+        let base = runtime.into_jsvalue(receiver(&runtime, "[1]")).unwrap();
+        let keep = runtime.dup_jsvalue(&base).unwrap();
         assert!(runtime.try_dense_array_immediate_read(&base, 1).is_none());
         assert!(
             runtime
@@ -1232,14 +1332,20 @@ mod dense_array_read_tests {
         );
         let other = Runtime::new();
         assert!(other.try_dense_array_immediate_read(&base, 0).is_none());
+        runtime.release_jsvalue(keep).unwrap();
+        runtime.release_jsvalue(base).unwrap();
     }
 
     #[test]
     fn dense_array_read_leaf_keeps_frozen_materialized_values_on_canonical_path() {
         let runtime = Runtime::new();
         let mut context = runtime.new_context();
-        let base = context
-            .eval("globalThis.frozenRead = Object.freeze([7, -0])")
+        let base = runtime
+            .into_jsvalue(
+                context
+                    .eval("globalThis.frozenRead = Object.freeze([7, -0])")
+                    .unwrap(),
+            )
             .unwrap();
         runtime.run_gc().unwrap();
         assert!(runtime.try_dense_array_immediate_read(&base, 0).is_none());
@@ -1249,13 +1355,14 @@ mod dense_array_read_tests {
                 .unwrap(),
             Value::Bool(true)
         );
+        runtime.release_jsvalue(base).unwrap();
     }
 
     #[test]
     fn dense_array_read_leaf_does_not_drain_deferred_or_borrowed_state() {
         let runtime = Runtime::new();
-        let base = receiver(&runtime, "[1]");
-        let _keep = base.clone();
+        let base = runtime.into_jsvalue(receiver(&runtime, "[1]")).unwrap();
+        let keep = runtime.dup_jsvalue(&base).unwrap();
         {
             let _borrow = runtime.0.state.borrow();
             assert!(runtime.try_dense_array_immediate_read(&base, 0).is_none());
@@ -1273,8 +1380,10 @@ mod dense_array_read_tests {
         runtime.run_gc().unwrap();
         assert!(matches!(
             runtime.try_dense_array_immediate_read(&base, 0),
-            Some(Value::Int(1))
+            Some(JsValue::Int(1))
         ));
+        runtime.release_jsvalue(keep).unwrap();
+        runtime.release_jsvalue(base).unwrap();
     }
 }
 
@@ -1282,6 +1391,7 @@ mod dense_array_read_tests {
 mod ordinary_field_leaf_tests {
     use super::*;
     use crate::engine::code::{bytecode::Instruction, runtime::PublishedFunctionSnapshot};
+    use crate::engine::object::OrdinaryRead;
 
     fn executable(runtime: &Runtime, field: &str) -> (PublishedFunctionSnapshot, u32) {
         let mut context = runtime.new_context();
@@ -1309,6 +1419,12 @@ mod ordinary_field_leaf_tests {
         (executable, index)
     }
 
+    fn release_read(runtime: &Runtime, read: Option<OrdinaryRead>) {
+        if let Some(OrdinaryRead::Complete(Some(value))) = read {
+            runtime.release_jsvalue(value).unwrap();
+        }
+    }
+
     #[test]
     fn ordinary_field_leaf_preserves_scalar_values_flags_and_declines_nonlocal_rules() {
         let runtime = Runtime::new();
@@ -1321,9 +1437,10 @@ mod ordinary_field_leaf_tests {
             "({x:42})",
             "({x:1.5})",
             "({x:-0})",
+            "({x:42n})",
         ] {
-            let base = context.eval(source).unwrap();
-            let _retained = base.clone();
+            let base = runtime.into_jsvalue(context.eval(source).unwrap()).unwrap();
+            let retained = runtime.dup_jsvalue(&base).unwrap();
             assert!(
                 runtime
                     .try_ordinary_field_immediate_read(&base, &executable, index)
@@ -1333,12 +1450,14 @@ mod ordinary_field_leaf_tests {
                 &base,
                 &executable,
                 index,
-                &Value::Int(17)
+                &JsValue::Int(17)
             ));
             assert_eq!(
                 runtime.try_ordinary_field_immediate_read(&base, &executable, index),
-                Some(Value::Int(17))
+                Some(JsValue::Int(17))
             );
+            runtime.release_jsvalue(retained).unwrap();
+            runtime.release_jsvalue(base).unwrap();
         }
         for source in [
             "({get x(){throw 42}})",
@@ -1346,50 +1465,53 @@ mod ordinary_field_leaf_tests {
             "new Proxy({x:42},{get(){throw 42},set(){throw 42}})",
             "({x:{}})",
             "({x:'text'})",
-            "({x:42n})",
+            // Heap BigInts still decline; Short BigInts are covered above.
+            "({x:9223372036854775808n})",
             "({x:Symbol()})",
             "([])",
             "new Uint8Array(1)",
             "globalThis",
         ] {
-            let base = context.eval(source).unwrap();
-            let _retained = base.clone();
-            assert!(
-                runtime
-                    .try_ordinary_field_immediate_read(&base, &executable, index)
-                    .is_none(),
-                "{source}"
+            let base = runtime.into_jsvalue(context.eval(source).unwrap()).unwrap();
+            let retained = runtime.dup_jsvalue(&base).unwrap();
+            let result = runtime.try_ordinary_field_immediate_read(&base, &executable, index);
+            let read_declined = result.is_none();
+            if let Some(value) = result {
+                runtime.release_jsvalue(value).unwrap();
+            }
+            let write_declined = !runtime.try_ordinary_field_immediate_write(
+                &base,
+                &executable,
+                index,
+                &JsValue::Int(17),
             );
-            assert!(
-                !runtime.try_ordinary_field_immediate_write(
-                    &base,
-                    &executable,
-                    index,
-                    &Value::Int(17)
-                ),
-                "{source}"
-            );
+            runtime.release_jsvalue(retained).unwrap();
+            runtime.release_jsvalue(base).unwrap();
+            assert!(read_declined, "{source}");
+            assert!(write_declined, "{source}");
         }
         for source in [
             "Object.freeze({x:42})",
             "Object.defineProperty({},'x',{value:42,writable:false})",
         ] {
-            let base = context.eval(source).unwrap();
-            let _retained = base.clone();
+            let base = runtime.into_jsvalue(context.eval(source).unwrap()).unwrap();
+            let retained = runtime.dup_jsvalue(&base).unwrap();
             assert_eq!(
                 runtime.try_ordinary_field_immediate_read(&base, &executable, index),
-                Some(Value::Int(42))
+                Some(JsValue::Int(42))
             );
             assert!(!runtime.try_ordinary_field_immediate_write(
                 &base,
                 &executable,
                 index,
-                &Value::Int(17)
+                &JsValue::Int(17)
             ));
             assert_eq!(
                 runtime.try_ordinary_field_immediate_read(&base, &executable, index),
-                Some(Value::Int(42))
+                Some(JsValue::Int(42))
             );
+            runtime.release_jsvalue(retained).unwrap();
+            runtime.release_jsvalue(base).unwrap();
         }
     }
 
@@ -1400,14 +1522,21 @@ mod ordinary_field_leaf_tests {
         let mut context = runtime.new_context();
         let (code, index) = executable(&runtime, "x");
         let (foreign_code, foreign_index) = executable(&foreign, "x");
-        let base = context.eval("({x:42})").unwrap();
+        let base = runtime
+            .into_jsvalue(context.eval("({x:42})").unwrap())
+            .unwrap();
         assert!(
             runtime
                 .try_ordinary_field_immediate_read(&base, &code, index)
                 .is_none()
         );
-        assert!(!runtime.try_ordinary_field_immediate_write(&base, &code, index, &Value::Int(17)));
-        let _retained = base.clone();
+        assert!(!runtime.try_ordinary_field_immediate_write(
+            &base,
+            &code,
+            index,
+            &JsValue::Int(17)
+        ));
+        let retained = runtime.dup_jsvalue(&base).unwrap();
         assert!(
             runtime
                 .try_ordinary_field_immediate_read(&base, &foreign_code, foreign_index)
@@ -1417,7 +1546,7 @@ mod ordinary_field_leaf_tests {
             &base,
             &foreign_code,
             foreign_index,
-            &Value::Int(17)
+            &JsValue::Int(17)
         ));
         assert!(
             runtime
@@ -1442,7 +1571,7 @@ mod ordinary_field_leaf_tests {
                 &base,
                 &code,
                 index,
-                &Value::Int(17)
+                &JsValue::Int(17)
             ));
             drop(queued);
         }
@@ -1451,21 +1580,28 @@ mod ordinary_field_leaf_tests {
                 .try_ordinary_field_immediate_read(&base, &code, index)
                 .is_none()
         );
-        assert!(!runtime.try_ordinary_field_immediate_write(&base, &code, index, &Value::Int(17)));
+        assert!(!runtime.try_ordinary_field_immediate_write(
+            &base,
+            &code,
+            index,
+            &JsValue::Int(17)
+        ));
         assert!(runtime.0.deferred_references.has_pending());
         runtime.drain_deferred_references().unwrap();
         assert_eq!(
             runtime.try_ordinary_field_immediate_read(&base, &code, index),
-            Some(Value::Int(42))
+            Some(JsValue::Int(42))
         );
-        let object_value = Value::Object(runtime.new_object(None).unwrap());
+        let object_value = runtime
+            .into_jsvalue(Value::Object(runtime.new_object(None).unwrap()))
+            .unwrap();
         assert!(!runtime.try_ordinary_field_immediate_write(&base, &code, index, &object_value));
         assert_eq!(
             runtime.try_ordinary_field_immediate_read(&base, &code, index),
-            Some(Value::Int(42))
+            Some(JsValue::Int(42))
         );
         let (lazy_code, lazy_index) = executable(&runtime, "min");
-        let math = context.eval("Math").unwrap();
+        let math = runtime.into_jsvalue(context.eval("Math").unwrap()).unwrap();
         assert!(
             runtime
                 .try_ordinary_field_immediate_read(&math, &lazy_code, lazy_index)
@@ -1475,12 +1611,16 @@ mod ordinary_field_leaf_tests {
             &math,
             &lazy_code,
             lazy_index,
-            &Value::Int(17)
+            &JsValue::Int(17)
         ));
         assert!(matches!(
             context.eval("typeof Math.min").unwrap(),
             Value::String(_)
         ));
+        runtime.release_jsvalue(retained).unwrap();
+        runtime.release_jsvalue(base).unwrap();
+        runtime.release_jsvalue(object_value).unwrap();
+        runtime.release_jsvalue(math).unwrap();
     }
     #[test]
     fn recovery_length_leaf_preserves_utf16_brand_and_final_owner_boundaries() {
@@ -1488,108 +1628,180 @@ mod ordinary_field_leaf_tests {
         let mut context = runtime.new_context();
         let (code, index) = executable(&runtime, "length");
         for (source, expected) in [("[1,,3]", 3), ("'a\\ud83d\\ude00'", 3)] {
-            let base = context.eval(source).unwrap();
-            let retained = base.clone();
-            assert_eq!(
-                runtime.try_ordinary_field_immediate_read(&base, &code, index),
-                Some(Value::Int(expected))
-            );
-            drop(retained);
+            let base = runtime.into_jsvalue(context.eval(source).unwrap()).unwrap();
+            let retained = runtime.dup_jsvalue(&base).unwrap();
+            let actual = runtime
+                .try_ordinary_field_immediate_read(&base, &code, index)
+                .unwrap();
+            assert_eq!(runtime.root_value(&actual).unwrap(), Value::Int(expected));
+            runtime.release_jsvalue(retained).unwrap();
+            runtime.release_jsvalue(base).unwrap();
         }
-        let proxy = context.eval("new Proxy([], {get(){throw 91}})").unwrap();
-        let _retained = proxy.clone();
+        let proxy = runtime
+            .into_jsvalue(context.eval("new Proxy([], {get(){throw 91}})").unwrap())
+            .unwrap();
+        let proxy_retained = runtime.dup_jsvalue(&proxy).unwrap();
         assert!(
             runtime
                 .try_ordinary_field_immediate_read(&proxy, &code, index)
                 .is_none()
         );
-        let unique = Value::String(crate::engine::value::JsString::from_owned_utf16(vec![
-            97, 0xd800,
-        ]));
-        assert!(
-            runtime
-                .try_ordinary_field_immediate_read(&unique, &code, index)
-                .is_none()
-        );
-        let retained = unique.clone();
-        assert_eq!(
-            runtime.try_ordinary_field_immediate_read(&unique, &code, index),
-            Some(Value::Int(2))
-        );
-        drop(retained);
+        let unique = runtime
+            .into_jsvalue(Value::String(
+                crate::engine::value::JsString::from_owned_utf16(vec![97, 0xd800]),
+            ))
+            .unwrap();
+        // A final string owner is ready when retirement cannot allocate.
+        drop(runtime.new_object(None).unwrap());
+        let keep_capacity = runtime.new_object(None).unwrap();
+        let unique_read = runtime.try_ordinary_field_immediate_read(&unique, &code, index);
+        let unique_retained = runtime.dup_jsvalue(&unique).unwrap();
+        let actual = runtime
+            .try_ordinary_field_immediate_read(&unique, &code, index)
+            .unwrap();
+        assert_eq!(runtime.root_value(&actual).unwrap(), Value::Int(2));
+        runtime.release_jsvalue(proxy_retained).unwrap();
+        runtime.release_jsvalue(proxy).unwrap();
+        runtime.release_jsvalue(unique_retained).unwrap();
+        runtime.release_jsvalue(unique).unwrap();
+        drop(keep_capacity);
+        assert_eq!(unique_read, Some(JsValue::Int(2)));
     }
 
     #[test]
     fn recovery_arguments_leaf_reads_current_cell_and_declines_redefinitions() {
         let runtime = Runtime::new();
         let mut context = runtime.new_context();
-        let base = context
-            .eval(
-                "globalThis.args=(function(a){globalThis.change=x=>a=x;return arguments})(1);args",
+        let base = runtime
+            .into_jsvalue(
+                context
+                    .eval(
+                        "globalThis.args=(function(a){globalThis.change=x=>a=x;return arguments})(1);args",
+                    )
+                    .unwrap(),
             )
             .unwrap();
-        let _retained = base.clone();
+        let retained = runtime.dup_jsvalue(&base).unwrap();
         assert_eq!(
             runtime.try_array_immediate_read(&base, 0),
-            Some(Value::Int(1))
+            Some(JsValue::Int(1))
         );
-        context.eval("change(7)").unwrap();
+        drop(context.eval("change(7)").unwrap());
         assert_eq!(
             runtime.try_array_immediate_read(&base, 0),
-            Some(Value::Int(7))
+            Some(JsValue::Int(7))
         );
-        context
-            .eval("Object.defineProperty(args,'0',{value:8,writable:false});change(9)")
-            .unwrap();
+        drop(
+            context
+                .eval("Object.defineProperty(args,'0',{value:8,writable:false});change(9)")
+                .unwrap(),
+        );
         assert_eq!(
             runtime.try_array_immediate_read(&base, 0),
-            Some(Value::Int(8))
+            Some(JsValue::Int(8))
         );
-        context
-            .eval("Object.defineProperty(args,'0',{get(){return 11},configurable:true})")
-            .unwrap();
+        drop(
+            context
+                .eval("Object.defineProperty(args,'0',{get(){return 11},configurable:true})")
+                .unwrap(),
+        );
         assert!(runtime.try_array_immediate_read(&base, 0).is_none());
         assert_eq!(context.eval("args[0]").unwrap(), Value::Int(11));
-        context.eval("delete args[0]").unwrap();
+        drop(context.eval("delete args[0]").unwrap());
         assert!(runtime.try_array_immediate_read(&base, 0).is_none());
+        runtime.release_jsvalue(retained).unwrap();
+        runtime.release_jsvalue(base).unwrap();
     }
 
     #[test]
     fn linked_native_fact_is_bound_to_the_selected_callee_not_a_property_cache() {
         use crate::engine::builtins::native::{MathMinMaxKind, NativeFunctionId};
-        use crate::engine::object::OrdinaryRead;
         let runtime = Runtime::new();
         let mut context = runtime.new_context();
         let (code, index) = executable(&runtime, "x");
-        let base = context
-            .eval("globalThis.selectedNative={x:Math.min};selectedNative")
+        let base = runtime
+            .into_jsvalue(
+                context
+                    .eval("globalThis.selectedNative={x:Math.min};selectedNative")
+                    .unwrap(),
+            )
             .unwrap();
         let mut fact = None;
-        let Some(OrdinaryRead::Complete(Some(Value::Object(callee)))) = runtime
+        let Some(OrdinaryRead::Complete(Some(value))) = runtime
             .prepare_linked_own_read_selected(&base, &code, index, Some(&mut fact))
             .unwrap()
         else {
             panic!("own native")
         };
-        context.eval("selectedNative.x=Math.max").unwrap();
-        let data = fact.take().unwrap().into_parts(&callee).unwrap();
+        let Value::Object(callee) = runtime.root_and_release_jsvalue(value).unwrap() else {
+            panic!("own native")
+        };
+        drop(context.eval("selectedNative.x=Math.max").unwrap());
+        let data = fact
+            .take()
+            .unwrap()
+            .into_parts_jsvalue(callee.runtime(), callee.object_id())
+            .unwrap();
         assert_eq!(
             data.target,
             NativeFunctionId::MathMinMax(MathMinMaxKind::Min)
         );
-        let _new_read = runtime
-            .prepare_linked_own_read_selected(&base, &code, index, Some(&mut fact))
-            .unwrap();
-        assert!(fact.take().unwrap().into_parts(&callee).is_none());
-        let _new_read = runtime
-            .prepare_linked_own_read_selected(&base, &code, index, Some(&mut fact))
-            .unwrap();
+        release_read(
+            &runtime,
+            runtime
+                .prepare_linked_own_read_selected(&base, &code, index, Some(&mut fact))
+                .unwrap(),
+        );
+        assert!(
+            fact.take()
+                .unwrap()
+                .into_parts_jsvalue(callee.runtime(), callee.object_id())
+                .is_none()
+        );
+        release_read(
+            &runtime,
+            runtime
+                .prepare_linked_own_read_selected(&base, &code, index, Some(&mut fact))
+                .unwrap(),
+        );
         let foreign = Runtime::new();
         let mut foreign_context = foreign.new_context();
         let Value::Object(foreign_callee) = foreign_context.eval("Math.max").unwrap() else {
             panic!("native")
         };
-        assert!(fact.take().unwrap().into_parts(&foreign_callee).is_none());
+        assert!(
+            fact.take()
+                .unwrap()
+                .into_parts_jsvalue(foreign_callee.runtime(), foreign_callee.object_id())
+                .is_none()
+        );
+        runtime.release_jsvalue(base).unwrap();
+    }
+
+    #[test]
+    fn borrowed_fallback_read_preserves_inherited_getter_and_receiver_owner() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let base = runtime
+            .into_jsvalue(
+                context
+                    .eval("({__proto__: {get x(){return this.marker}}, marker: 7})")
+                    .unwrap(),
+            )
+            .unwrap();
+        let key = runtime.intern_property_key("x").unwrap();
+        let read = runtime
+            .prepare_value_property_read_borrowed_jsvalue(context.realm, &base, &key)
+            .unwrap();
+        assert!(matches!(&read, OrdinaryRead::Call { .. }));
+        runtime.release_jsvalue(base).unwrap();
+        let result = runtime
+            .finish_prepared_read_jsvalue(context.realm, &key, read)
+            .unwrap();
+        assert!(matches!(
+            result,
+            crate::engine::value::conversion::NativeConversion::Value(Some(JsValue::Int(7)))
+        ));
     }
 
     #[test]
@@ -1605,9 +1817,11 @@ mod ordinary_field_leaf_tests {
             .unwrap()
             .unwrap();
         assert_eq!(context.eval("readLog").unwrap(), Value::Int(0));
-        context
-            .eval("Object.defineProperty(o,'x',{get(){throw 99}})")
-            .unwrap();
+        drop(
+            context
+                .eval("Object.defineProperty(o,'x',{get(){throw 99}})")
+                .unwrap(),
+        );
         let key = PropertyKey::from_borrowed_atom(
             runtime.clone(),
             code.property_key_atoms.as_ref().unwrap()[index as usize],

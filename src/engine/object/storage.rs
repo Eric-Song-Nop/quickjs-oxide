@@ -1,17 +1,19 @@
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
-use crate::engine::atom::Atom;
+use crate::engine::atom::{Atom, AtomIdx};
 use crate::engine::code::function::metadata::ClosureVariableKind;
+use crate::engine::heap::ownership::ConvertedValue;
 use crate::engine::heap::roots::VarRefRoot;
 use crate::engine::heap::runtime::RuntimeState;
 
 use crate::engine::heap::{ObjectId, ObjectPayload, PropertySlot, RawValue, ShapeId};
+use crate::engine::object::property::CompletePropertyDescriptor;
 use crate::engine::object::shape::{PropertyFlags, ShapeEntry};
 use crate::engine::object::{
     AccessorValue, CompleteOrdinaryPropertyDescriptor, DescriptorField, ObjectRef,
     OrdinaryPropertyDescriptor, PropertyKey, properties,
 };
-use crate::engine::value::Value;
+use crate::engine::value::{JsValue, Value};
 
 /// One-use missing selection minted only by the storage transaction below.
 /// It never leaves that exclusive RuntimeState borrow or enters a VM/JS state.
@@ -99,47 +101,67 @@ impl Runtime {
         if !object.belongs_to(self) {
             return Err(RuntimeError::WrongRuntime("IsHTMLDDA value"));
         }
-        Ok(self
-            .0
-            .state
-            .borrow()
-            .heap
-            .object(object.object_id())?
-            .is_html_dda)
+        self.value_is_html_dda_jsvalue(&JsValue::Object(object.object_id()))
     }
 
-    /// Test `[[Call]]` without creating a capability handle or entering a
-    /// public runtime operation. Fused bytecode predicates use this after the
-    /// HTMLDDA check, matching QuickJS's allocation-free tag path.
-    pub(crate) fn value_is_callable(&self, value: &Value) -> Result<bool, RuntimeError> {
-        let Value::Object(object) = value else {
+    pub(crate) fn value_is_html_dda_jsvalue(&self, value: &JsValue) -> Result<bool, RuntimeError> {
+        let JsValue::Object(id) = value else {
             return Ok(false);
         };
-        if !object.belongs_to(self) {
-            return Err(RuntimeError::WrongRuntime("callable value"));
-        }
-        let state = self.0.state.borrow();
-        let object = state.heap.object(object.object_id())?;
-        Ok(matches!(
-            &object.payload,
-            ObjectPayload::NativeFunction { .. }
-                | ObjectPayload::BoundFunction { .. }
-                | ObjectPayload::BytecodeFunction { .. }
-                | ObjectPayload::Proxy(crate::engine::heap::ProxyData {
-                    is_callable: true,
-                    ..
-                })
-        ))
+        Ok(self.0.state.borrow().heap.object(*id)?.is_html_dda)
     }
 
     /// Apply ECMAScript `ToBoolean`, including QuickJS's Annex B falsy
-    /// `is_HTMLDDA` object exception.
-    pub(crate) fn value_to_boolean(&self, value: &Value) -> Result<bool, RuntimeError> {
-        if self.value_is_html_dda(value)? {
-            Ok(false)
-        } else {
-            Ok(value.to_boolean_primitive())
+    /// `is_HTMLDDA` object exception, to an internal value.
+    pub(crate) fn value_to_boolean_jsvalue(&self, value: &JsValue) -> Result<bool, RuntimeError> {
+        match value {
+            JsValue::Object(id) => Ok(!self.0.state.borrow().heap.object(*id)?.is_html_dda),
+            JsValue::String(id) => Ok(!self.0.state.borrow().heap.string(*id)?.is_empty()),
+            JsValue::BigInt(id) => Ok(!self.0.state.borrow().heap.bigint(*id)?.is_zero()),
+            _ => Ok(value.to_boolean_primitive()),
         }
+    }
+
+    /// Strict equality over internal values: handle identity is the fast path;
+    /// string and BigInt handles fall back to arena content comparison.
+    pub(crate) fn strict_equal_jsvalue(
+        &self,
+        left: &JsValue,
+        right: &JsValue,
+    ) -> Result<bool, RuntimeError> {
+        Ok(match (left, right) {
+            (JsValue::Undefined, JsValue::Undefined) | (JsValue::Null, JsValue::Null) => true,
+            (JsValue::Bool(left), JsValue::Bool(right)) => left == right,
+            (JsValue::Int(left), JsValue::Int(right)) => left == right,
+            (JsValue::Symbol(left), JsValue::Symbol(right)) => left == right,
+            (JsValue::Object(left), JsValue::Object(right)) => left == right,
+            (JsValue::String(left), JsValue::String(right)) => {
+                if left == right {
+                    true
+                } else {
+                    let state = self.0.state.borrow();
+                    state.heap.string(*left)? == state.heap.string(*right)?
+                }
+            }
+            (JsValue::ShortBigInt(left), JsValue::ShortBigInt(right)) => left == right,
+            (JsValue::ShortBigInt(value), JsValue::BigInt(id))
+            | (JsValue::BigInt(id), JsValue::ShortBigInt(value)) => {
+                self.0.state.borrow().heap.bigint(*id)?
+                    == &crate::engine::value::bigint::JsBigInt::from(*value)
+            }
+            (JsValue::BigInt(left), JsValue::BigInt(right)) => {
+                if left == right {
+                    true
+                } else {
+                    let state = self.0.state.borrow();
+                    state.heap.bigint(*left)? == state.heap.bigint(*right)?
+                }
+            }
+            (left, right) => match (left.as_number(), right.as_number()) {
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            },
+        })
     }
 
     /// Mirror `JS_SetIsHTMLDDA` for a runtime-owned object.
@@ -156,20 +178,61 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) fn raw_property_value(&self, value: &Value) -> Result<RawValue, RuntimeError> {
-        Ok(match value {
+    /// Convert a public value into its heap-stored form at a boundary.
+    ///
+    /// String and heap BigInt payloads allocate one arena node each (API input
+    /// conversion is a genuine creation point); short BigInts stay immediate.
+    /// The returned guard owns that
+    /// one producer-owned node edge and releases it on `Drop` unless the
+    /// caller adopts it: clone with [`ConvertedValue::raw`] for a store that
+    /// retained its own copy edge, [`ConvertedValue::take`] for a sink that
+    /// owns and releases the edge itself, or [`ConvertedValue::disarm`] for a
+    /// by-value owner that releases it later.  Object edges and Symbol atoms
+    /// are *not* retained here — the historical contract stands:
+    /// transactional stores retain object and string/BigInt edges, and
+    /// Symbol/Private atoms are retained by the store's atom accounting or
+    /// explicitly by transfer points.
+    ///
+    /// This conversion takes its own state borrow; callers must not hold one.
+    pub(crate) fn raw_property_value(
+        &self,
+        value: &Value,
+    ) -> Result<ConvertedValue<'_>, RuntimeError> {
+        let raw = match value {
             Value::Undefined => RawValue::Undefined,
             Value::Null => RawValue::Null,
             Value::Bool(value) => RawValue::Bool(*value),
             Value::Int(value) => RawValue::Int(*value),
             Value::Float(value) => RawValue::Float(*value),
-            Value::BigInt(value) => RawValue::BigInt(value.clone()),
-            Value::String(value) => RawValue::String(value.clone()),
+            Value::BigInt(value) if value.as_i64().is_some() => {
+                RawValue::ShortBigInt(value.as_i64().expect("short BigInt"))
+            }
+            Value::BigInt(value) => {
+                let mut state = self.0.state.borrow_mut();
+                let id = state.heap.allocate_bigint(value.clone())?;
+                #[cfg(debug_assertions)]
+                if std::env::var("QJS_TRACE_BIGINT_ID")
+                    .is_ok_and(|value| format!("{id:?}").contains(&format!("index: {value},")))
+                {
+                    eprintln!(
+                        "[raw-b] {id:?}\n{}",
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+                RawValue::BigInt(id)
+            }
+            Value::String(value) => {
+                let mut state = self.0.state.borrow_mut();
+                let id = state.heap.allocate_string(value.clone())?;
+                RawValue::String(id)
+            }
             Value::Symbol(symbol) => {
                 if !symbol.belongs_to(self) {
                     return Err(RuntimeError::WrongRuntime("property value"));
                 }
-                RawValue::Symbol(symbol.atom())
+                let atom = symbol.atom();
+                let index = self.0.state.borrow().atoms.unbrand(atom)?;
+                RawValue::Symbol(index)
             }
             Value::Object(object) => {
                 if !object.belongs_to(self) {
@@ -177,7 +240,8 @@ impl Runtime {
                 }
                 RawValue::Object(object.object_id())
             }
-        })
+        };
+        Ok(ConvertedValue::new(self, raw))
     }
 
     pub(crate) fn store_complete_property(
@@ -185,6 +249,49 @@ impl Runtime {
         object: &ObjectRef,
         key: &PropertyKey,
         complete: CompleteOrdinaryPropertyDescriptor,
+    ) -> Result<(), RuntimeError> {
+        let converted = match &complete {
+            CompleteOrdinaryPropertyDescriptor::Data { value, .. } => {
+                Some(self.raw_property_value(value)?)
+            }
+            CompleteOrdinaryPropertyDescriptor::Accessor { .. } => None,
+        };
+        let complete = match &complete {
+            CompleteOrdinaryPropertyDescriptor::Data {
+                writable,
+                enumerable,
+                configurable,
+                ..
+            } => CompletePropertyDescriptor::Data {
+                value: converted.as_ref().expect("converted data").raw(),
+                writable: *writable,
+                enumerable: *enumerable,
+                configurable: *configurable,
+            },
+            CompleteOrdinaryPropertyDescriptor::Accessor {
+                get,
+                set,
+                enumerable,
+                configurable,
+            } => CompletePropertyDescriptor::Accessor {
+                get: get
+                    .as_ref()
+                    .map(|v| RawValue::Object(v.as_object().object_id())),
+                set: set
+                    .as_ref()
+                    .map(|v| RawValue::Object(v.as_object().object_id())),
+                enumerable: *enumerable,
+                configurable: *configurable,
+            },
+        };
+        self.store_complete_raw_property(object, key, complete)
+    }
+
+    pub(crate) fn store_complete_raw_property(
+        &self,
+        object: &ObjectRef,
+        key: &PropertyKey,
+        complete: CompletePropertyDescriptor<RawValue>,
     ) -> Result<(), RuntimeError> {
         let global_hidden = {
             let state = self.0.state.borrow();
@@ -229,45 +336,52 @@ impl Runtime {
             }
         };
         if let Some(hidden) = global_hidden {
-            return self.store_complete_global_property(object, hidden, key, complete);
+            return self.store_complete_global_raw_property(object, hidden, key, complete);
         }
 
         let (flags, replacement) = match complete {
-            CompleteOrdinaryPropertyDescriptor::Data {
+            CompletePropertyDescriptor::Data {
                 value,
                 writable,
                 enumerable,
                 configurable,
             } => (
                 PropertyFlags::data(writable, enumerable, configurable),
-                PropertySlot::Data(self.raw_property_value(&value)?),
+                PropertySlot::Data(value),
             ),
-            CompleteOrdinaryPropertyDescriptor::Accessor {
+            CompletePropertyDescriptor::Accessor {
                 get,
                 set,
                 enumerable,
                 configurable,
-            } => (
-                PropertyFlags::accessor(enumerable, configurable),
-                PropertySlot::Accessor {
-                    get: get.as_ref().map(|value| value.as_object().object_id()),
-                    set: set.as_ref().map(|value| value.as_object().object_id()),
-                },
-            ),
+            } => {
+                let id = |value| match value {
+                    None => Ok(None),
+                    Some(RawValue::Object(id)) => Ok(Some(id)),
+                    _ => Err(RuntimeError::Invariant("raw accessor is not an object")),
+                };
+                (
+                    PropertyFlags::accessor(enumerable, configurable),
+                    PropertySlot::Accessor {
+                        get: id(get)?,
+                        set: id(set)?,
+                    },
+                )
+            }
         };
         self.store_property_slot(object, key, flags, replacement)
     }
 
-    pub(crate) fn store_complete_global_property(
+    pub(crate) fn store_complete_global_raw_property(
         &self,
         object: &ObjectRef,
         hidden_id: ObjectId,
         key: &PropertyKey,
-        complete: CompleteOrdinaryPropertyDescriptor,
+        complete: CompletePropertyDescriptor<RawValue>,
     ) -> Result<(), RuntimeError> {
         let hidden = ObjectRef::from_borrowed_handle(self.clone(), hidden_id)?;
         match complete {
-            CompleteOrdinaryPropertyDescriptor::Data {
+            CompletePropertyDescriptor::Data {
                 value,
                 writable,
                 enumerable,
@@ -280,7 +394,12 @@ impl Runtime {
                     None
                 };
                 let root = if let Some(root) = global_root {
-                    self.write_var_ref(&root, value)?;
+                    self.write_var_ref(
+                        &root,
+                        self.dup_jsvalue(&JsValue::from_raw(value.clone()).ok_or(
+                            RuntimeError::Invariant("global data held internal sentinel"),
+                        )?)?,
+                    )?;
                     root
                 } else if let Some(root) = hidden_root {
                     if !self.delete_property(&hidden, key)? {
@@ -288,10 +407,22 @@ impl Runtime {
                             "hidden global VarRef property was not configurable",
                         ));
                     }
-                    self.write_var_ref(&root, value)?;
+                    self.write_var_ref(
+                        &root,
+                        self.dup_jsvalue(&JsValue::from_raw(value.clone()).ok_or(
+                            RuntimeError::Invariant("global data held internal sentinel"),
+                        )?)?,
+                    )?;
                     root
                 } else {
-                    self.new_var_ref(value, false, !writable, ClosureVariableKind::Normal)?
+                    self.new_var_ref(
+                        self.dup_jsvalue(&JsValue::from_raw(value.clone()).ok_or(
+                            RuntimeError::Invariant("global data held internal sentinel"),
+                        )?)?,
+                        false,
+                        !writable,
+                        ClosureVariableKind::Normal,
+                    )?
                 };
                 self.set_var_ref_metadata(&root, false, !writable, ClosureVariableKind::Normal)?;
                 self.store_property_slot(
@@ -301,7 +432,7 @@ impl Runtime {
                     PropertySlot::VarRef(root.id()),
                 )
             }
-            CompleteOrdinaryPropertyDescriptor::Accessor {
+            CompletePropertyDescriptor::Accessor {
                 get,
                 set,
                 enumerable,
@@ -335,8 +466,14 @@ impl Runtime {
                     key,
                     PropertyFlags::accessor(enumerable, configurable),
                     PropertySlot::Accessor {
-                        get: get.as_ref().map(|value| value.as_object().object_id()),
-                        set: set.as_ref().map(|value| value.as_object().object_id()),
+                        get: get.map(|value| match value {
+                            RawValue::Object(id) => id,
+                            _ => unreachable!("validated accessor"),
+                        }),
+                        set: set.map(|value| match value {
+                            RawValue::Object(id) => id,
+                            _ => unreachable!("validated accessor"),
+                        }),
                     },
                 )
             }
@@ -353,7 +490,7 @@ impl Runtime {
             let state = self.0.state.borrow();
             let object = state.heap.object(object.object_id())?;
             let shape = state.heap.shape(object.shape)?;
-            let Some(index) = shape.find(key.atom()) else {
+            let Some(index) = shape.find(AtomIdx::from_raw(key.atom().raw())) else {
                 return Ok(None);
             };
             match object.slots.get(index as usize) {
@@ -387,7 +524,7 @@ impl Runtime {
             let object_data = state.heap.object(object_id)?;
             let shape = state.heap.shape(object_data.shape)?;
             shape
-                .find(key.atom())
+                .find(AtomIdx::from_raw(key.atom().raw()))
                 .map(|index| {
                     let index = index as usize;
                     let entry = shape.entries().get(index).ok_or(RuntimeError::Invariant(
@@ -464,7 +601,13 @@ impl RuntimeState {
             );
         }
         if existing.is_none() && !dictionary {
-            let target = state.append_transition(shape_id, ShapeEntry { atom, flags })?;
+            let target = state.append_transition(
+                shape_id,
+                ShapeEntry {
+                    atom: AtomIdx::from_raw(atom.raw()),
+                    flags,
+                },
+            )?;
             let mut slots = state.heap.object(object_id)?.slots.clone();
             slots.push(replacement);
             return state.replace_layout_with_owned_shape(object_id, target, slots);
@@ -485,7 +628,10 @@ impl RuntimeState {
             entries[index].flags = flags;
             slots[index] = replacement;
         } else {
-            entries.push(ShapeEntry { atom, flags });
+            entries.push(ShapeEntry {
+                atom: AtomIdx::from_raw(atom.raw()),
+                flags,
+            });
             slots.push(replacement);
         }
         state.replace_layout(object_id, prototype, &entries, slots)
@@ -510,7 +656,14 @@ mod selected_append_tests {
         let mut state = runtime.0.state.borrow_mut();
         let shape = state.heap.object(owner.object_id()).unwrap().shape;
         assert_eq!(state.heap.shape_strong_count(shape), Ok(1));
-        assert!(state.heap.shape(shape).unwrap().find(key.atom()).is_none());
+        assert!(
+            state
+                .heap
+                .shape(shape)
+                .unwrap()
+                .find(AtomIdx::from_raw(key.atom().raw()))
+                .is_none()
+        );
         let before_atoms = state.atoms.resolve(key.atom()).unwrap().ref_count;
         let fingerprint = state.shape_fingerprints.get(&shape).unwrap().clone();
         let selected = SelectedMissingAppend {

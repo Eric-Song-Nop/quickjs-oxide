@@ -797,6 +797,14 @@ fn assert_script_true(context: &mut Context, source: &str) {
     assert_eq!(context.eval(source).unwrap(), Value::Bool(true));
 }
 
+#[track_caller]
+fn assert_returned_completion(runtime: &Runtime, completion: Completion, expected: Value) {
+    let Completion::Return(value) = completion else {
+        panic!("expected Completion::Return");
+    };
+    assert_eq!(runtime.root_and_release_jsvalue(value).unwrap(), expected);
+}
+
 fn eval_dynamic_import(context: &mut Context, source: &str, filename: &str) -> ObjectRef {
     let Value::Object(promise) = context.eval_with_filename(source, filename).unwrap() else {
         panic!("dynamic import did not return an object");
@@ -873,7 +881,7 @@ fn assert_static_loader_exception(
     let module = context
         .compile_module_with_filename(source, "pkg/entry.js")
         .unwrap();
-    context.execute_module(&module).unwrap();
+    drop(context.execute_module(&module).unwrap());
     assert_script_true(&mut context, "__abruptRetry === 42");
     let expected_loads = usize::from(phase == AbruptLoaderPhase::Load) + 1;
     assert_eq!(loads.borrow().len(), expected_loads);

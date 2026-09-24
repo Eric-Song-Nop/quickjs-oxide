@@ -5,7 +5,7 @@ use crate::engine::heap::{
     AsyncFunctionPhase, AsyncFunctionResumeKind, ContextId, InternalCallableData,
 };
 use crate::engine::object::{CallableRef, ObjectRef};
-use crate::engine::value::Value;
+use crate::engine::value::{JsValue, Value};
 use crate::engine::vm::{
     Completion, VmSuspendKind,
     suspend::{EncodedVmActivation, RootedVmActivation, VmActivationResume, VmRunOutcome},
@@ -22,7 +22,7 @@ pub(crate) struct AsyncResume {
     pending_effect: AsyncStepPending,
     runtime: Runtime,
     state: ObjectRef,
-    output: Value,
+    output: JsValue,
     phase: Phase,
     active: bool,
 }
@@ -43,7 +43,7 @@ impl AsyncResume {
             pending_effect: AsyncStepPending::default(),
             runtime: runtime.clone(),
             state,
-            output: Value::Object(capability.promise),
+            output: runtime.into_jsvalue(Value::Object(capability.promise))?,
             phase: Phase::Body,
             active: true,
         }))
@@ -53,7 +53,7 @@ impl AsyncResume {
             pending_effect: AsyncStepPending::default(),
             runtime: runtime.clone(),
             state,
-            output: Value::Undefined,
+            output: JsValue::Undefined,
             phase: Phase::Body,
             active: true,
         })
@@ -141,15 +141,24 @@ impl AsyncResume {
     ) -> Result<AsyncStep, RuntimeError> {
         match std::mem::replace(&mut self.phase, Phase::Body) {
             Phase::Body => self.body(VmRunOutcome::Complete(completion)),
-            Phase::Settled => self.finish(), // Consume either JS completion from the internal resolving pair.
-            Phase::Await(activation) => {
+            Phase::Settled => {
+                // The internal resolving pair's reply is ignored, including a
+                // stack-overflow throw. It still owns one value edge.
+                let (Completion::Return(value) | Completion::Throw(value)) = completion;
+                self.runtime.release_jsvalue(value)?;
+                self.finish()
+            }
+            Phase::Await(mut activation) => {
                 let promise = match completion {
                     Completion::Throw(reason) => return self.settle(Completion::Throw(reason)),
-                    Completion::Return(Value::Object(promise)) => promise,
-                    Completion::Return(_) => {
-                        return Err(RuntimeError::Invariant(
-                            "intrinsic PromiseResolve returned a non-object",
-                        ));
+                    Completion::Return(value) => {
+                        let JsValue::Object(promise) = value else {
+                            self.runtime.release_jsvalue(value)?;
+                            return Err(RuntimeError::Invariant(
+                                "intrinsic PromiseResolve returned a non-object",
+                            ));
+                        };
+                        ObjectRef::from_owned_handle(self.runtime.clone(), promise)
                     }
                 };
                 let realm = self
@@ -175,7 +184,7 @@ impl AsyncResume {
                 let fulfill = make_resume(AsyncFunctionResumeKind::Fulfill)?;
                 let reject = make_resume(AsyncFunctionResumeKind::Reject)?;
                 self.runtime
-                    .store_async_function_activation(&self.state, &activation)?;
+                    .store_async_function_activation(&self.state, &mut activation)?;
                 self.runtime
                     .perform_promise_then_without_capability(realm, &promise, &fulfill, &reject)?;
                 self.active = false;
@@ -183,11 +192,11 @@ impl AsyncResume {
             }
         }
     }
+    // Consume the suspended resume box here, keeping its payload out of the step transport.
+    #[allow(clippy::boxed_local)]
     fn finish(mut self: Box<Self>) -> Result<AsyncStep, RuntimeError> {
-        Ok(AsyncStep::Complete(Completion::Return(std::mem::replace(
-            &mut self.output,
-            Value::Undefined,
-        ))))
+        let output = std::mem::replace(&mut self.output, JsValue::Undefined);
+        Ok(AsyncStep::Complete(Completion::Return(output)))
     }
 }
 impl Drop for AsyncResume {
@@ -195,6 +204,9 @@ impl Drop for AsyncResume {
         if self.active {
             let _ = self.runtime.complete_async_function_state(&self.state);
         }
+        let output = std::mem::replace(&mut self.output, JsValue::Undefined);
+        let _ = self.runtime.release_jsvalue(output);
+        self.pending_effect.release_owned(&self.runtime);
     }
 }
 impl AsyncStep {
@@ -248,10 +260,26 @@ mod tests {
 struct AsyncStepPending {
     run_activation: Option<Box<RootedVmActivation>>,
     run_input: Option<VmActivationResume>,
-    resolve_value: Option<Value>,
+    resolve_value: Option<JsValue>,
     resolve_realm: Option<ContextId>,
     call_callable: Option<CallableRef>,
-    call_value: Option<Value>,
+    call_value: Option<JsValue>,
+}
+impl AsyncStepPending {
+    fn release_owned(&mut self, runtime: &Runtime) {
+        if let Some(value) = self.resolve_value.take() {
+            let _ = runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.call_value.take() {
+            let _ = runtime.release_jsvalue(value);
+        }
+        if let Some(
+            VmActivationResume::AwaitFulfill(value) | VmActivationResume::AwaitReject(value),
+        ) = self.run_input.take()
+        {
+            let _ = runtime.release_jsvalue(value);
+        }
+    }
 }
 impl AsyncStep {
     pub(crate) fn request_run(
@@ -264,7 +292,7 @@ impl AsyncStep {
         Self::Run { resume }
     }
     pub(crate) fn request_resolve(
-        value: Value,
+        value: JsValue,
         realm: ContextId,
         mut resume: Box<AsyncResume>,
     ) -> Self {
@@ -274,7 +302,7 @@ impl AsyncStep {
     }
     pub(crate) fn request_call(
         callable: CallableRef,
-        value: Value,
+        value: JsValue,
         mut resume: Box<AsyncResume>,
     ) -> Self {
         resume.pending_effect.call_callable = Some(callable);
@@ -295,7 +323,7 @@ impl AsyncResume {
             .take()
             .expect("AsyncStep Run input")
     }
-    pub(crate) fn take_resolve_value(&mut self) -> Value {
+    pub(crate) fn take_resolve_value(&mut self) -> JsValue {
         self.pending_effect
             .resolve_value
             .take()
@@ -313,7 +341,7 @@ impl AsyncResume {
             .take()
             .expect("AsyncStep Call callable")
     }
-    pub(crate) fn take_call_value(&mut self) -> Value {
+    pub(crate) fn take_call_value(&mut self) -> JsValue {
         self.pending_effect
             .call_value
             .take()

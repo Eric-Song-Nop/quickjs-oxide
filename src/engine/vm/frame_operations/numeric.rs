@@ -23,29 +23,40 @@ impl NumericProgress {
 /// Commit in the original previous/value order. Pending owners remain outside
 /// RunSlots even if authentication or a later push fails.
 pub(in crate::engine::vm) fn commit_output(
+    runtime: &Runtime,
     execution: &mut RunningExecution,
     id: FrameId,
-    value: crate::engine::value::Value,
-    previous: Option<crate::engine::value::Value>,
+    value: crate::engine::value::JsValue,
+    previous: Option<crate::engine::value::JsValue>,
     _depth: usize,
 ) -> Result<(), Error> {
-    let frame = execution.frames.current_mut(id)?;
     let mut value = Some(value);
     let mut previous = previous;
-    {
-        let mut slots = execution.slots.run_window(&mut frame.window)?;
-        if previous.is_some() {
-            slots.push_pending(&mut previous)?;
+    let result = (|| {
+        let frame = execution.frames.current_mut(id)?;
+        let resume_pc = frame
+            .fault_pc
+            .checked_add(1)
+            .ok_or_else(|| Error::internal("numeric resume PC overflow"))?;
+        {
+            let mut slots = execution.slots.run_window(&mut frame.window)?;
+            if previous.is_some() {
+                slots.push_pending(&mut previous)?;
+            }
+            slots.push_pending(&mut value)?;
         }
-        slots.push_pending(&mut value)?;
+        frame.resume_pc = resume_pc;
+        #[cfg(feature = "profiling")]
+        crate::engine::api::profiling::record_owned_instruction(_depth);
+        Ok(())
+    })();
+    if let Some(value) = value {
+        let _ = runtime.release_jsvalue(value);
     }
-    frame.resume_pc = frame
-        .fault_pc
-        .checked_add(1)
-        .ok_or_else(|| Error::internal("numeric resume PC overflow"))?;
-    #[cfg(feature = "profiling")]
-    crate::engine::api::profiling::record_owned_instruction(_depth);
-    Ok(())
+    if let Some(value) = previous {
+        let _ = runtime.release_jsvalue(value);
+    }
+    result
 }
 
 pub(in crate::engine::vm) fn try_complete_primitive(
@@ -54,17 +65,18 @@ pub(in crate::engine::vm) fn try_complete_primitive(
     id: FrameId,
     kind: NumericKind,
 ) -> Result<Option<NumericProgress>, Error> {
-    use crate::engine::value::Value;
+    use crate::engine::value::JsValue;
     let frame = execution.frames.current_mut(id)?;
     let realm = frame.executable.realm;
     let depth = execution.slots.depth(&frame.window);
+    let fault_pc = frame.fault_pc;
     let mut transaction = execution.slots.frame_transaction(&mut frame.window)?;
     let (left, right) = {
         let mut slots = transaction.slots();
         // A malformed stack declines untouched: the canonical outer entry must
         // still pop RHS before reporting a missing LHS.
         for offset in 0..if kind.unary() { 1 } else { 2 } {
-            if matches!(slots.peek(offset), Err(_) | Ok(Value::Object(_))) {
+            if matches!(slots.peek(offset), Err(_) | Ok(JsValue::Object(_))) {
                 return Ok(None);
             }
         }
@@ -79,7 +91,7 @@ pub(in crate::engine::vm) fn try_complete_primitive(
         }
     };
     if !kind.primitive_arithmetic() {
-        return match NumericStep::start(kind, left, right) {
+        return match NumericStep::start(runtime, kind, left, right) {
             Ok(step) => crate::engine::vm::proxy_get_driver::start_numeric(
                 runtime, execution, id, step, depth,
             )
@@ -88,28 +100,38 @@ pub(in crate::engine::vm) fn try_complete_primitive(
                 .map(|step| Some(NumericProgress::Deferred(step))),
         };
     }
-    let output = match crate::engine::vm::numeric::operation::primitive_output(kind, left, right) {
-        Ok(output) => output,
-        Err(error) => {
-            return crate::engine::vm::property_driver::throw_error(runtime, realm, error)
-                .map(|step| Some(NumericProgress::Deferred(step)));
-        }
-    };
+    let output =
+        match crate::engine::vm::numeric::operation::primitive_output(runtime, kind, left, right) {
+            Ok(output) => output,
+            Err(error) => {
+                return crate::engine::vm::property_driver::throw_error(runtime, realm, error)
+                    .map(|step| Some(NumericProgress::Deferred(step)));
+            }
+        };
     #[cfg(feature = "profiling")]
     crate::engine::api::profiling::record_owned_execution_event("numeric_completed_without_query");
     let mut value = Some(output.value);
     let mut previous = output.previous;
-    {
-        let mut slots = transaction.slots();
-        if previous.is_some() {
-            slots.push_pending(&mut previous)?;
+    let result: Result<usize, Error> = (|| {
+        let resume_pc = fault_pc
+            .checked_add(1)
+            .ok_or_else(|| Error::internal("numeric resume PC overflow"))?;
+        {
+            let mut slots = transaction.slots();
+            if previous.is_some() {
+                slots.push_pending(&mut previous)?;
+            }
+            slots.push_pending(&mut value)?;
         }
-        slots.push_pending(&mut value)?;
+        Ok(resume_pc)
+    })();
+    if let Some(value) = value {
+        let _ = runtime.release_jsvalue(value);
     }
-    frame.resume_pc = frame
-        .fault_pc
-        .checked_add(1)
-        .ok_or_else(|| Error::internal("numeric resume PC overflow"))?;
+    if let Some(value) = previous {
+        let _ = runtime.release_jsvalue(value);
+    }
+    frame.resume_pc = result?;
     #[cfg(feature = "profiling")]
     crate::engine::api::profiling::record_owned_instruction(depth);
     Ok(Some(NumericProgress::Completed))
@@ -129,9 +151,17 @@ pub(in crate::engine::vm) fn complete(
         (execution.slots.pop(&mut frame.window)?, None)
     } else {
         let right = execution.slots.pop(&mut frame.window)?;
-        (execution.slots.pop(&mut frame.window)?, Some(right))
+        match execution.slots.pop(&mut frame.window) {
+            Ok(left) => (left, Some(right)),
+            Err(error) => {
+                runtime
+                    .release_jsvalue(right)
+                    .map_err(crate::engine::vm::exception::runtime_error_to_vm_error)?;
+                return Err(error);
+            }
+        }
     };
-    let result = match NumericStep::start(kind, left, right) {
+    let result = match NumericStep::start(runtime, kind, left, right) {
         Ok(step) => {
             crate::engine::vm::proxy_get_driver::start_numeric(runtime, execution, id, step, depth)?
         }
@@ -150,6 +180,7 @@ pub(in crate::engine::vm) fn complete(
 #[cfg(test)]
 mod tests {
     use crate::engine::api::{Runtime, Value};
+    use crate::engine::value::JsValue;
 
     use super::*;
     use crate::engine::vm::{
@@ -207,7 +238,7 @@ mod tests {
         (execution, id)
     }
 
-    fn push(execution: &mut RunningExecution, id: FrameId, value: Value) {
+    fn push(execution: &mut RunningExecution, id: FrameId, value: JsValue) {
         let frame = execution.frames.current_mut(id).unwrap();
         execution.slots.push(&mut frame.window, value).unwrap();
     }
@@ -217,7 +248,7 @@ mod tests {
         let runtime = Runtime::new();
         let mut context = runtime.new_context();
         let (mut execution, id) = fixture(&runtime, &mut context);
-        push(&mut execution, id, Value::Int(7));
+        push(&mut execution, id, JsValue::Int(7));
         assert!(
             try_complete_primitive(&runtime, &mut execution, id, NumericKind::Mul)
                 .unwrap()
@@ -237,23 +268,31 @@ mod tests {
             let frame = execution.frames.current_mut(id).unwrap();
             if execution
                 .slots
-                .push(&mut frame.window, Value::Int(0))
+                .push(&mut frame.window, JsValue::Int(0))
                 .is_err()
             {
                 break;
             }
         }
         let frame = execution.frames.current_mut(id).unwrap();
-        execution.slots.pop(&mut frame.window).unwrap();
+        drop(execution.slots.pop(&mut frame.window).unwrap());
         let fault = frame.fault_pc;
         let resume = frame.resume_pc;
         assert!(
-            commit_output(&mut execution, id, Value::Int(99), Some(Value::Int(41)), 0).is_err()
+            commit_output(
+                &runtime,
+                &mut execution,
+                id,
+                JsValue::Int(99),
+                Some(JsValue::Int(41)),
+                0
+            )
+            .is_err()
         );
         let frame = execution.frames.current_mut(id).unwrap();
         assert_eq!(
             execution.slots.peek(&frame.window, 0).unwrap(),
-            &Value::Int(41)
+            &JsValue::Int(41)
         );
         assert_eq!((frame.fault_pc, frame.resume_pc), (fault, resume));
     }
@@ -266,7 +305,11 @@ mod tests {
         push(
             &mut execution,
             id,
-            Value::String(crate::engine::value::JsString::from_static("7")),
+            runtime
+                .into_jsvalue(Value::String(crate::engine::value::JsString::from_static(
+                    "7",
+                )))
+                .unwrap(),
         );
         {
             let frame = execution.frames.current_mut(id).unwrap();
@@ -300,15 +343,18 @@ mod tests {
             let frame = execution.frames.current_mut(id).unwrap();
             if execution
                 .slots
-                .push(&mut frame.window, Value::Int(0))
+                .push(&mut frame.window, JsValue::Int(0))
                 .is_err()
             {
                 break;
             }
         }
         let frame = execution.frames.current_mut(id).unwrap();
-        execution.slots.pop(&mut frame.window).unwrap();
-        execution.slots.push(&mut frame.window, text).unwrap();
+        drop(execution.slots.pop(&mut frame.window).unwrap());
+        execution
+            .slots
+            .push(&mut frame.window, runtime.into_jsvalue(text).unwrap())
+            .unwrap();
         let depth = execution.slots.depth(&frame.window);
         let before = (frame.fault_pc, frame.resume_pc);
         let realm = frame.executable.realm;
@@ -345,7 +391,7 @@ mod tests {
             let slots = transaction.slots();
             assert_eq!(
                 slots.peek(0).unwrap(),
-                &Value::Int(41),
+                &JsValue::Int(41),
                 "previous commits before value fails"
             );
         }
@@ -367,8 +413,8 @@ mod tests {
             .current_mut(id)
             .unwrap()
             .property_generation = u64::MAX;
-        push(&mut execution, id, Value::Int(6));
-        push(&mut execution, id, Value::Int(7));
+        push(&mut execution, id, JsValue::Int(6));
+        push(&mut execution, id, JsValue::Int(7));
         assert!(matches!(
             try_complete_primitive(&runtime, &mut execution, id, NumericKind::Mul).unwrap(),
             Some(NumericProgress::Completed)
@@ -377,24 +423,29 @@ mod tests {
         assert_eq!(frame.property_generation, u64::MAX);
         assert_eq!(
             execution.slots.pop(&mut frame.window).unwrap(),
-            Value::Int(42)
+            JsValue::Int(42)
         );
         assert!(matches!(
             crate::engine::vm::proxy_get_driver::start_numeric(
                 &runtime,
                 &mut execution,
                 id,
-                NumericStep::Throw(Value::Int(17)),
+                NumericStep::Throw(JsValue::Int(17)),
                 0
             )
             .unwrap(),
             NumericProgress::Deferred(CallStep::Complete(crate::engine::vm::Completion::Throw(
-                Value::Int(17)
+                JsValue::Int(17)
             )))
         ));
         let object = runtime.new_object(None).unwrap();
-        let step =
-            NumericStep::start(NumericKind::Plus, Value::Object(object.clone()), None).unwrap();
+        let step = NumericStep::start(
+            &runtime,
+            NumericKind::Plus,
+            JsValue::Object(object.object_id()),
+            None,
+        )
+        .unwrap();
         assert!(
             crate::engine::vm::proxy_get_driver::start_numeric(
                 &runtime,
@@ -405,7 +456,7 @@ mod tests {
             )
             .is_err()
         );
-        push(&mut execution, id, Value::Object(object));
+        push(&mut execution, id, JsValue::Object(object.into_handle()));
         let mut identity = u64::MAX;
         assert!(complete_primitives(&runtime, &mut execution, id, false, &mut identity).is_err());
         let frame = execution.frames.current_mut(id).unwrap();
@@ -417,21 +468,25 @@ mod tests {
         ));
         assert_eq!(identity, 11);
         let frame = execution.frames.current_mut(id).unwrap();
-        execution.slots.pop(&mut frame.window).unwrap();
+        runtime
+            .release_jsvalue(execution.slots.pop(&mut frame.window).unwrap())
+            .unwrap();
         let foreign = Runtime::new();
         push(
             &mut execution,
             id,
-            Value::Object(foreign.new_object(None).unwrap()),
+            JsValue::Object(foreign.new_object(None).unwrap().into_handle()),
         );
-        identity = u64::MAX;
-        let error = complete_primitives(&runtime, &mut execution, id, false, &mut identity)
-            .err()
-            .expect("foreign conversion operand must fail before identity issue");
-        assert!(error.to_string().contains("conversion operand"));
-        assert_eq!(identity, u64::MAX);
+        identity = 10;
+        assert!(matches!(
+            complete_primitives(&runtime, &mut execution, id, false, &mut identity).unwrap(),
+            PrimitiveCompletion::Declined
+        ));
+        assert_eq!(identity, 11);
         let frame = execution.frames.current_mut(id).unwrap();
-        assert_eq!(execution.slots.depth(&frame.window), 1);
+        let pending = execution.slots.pop(&mut frame.window).unwrap();
+        foreign.release_jsvalue(pending).unwrap();
+        assert_eq!(execution.slots.depth(&frame.window), 0);
     }
 
     #[test]
@@ -471,8 +526,16 @@ mod tests {
             .current_mut(id)
             .unwrap()
             .property_generation = u64::MAX;
-        push(&mut execution, id, Value::Object(target.clone()));
-        push(&mut execution, id, source.clone());
+        push(
+            &mut execution,
+            id,
+            JsValue::Object(target.clone().into_handle()),
+        );
+        push(
+            &mut execution,
+            id,
+            runtime.into_jsvalue(source.clone()).unwrap(),
+        );
         let result = crate::engine::vm::proxy_get_driver::start_object_copy(
             &runtime,
             &mut execution,
@@ -486,7 +549,12 @@ mod tests {
         );
         let frame = execution.frames.current_mut(id).unwrap();
         assert_eq!(execution.slots.depth(&frame.window), 2);
-        assert_eq!(execution.slots.peek(&frame.window, 0).unwrap(), &source);
+        assert_eq!(
+            runtime
+                .root_value(execution.slots.peek(&frame.window, 0).unwrap())
+                .unwrap(),
+            source
+        );
         assert_eq!(frame.property_generation, u64::MAX);
         // Classification may already have completed ordinary fresh-target
         // definitions. No selected getter was called or replayed to discover it.
@@ -521,8 +589,8 @@ mod tests {
                 .current_mut(id)
                 .unwrap()
                 .property_generation = u64::MAX;
-            push(&mut execution, id, target);
-            push(&mut execution, id, source);
+            push(&mut execution, id, runtime.into_jsvalue(target).unwrap());
+            push(&mut execution, id, runtime.into_jsvalue(source).unwrap());
             let result = crate::engine::vm::proxy_get_driver::start_object_copy(
                 &runtime,
                 &mut execution,

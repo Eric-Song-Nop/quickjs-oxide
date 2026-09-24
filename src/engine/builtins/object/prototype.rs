@@ -5,7 +5,7 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
     object::ObjectRef,
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
@@ -93,19 +93,20 @@ impl BuiltinPrototypeStep {
             _ => return Self::start(runtime, realm, kind, arguments),
         };
         if matches!(kind, BuiltinPrototypeKind::Setter) {
-            if matches!(receiver, Value::Null | Value::Undefined) {
+            if matches!(receiver, JsValue::Null | JsValue::Undefined) {
                 return not_object(runtime, realm);
             }
             let prototype = match arguments.readable.first().ok_or(RuntimeError::Invariant(
                 "prototype setter argv was not padded",
             ))? {
-                Value::Object(object) => Some(object.clone()),
-                Value::Null => None,
-                _ => return Ok(Self::Complete(Completion::Return(Value::Undefined))),
+                JsValue::Object(id) => Some(ObjectRef::from_borrowed_handle(runtime.clone(), *id)?),
+                JsValue::Null => None,
+                _ => return Ok(Self::Complete(Completion::Return(JsValue::Undefined))),
             };
-            let Value::Object(object) = receiver else {
-                return Ok(Self::Complete(Completion::Return(Value::Undefined)));
+            let JsValue::Object(id) = receiver else {
+                return Ok(Self::Complete(Completion::Return(JsValue::Undefined)));
             };
+            let object = ObjectRef::from_borrowed_handle(runtime.clone(), *id)?;
             return Ok(Self::Set {
                 object: object.clone(),
                 prototype,
@@ -119,16 +120,21 @@ impl BuiltinPrototypeStep {
         // isPrototypeOf checks the candidate before converting its receiver.
         let candidate = if matches!(kind, BuiltinPrototypeKind::IsPrototype) {
             match arguments.readable.first() {
-                Some(Value::Object(object)) => Some(object.clone()),
-                _ => return Ok(Self::Complete(Completion::Return(Value::Bool(false)))),
+                Some(JsValue::Object(id)) => {
+                    Some(ObjectRef::from_borrowed_handle(runtime.clone(), *id)?)
+                }
+                _ => return Ok(Self::Complete(Completion::Return(JsValue::Bool(false)))),
             }
         } else {
             None
         };
-        let object = match runtime.native_to_object(realm, receiver.clone())? {
-            NativeConversion::Value(object) => object,
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
-        };
+        let object =
+            match runtime.native_to_object_jsvalue(realm, runtime.dup_jsvalue(receiver)?)? {
+                NativeConversion::Value(object) => object,
+                NativeConversion::Throw(value) => {
+                    return Ok(Self::Complete(Completion::Throw(value)));
+                }
+            };
         Ok(Self::Get {
             object: candidate.unwrap_or_else(|| object.clone()),
             resume: BuiltinPrototypeResume(Box::new(BuiltinPrototypeResumeState {
@@ -155,11 +161,11 @@ impl BuiltinPrototypeStep {
                 }
                 _ => "Reflect target argv was not padded",
             }))?;
-        if matches!(target, Value::Null | Value::Undefined)
+        if matches!(target, JsValue::Null | JsValue::Undefined)
             || (matches!(
                 kind,
                 BuiltinPrototypeKind::ReflectGet | BuiltinPrototypeKind::ReflectSet
-            ) && !matches!(target, Value::Object(_)))
+            ) && !matches!(target, JsValue::Object(_)))
         {
             return not_object(runtime, realm);
         }
@@ -167,12 +173,13 @@ impl BuiltinPrototypeStep {
             kind,
             BuiltinPrototypeKind::ObjectGet | BuiltinPrototypeKind::ReflectGet
         ) {
-            let object = match runtime.native_to_object(realm, target.clone())? {
-                NativeConversion::Value(object) => object,
-                NativeConversion::Throw(value) => {
-                    return Ok(Self::Complete(Completion::Throw(value)));
-                }
-            };
+            let object =
+                match runtime.native_to_object_jsvalue(realm, runtime.dup_jsvalue(target)?)? {
+                    NativeConversion::Value(object) => object,
+                    NativeConversion::Throw(value) => {
+                        return Ok(Self::Complete(Completion::Throw(value)));
+                    }
+                };
             return Ok(Self::Get {
                 object: object.clone(),
                 resume: BuiltinPrototypeResume(Box::new(BuiltinPrototypeResumeState {
@@ -185,13 +192,16 @@ impl BuiltinPrototypeStep {
         let prototype = match arguments.readable.get(1).ok_or(RuntimeError::Invariant(
             "Object.setPrototypeOf prototype argv was not padded",
         ))? {
-            Value::Object(object) => Some(object.clone()),
-            Value::Null => None,
+            JsValue::Object(id) => Some(ObjectRef::from_borrowed_handle(runtime.clone(), *id)?),
+            JsValue::Null => None,
             _ => return not_object(runtime, realm),
         };
-        let Value::Object(object) = target else {
-            return Ok(Self::Complete(Completion::Return(target.clone())));
+        let JsValue::Object(id) = target else {
+            return Ok(Self::Complete(Completion::Return(
+                runtime.dup_jsvalue(target)?,
+            )));
         };
+        let object = ObjectRef::from_borrowed_handle(runtime.clone(), *id)?;
         Ok(Self::Set {
             object: object.clone(),
             prototype,
@@ -205,12 +215,13 @@ impl BuiltinPrototypeStep {
 }
 fn not_object(runtime: &Runtime, realm: ContextId) -> Result<BuiltinPrototypeStep, RuntimeError> {
     Ok(BuiltinPrototypeStep::Complete(Completion::Throw(
-        runtime.new_native_error(realm, NativeErrorKind::Type, "not an object")?,
+        runtime.new_native_error_jsvalue(realm, NativeErrorKind::Type, "not an object")?,
     )))
 }
 impl BuiltinPrototypeResume {
     pub(crate) fn prototype(
         self,
+        _runtime: &Runtime,
         result: NativeConversion<Option<ObjectRef>>,
     ) -> Result<BuiltinPrototypeStep, RuntimeError> {
         if !matches!(
@@ -220,6 +231,9 @@ impl BuiltinPrototypeResume {
                 | BuiltinPrototypeKind::Getter
                 | BuiltinPrototypeKind::IsPrototype
         ) {
+            if let NativeConversion::Throw(value) = result {
+                let _ = _runtime.release_jsvalue(value);
+            }
             return Err(RuntimeError::Invariant(
                 "prototype builtin received a Get reply for Set",
             ));
@@ -230,10 +244,10 @@ impl BuiltinPrototypeResume {
                     BuiltinPrototypeStep::Complete(Completion::Throw(value))
                 }
                 NativeConversion::Value(None) => {
-                    BuiltinPrototypeStep::Complete(Completion::Return(Value::Bool(false)))
+                    BuiltinPrototypeStep::Complete(Completion::Return(JsValue::Bool(false)))
                 }
                 NativeConversion::Value(Some(object)) if object == self.0.object => {
-                    BuiltinPrototypeStep::Complete(Completion::Return(Value::Bool(true)))
+                    BuiltinPrototypeStep::Complete(Completion::Return(JsValue::Bool(true)))
                 }
                 NativeConversion::Value(Some(object)) => BuiltinPrototypeStep::Get {
                     object,
@@ -243,7 +257,9 @@ impl BuiltinPrototypeResume {
         }
         Ok(BuiltinPrototypeStep::Complete(match result {
             NativeConversion::Value(prototype) => {
-                Completion::Return(prototype.map_or(Value::Null, Value::Object))
+                Completion::Return(prototype.map_or(JsValue::Null, |object| {
+                    JsValue::Object(object.into_handle())
+                }))
             }
             NativeConversion::Throw(value) => Completion::Throw(value),
         }))
@@ -255,7 +271,7 @@ impl BuiltinPrototypeResume {
     ) -> Result<BuiltinPrototypeStep, RuntimeError> {
         Ok(BuiltinPrototypeStep::Complete(match self.0.kind {
             BuiltinPrototypeKind::ReflectSet => match result {
-                NativeConversion::Value(value) => Completion::Return(Value::Bool(value)),
+                NativeConversion::Value(value) => Completion::Return(JsValue::Bool(value)),
                 NativeConversion::Throw(value) => Completion::Throw(value),
             },
             BuiltinPrototypeKind::ObjectSet | BuiltinPrototypeKind::Setter => {
@@ -263,9 +279,9 @@ impl BuiltinPrototypeResume {
                     Some(value) => Completion::Throw(value),
                     None => {
                         Completion::Return(if matches!(self.0.kind, BuiltinPrototypeKind::Setter) {
-                            Value::Undefined
+                            JsValue::Undefined
                         } else {
-                            Value::Object(self.0.object)
+                            JsValue::Object(self.0.object.into_handle())
                         })
                     }
                 }
@@ -287,7 +303,7 @@ pub(in crate::engine::builtins) fn finish(
         step = match step {
             BuiltinPrototypeStep::Complete(result) => return Ok(result),
             BuiltinPrototypeStep::Get { object, resume } => {
-                resume.prototype(runtime.internal_get_prototype_of(realm, &object)?)?
+                resume.prototype(runtime, runtime.internal_get_prototype_of(realm, &object)?)?
             }
             BuiltinPrototypeStep::Set {
                 object,

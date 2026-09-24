@@ -18,7 +18,7 @@ use crate::engine::heap::{
 };
 use crate::engine::object::shape::PropertyFlags;
 use crate::engine::object::{CallableRef, ObjectRef, PropertyKey, WellKnownSymbol};
-use crate::engine::value::Value;
+use crate::engine::value::{JsValue, Value};
 
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
@@ -28,16 +28,25 @@ mod operation;
 pub(crate) use operation::{AsyncGeneratorResume, AsyncGeneratorStep};
 
 struct RootedAsyncGeneratorRequest {
+    runtime: Runtime,
     completion: GeneratorResumeKind,
-    result: Value,
+    result: Option<JsValue>,
     _promise: ObjectRef,
-    resolve: CallableRef,
-    reject: CallableRef,
+    resolve: Option<CallableRef>,
+    reject: Option<CallableRef>,
+}
+
+impl Drop for RootedAsyncGeneratorRequest {
+    fn drop(&mut self) {
+        if let Some(value) = self.result.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
 }
 
 enum AsyncGeneratorSettlement {
-    Resolve { value: Value, done: bool },
-    Reject(Value),
+    Resolve { value: JsValue, done: bool },
+    Reject(JsValue),
 }
 
 impl Runtime {
@@ -175,9 +184,12 @@ impl Runtime {
     pub(super) fn allocate_async_generator_object(
         &self,
         prototype: &ObjectRef,
-        activation: EncodedVmActivation,
+        mut activation: EncodedVmActivation,
     ) -> Result<ObjectRef, RuntimeError> {
-        let atoms = activation.atoms();
+        let atoms = {
+            let state = self.0.state.borrow();
+            activation.atoms(&state.atoms)?
+        };
         let mut state = self.0.state.borrow_mut();
         let shape = state.get_or_create_shape(Some(prototype.object_id()), &[])?;
         let mut retained_atoms = Vec::with_capacity(atoms.len());
@@ -186,6 +198,7 @@ impl Runtime {
                 state.release_atoms(retained_atoms)?;
                 let cleanup = state.heap.release_shape(shape)?;
                 state.apply_cleanup(cleanup)?;
+                activation.release_conversion_edges(self);
                 return Err(error.into());
             }
             retained_atoms.push(atom);
@@ -200,11 +213,15 @@ impl Runtime {
                 state.release_atoms(retained_atoms)?;
                 let cleanup = state.heap.release_shape(shape)?;
                 state.apply_cleanup(cleanup)?;
+                activation.release_conversion_edges(self);
                 return Err(error.into());
             }
         };
         let cleanup = state.heap.release_shape(shape)?;
         state.apply_cleanup(cleanup)?;
+        // The async-generator object retained its own activation edges, so
+        // the caller-owned conversion edges can drop.
+        activation.release_conversion_edges(self);
         drop(state);
         drop(activation);
         Ok(ObjectRef::from_owned_handle(self.clone(), object))
@@ -217,42 +234,47 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        AsyncGeneratorStep::start(
-            self,
-            realm,
-            NativeFunctionId::AsyncGeneratorPrototypeResume(kind),
-            &invocation,
-            arguments,
-        )?
-        .finish(self)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            AsyncGeneratorStep::start(
+                self,
+                realm,
+                NativeFunctionId::AsyncGeneratorPrototypeResume(kind),
+                invocation,
+                arguments,
+            )?
+            .finish(self)
+        })
     }
 
     fn enqueue_async_generator_request(
         &self,
         generator: &ObjectRef,
         completion: GeneratorResumeKind,
-        result: Value,
+        result: JsValue,
         capability: &RootedPromiseCapability,
     ) -> Result<(), RuntimeError> {
-        self.validate_value_domain(&result, "AsyncGenerator request")?;
-        let result = self.raw_property_value(&result)?;
-        let request = AsyncGeneratorRequestData {
-            completion,
-            result: result.clone(),
-            promise: capability.promise.object_id(),
-            resolve: capability.resolve.as_object().object_id(),
-            reject: capability.reject.as_object().object_id(),
-        };
-        let mut state = self.0.state.borrow_mut();
-        let retained_atoms = state.retain_raw_value_atoms([&result])?;
-        if let Err(error) = state
-            .heap
-            .async_generator_enqueue(generator.object_id(), request)
-        {
-            state.release_atoms(retained_atoms)?;
-            return Err(error.into());
-        }
-        Ok(())
+        let outcome = (|| {
+            let raw = result.as_raw();
+            let request = AsyncGeneratorRequestData {
+                completion,
+                result: raw.clone(),
+                promise: capability.promise.object_id(),
+                resolve: capability.resolve.as_object().object_id(),
+                reject: capability.reject.as_object().object_id(),
+            };
+            let mut state = self.0.state.borrow_mut();
+            let retained_atoms = state.retain_raw_value_atoms([&raw])?;
+            if let Err(error) = state
+                .heap
+                .async_generator_enqueue(generator.object_id(), request)
+            {
+                state.release_atoms(retained_atoms)?;
+                return Err(error.into());
+            }
+            Ok(())
+        })();
+        self.release_jsvalue(result)?;
+        outcome
     }
 
     fn store_async_generator_suspension(
@@ -260,14 +282,18 @@ impl Runtime {
         generator: &ObjectRef,
         generator_state: AsyncGeneratorState,
         resume_realm: Option<ContextId>,
-        activation: &EncodedVmActivation,
+        activation: &mut EncodedVmActivation,
     ) -> Result<(), RuntimeError> {
-        let atoms = activation.atoms();
+        let atoms = {
+            let state = self.0.state.borrow();
+            activation.atoms(&state.atoms)?
+        };
         let mut state = self.0.state.borrow_mut();
         let mut retained_atoms = Vec::with_capacity(atoms.len());
         for atom in atoms {
             if let Err(error) = state.atoms.retain(atom) {
                 state.release_atoms(retained_atoms)?;
+                activation.release_conversion_edges(self);
                 return Err(error.into());
             }
             retained_atoms.push(atom);
@@ -279,8 +305,12 @@ impl Runtime {
             resume_realm,
         ) {
             state.release_atoms(retained_atoms)?;
+            activation.release_conversion_edges(self);
             return Err(error.into());
         }
+        // The heap record retained its own activation edges, so the
+        // caller-owned conversion edges can drop.
+        activation.release_conversion_edges(self);
         Ok(())
     }
 
@@ -309,14 +339,16 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        AsyncGeneratorStep::start(
-            self,
-            realm,
-            NativeFunctionId::AsyncGeneratorResume(target_kind),
-            &invocation,
-            arguments,
-        )?
-        .finish(self)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            AsyncGeneratorStep::start(
+                self,
+                realm,
+                NativeFunctionId::AsyncGeneratorResume(target_kind),
+                invocation,
+                arguments,
+            )?
+            .finish(self)
+        })
     }
 
     fn root_front_async_generator_request(
@@ -332,7 +364,6 @@ impl Runtime {
             .ok_or(RuntimeError::Invariant(
                 "AsyncGenerator request queue is empty",
             ))?;
-        let result = self.root_raw_value(&request.result)?;
         let promise = ObjectRef::from_borrowed_handle(self.clone(), request.promise)?;
         let resolve = ObjectRef::from_borrowed_handle(self.clone(), request.resolve)?;
         let resolve = self.as_callable(&resolve)?.ok_or(RuntimeError::Invariant(
@@ -342,12 +373,17 @@ impl Runtime {
         let reject = self.as_callable(&reject)?.ok_or(RuntimeError::Invariant(
             "AsyncGenerator request reject is not callable",
         ))?;
+        let value = JsValue::from_raw(request.result.clone()).ok_or(RuntimeError::Invariant(
+            "AsyncGenerator request contains an internal sentinel",
+        ))?;
+        let result = self.dup_jsvalue(&value)?;
         Ok(RootedAsyncGeneratorRequest {
+            runtime: self.clone(),
             completion: request.completion,
-            result,
+            result: Some(result),
             _promise: promise,
-            resolve,
-            reject,
+            resolve: Some(resolve),
+            reject: Some(reject),
         })
     }
 

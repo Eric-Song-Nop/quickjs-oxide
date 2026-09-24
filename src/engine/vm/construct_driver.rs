@@ -3,7 +3,7 @@
 //! use the same owned property query as other Get operations.
 use crate::engine::api::{error::Error, runtime::Runtime};
 use crate::engine::code::function::metadata::FunctionKind;
-use crate::engine::value::Value;
+use crate::engine::value::JsValue;
 use crate::engine::value::conversion::NativeConversion;
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{BytecodeCallRequest, CallableExecution};
@@ -22,8 +22,12 @@ pub(super) fn enter(
     let count = usize::from(count);
     let frame = execution.frames.current_mut(id)?;
     let realm = frame.executable.realm;
-    let target = execution.slots.peek(&frame.window, count + 1)?.clone();
-    let constructor = match runtime.constructor_from_value(realm, target) {
+    // The classifier consumes a duplicate; the slot owner retains its edge
+    // until `start_construct` consumes the operands.
+    let target = runtime
+        .dup_jsvalue(execution.slots.peek(&frame.window, count + 1)?)
+        .map_err(runtime_error_to_vm_error)?;
+    let constructor = match runtime.constructor_from_jsvalue(realm, target) {
         Ok(NativeConversion::Value(target)) => target,
         Ok(NativeConversion::Throw(value)) => {
             return Ok(CallStep::Complete(Completion::Throw(value)));
@@ -32,13 +36,19 @@ pub(super) fn enter(
             return super::driver::rejected_call(runtime, realm, runtime_error_to_vm_error(error));
         }
     };
-    let new_target = execution.slots.peek(&frame.window, count)?.clone();
+    let new_target = runtime
+        .dup_jsvalue(execution.slots.peek(&frame.window, count)?)
+        .map_err(runtime_error_to_vm_error)?;
     let mut arguments = Vec::new();
     arguments
         .try_reserve_exact(count)
         .map_err(|_| Error::internal("construct arguments allocation failed"))?;
     for offset in (0..count).rev() {
-        arguments.push(execution.slots.peek(&frame.window, offset)?.clone());
+        arguments.push(
+            runtime
+                .dup_jsvalue(execution.slots.peek(&frame.window, offset)?)
+                .map_err(runtime_error_to_vm_error)?,
+        );
     }
     super::proxy_get_driver::start_construct(
         runtime,
@@ -59,7 +69,7 @@ pub(super) fn enter_default_derived(
 ) -> Result<CallStep, Error> {
     let frame = execution.frames.current_mut(id)?;
     let realm = frame.executable.realm;
-    if matches!(frame.cold.input.new_target, Value::Undefined) {
+    if matches!(frame.cold.input.new_target, JsValue::Undefined) {
         return super::driver::rejected_call(
             runtime,
             realm,
@@ -73,18 +83,38 @@ pub(super) fn enter_default_derived(
     // constructor validation order, including null and non-constructor errors.
     let target = runtime
         .get_prototype_of(&frame.cold.function)
-        .map_err(runtime_error_to_vm_error)?
-        .map_or(Value::Null, Value::Object);
+        .map_err(runtime_error_to_vm_error)?;
     let arguments = execution
         .slots
         .snapshot_actual_arguments(&frame.window, runtime)?;
-    let new_target = frame.cold.input.new_target.clone();
-    let constructor = match runtime.constructor_from_value(realm, target) {
+    let new_target = runtime
+        .dup_jsvalue(&frame.cold.input.new_target)
+        .map_err(runtime_error_to_vm_error)?;
+    let target = target.map_or(JsValue::Null, |object| {
+        JsValue::Object(object.into_handle())
+    });
+    let constructor = match runtime.constructor_from_jsvalue(realm, target) {
         Ok(NativeConversion::Value(constructor)) => constructor,
         Ok(NativeConversion::Throw(value)) => {
+            runtime
+                .release_jsvalue(new_target)
+                .map_err(runtime_error_to_vm_error)?;
+            for argument in arguments {
+                runtime
+                    .release_jsvalue(argument)
+                    .map_err(runtime_error_to_vm_error)?;
+            }
             return Ok(CallStep::Complete(Completion::Throw(value)));
         }
         Err(error) => {
+            runtime
+                .release_jsvalue(new_target)
+                .map_err(runtime_error_to_vm_error)?;
+            for argument in arguments {
+                runtime
+                    .release_jsvalue(argument)
+                    .map_err(runtime_error_to_vm_error)?;
+            }
             return super::driver::rejected_call(runtime, realm, runtime_error_to_vm_error(error));
         }
     };
@@ -127,21 +157,24 @@ pub(super) fn initializer(
                 runtime
                     .install_class_instance_initializer(
                         realm,
-                        execution.slots.peek(&frame.window, 2)?.clone(),
-                        execution.slots.peek(&frame.window, 1)?.clone(),
-                        execution.slots.peek(&frame.window, 0)?.clone(),
+                        execution.slots.peek(&frame.window, 2)?,
+                        execution.slots.peek(&frame.window, 1)?,
+                        execution.slots.peek(&frame.window, 0)?,
                     )
                     .map_err(runtime_error_to_vm_error)?;
-                (None, Value::Undefined)
+                (None, JsValue::Undefined)
             }
             InitializerKind::Instance => {
-                let receiver = execution.slots.peek(&frame.window, 1)?.clone();
+                let receiver = execution.slots.peek(&frame.window, 1)?;
                 let callable = runtime
                     .begin_class_instance_initializer(
                         realm,
-                        execution.slots.peek(&frame.window, 0)?.clone(),
-                        &receiver,
+                        execution.slots.peek(&frame.window, 0)?,
+                        receiver,
                     )
+                    .map_err(runtime_error_to_vm_error)?;
+                let receiver = runtime
+                    .dup_jsvalue(receiver)
                     .map_err(runtime_error_to_vm_error)?;
                 (callable, receiver)
             }
@@ -149,21 +182,24 @@ pub(super) fn initializer(
                 let (callable, receiver) = runtime
                     .begin_class_static_initializer(
                         realm,
-                        execution.slots.peek(&frame.window, 1)?.clone(),
-                        execution.slots.peek(&frame.window, 0)?.clone(),
+                        execution.slots.peek(&frame.window, 1)?,
+                        execution.slots.peek(&frame.window, 0)?,
                     )
                     .map_err(runtime_error_to_vm_error)?;
                 (Some(callable), receiver)
             }
             InitializerKind::Block => {
-                let receiver = frame.cold.input.this_value.clone();
+                let receiver = &frame.cold.input.this_value;
                 let callable = runtime
                     .begin_class_static_block(
                         realm,
                         &frame.cold.function,
-                        &receiver,
-                        execution.slots.peek(&frame.window, 0)?.clone(),
+                        receiver,
+                        execution.slots.peek(&frame.window, 0)?,
                     )
+                    .map_err(runtime_error_to_vm_error)?;
+                let receiver = runtime
+                    .dup_jsvalue(receiver)
                     .map_err(runtime_error_to_vm_error)?;
                 (Some(callable), receiver)
             }
@@ -194,10 +230,19 @@ pub(super) fn initializer(
                     "authenticated class initializer is not ordinary bytecode",
                 ));
             }
+            if !execution.frames.can_push() || runtime.bytecode_call_would_overflow() {
+                runtime
+                    .release_jsvalue(receiver)
+                    .map_err(runtime_error_to_vm_error)?;
+                return runtime
+                    .bytecode_stack_overflow_completion(realm, &bytecode)
+                    .map(CallStep::Complete)
+                    .map_err(runtime_error_to_vm_error);
+            }
             Some(BytecodeCallRequest {
                 callable,
                 receiver,
-                new_target: Value::Undefined,
+                new_target: JsValue::Undefined,
                 arguments: Vec::new(),
                 bytecode,
                 closure_slots,
@@ -210,22 +255,20 @@ pub(super) fn initializer(
                 },
             })
         } else {
+            runtime
+                .release_jsvalue(receiver)
+                .map_err(runtime_error_to_vm_error)?;
             None
         };
-        if let Some(request) = &request {
-            if !execution.frames.can_push() || runtime.bytecode_call_would_overflow() {
-                return runtime
-                    .bytecode_stack_overflow_completion(realm, &request.bytecode)
-                    .map(CallStep::Complete)
-                    .map_err(runtime_error_to_vm_error);
-            }
-        }
         let frame = execution.frames.current_mut(id)?;
-        execution.slots.pop(&mut frame.window)?;
+        let discarded = execution.slots.pop(&mut frame.window)?;
         frame.resume_pc = frame
             .fault_pc
             .checked_add(1)
             .ok_or_else(|| Error::internal("initializer resume PC overflow"))?;
+        runtime
+            .release_jsvalue(discarded)
+            .map_err(runtime_error_to_vm_error)?;
         if let Some(request) = request {
             let entry = request.prepare(runtime, &mut execution.call_storage)?;
             push_frame(execution, entry)?;
@@ -243,7 +286,7 @@ pub(super) fn initializer(
             };
             Ok(CallStep::Complete(Completion::Throw(
                 runtime
-                    .new_native_error_from_error(realm, kind, &error)
+                    .new_native_error_from_error_jsvalue(realm, kind, &error)
                     .map_err(runtime_error_to_vm_error)?,
             )))
         }
@@ -266,25 +309,35 @@ pub(super) fn define_class(
     let frame = execution.frames.current_mut(id)?;
     let realm = frame.executable.realm;
     let parent = execution.slots.peek(&frame.window, 1)?;
-    let Some(BytecodeConstant::Value(RawValue::String(name))) = frame.executable.constant(name)
+    let Some(BytecodeConstant::Value(RawValue::String(name_id))) = frame.executable.constant(name)
     else {
         return Err(Error::internal("class name is not a published string"));
     };
-    if has_heritage && let Value::Object(parent) = parent {
+    // The bytecode node owns the constant-pool edge for this string, so the
+    // trusted read clones the payload Rc without retaining the arena node.
+    let name = runtime.0.state.borrow().heap.string_fast(*name_id).clone();
+    if has_heritage && let JsValue::Object(parent) = parent {
         let pending = PendingClass {
             frame: id,
             realm,
-            parent: parent.clone(),
-            constructor: execution.slots.peek(&frame.window, 0)?.clone(),
+            parent: crate::engine::object::ObjectRef::from_borrowed_handle(
+                runtime.clone(),
+                *parent,
+            )
+            .map_err(super::exception::heap_error_to_vm_error)?,
+            runtime: runtime.clone(),
+            constructor: runtime
+                .dup_jsvalue(execution.slots.peek(&frame.window, 0)?)
+                .map_err(runtime_error_to_vm_error)?,
             name: name.clone(),
         };
         return enter_class_parent(runtime, execution, pending);
     }
     let result = runtime.define_class_pair(
         realm,
-        parent.clone(),
-        execution.slots.peek(&frame.window, 0)?.clone(),
-        name,
+        parent,
+        execution.slots.peek(&frame.window, 0)?,
+        &name,
         has_heritage,
     );
     finish_class_result(runtime, execution, id, result)
@@ -305,8 +358,12 @@ fn finish_class_result(
     #[cfg(feature = "profiling")]
     let depth = execution.slots.depth(&frame.window);
     // No replay once the fresh constructor/prototype pair is published.
-    execution.slots.pop(&mut frame.window)?;
-    execution.slots.pop(&mut frame.window)?;
+    for _ in 0..2 {
+        let discarded = execution.slots.pop(&mut frame.window)?;
+        runtime
+            .release_jsvalue(discarded)
+            .map_err(runtime_error_to_vm_error)?;
+    }
     frame.resume_pc = frame
         .fault_pc
         .checked_add(1)
@@ -332,7 +389,7 @@ fn finish_class_result(
             };
             Ok(CallStep::Complete(Completion::Throw(
                 runtime
-                    .new_native_error_from_error(realm, kind, &error)
+                    .new_native_error_from_error_jsvalue(realm, kind, &error)
                     .map_err(runtime_error_to_vm_error)?,
             )))
         }
@@ -343,8 +400,17 @@ pub(super) struct PendingClass {
     pub(super) frame: FrameId,
     pub(super) realm: crate::engine::heap::ContextId,
     pub(super) parent: crate::engine::object::ObjectRef,
-    constructor: Value,
+    runtime: Runtime,
+    constructor: JsValue,
     name: crate::engine::value::JsString,
+}
+impl Drop for PendingClass {
+    /// Release the constructor edge still owned when heritage validation or
+    /// parent linking abandons the pending pair.
+    fn drop(&mut self) {
+        let constructor = std::mem::replace(&mut self.constructor, JsValue::Undefined);
+        let _ = self.runtime.release_jsvalue(constructor);
+    }
 }
 
 #[inline(never)]
@@ -379,9 +445,9 @@ pub(super) fn finish_class_reply(
         Completion::Throw(value) => Ok(crate::engine::vm::DefineClassOutcome::Throw(value)),
         Completion::Return(prototype) => runtime.finish_derived_class_pair(
             pending.realm,
-            pending.constructor,
+            &pending.constructor,
             &pending.name,
-            pending.parent,
+            pending.parent.clone(),
             prototype,
         ),
     };
@@ -401,7 +467,7 @@ pub(super) fn define_property(
     use crate::engine::object::PropertyKey;
     let frame = execution.frames.current_mut(id)?;
     let realm = frame.executable.realm;
-    let Value::Object(object) = execution
+    let JsValue::Object(object) = execution
         .slots
         .peek(&frame.window, 1 + usize::from(key.is_none()))?
     else {
@@ -437,32 +503,40 @@ pub(super) fn define_property(
     };
     let depth = execution.slots.depth(&frame.window);
     if method.is_none() {
-        let object = object.clone();
+        let object =
+            crate::engine::object::ObjectRef::from_borrowed_handle(runtime.clone(), *object)
+                .map_err(super::exception::heap_error_to_vm_error)?;
         let value = execution.slots.pop(&mut frame.window)?;
         if computed {
-            execution.slots.pop(&mut frame.window)?;
+            let discarded = execution.slots.pop(&mut frame.window)?;
+            runtime
+                .release_jsvalue(discarded)
+                .map_err(runtime_error_to_vm_error)?;
         }
         return super::proxy_get_driver::start_public_field(
             runtime, execution, id, object, key, value, depth,
         );
     }
     let (kind, enumerable) = method.expect("method checked above");
-    let object = object.clone();
-    let descriptor =
-        match runtime.prepare_object_literal_method(&object, &key, value.clone(), kind, enumerable)
-        {
-            Ok(descriptor) => descriptor,
-            Err(error) => {
-                return super::driver::rejected_call(
-                    runtime,
-                    realm,
-                    runtime_error_to_vm_error(error),
-                );
-            }
-        };
-    execution.slots.pop(&mut frame.window)?;
+    let object = crate::engine::object::ObjectRef::from_borrowed_handle(runtime.clone(), *object)
+        .map_err(super::exception::heap_error_to_vm_error)?;
+    let descriptor = match runtime
+        .prepare_object_literal_method(&object, &key, value, kind, enumerable)
+    {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return super::driver::rejected_call(runtime, realm, runtime_error_to_vm_error(error));
+        }
+    };
+    let discarded = execution.slots.pop(&mut frame.window)?;
+    runtime
+        .release_jsvalue(discarded)
+        .map_err(runtime_error_to_vm_error)?;
     if computed {
-        execution.slots.pop(&mut frame.window)?;
+        let discarded = execution.slots.pop(&mut frame.window)?;
+        runtime
+            .release_jsvalue(discarded)
+            .map_err(runtime_error_to_vm_error)?;
     }
     super::proxy_get_driver::start_literal_definition(
         runtime,
@@ -507,7 +581,10 @@ mod owned_definition_tests {
                 .unwrap();
             let _costs = profile.snapshot();
             assert!(
-                matches!(result, Completion::Return(Value::Int(42))),
+                matches!(
+                    result,
+                    Completion::Return(crate::engine::value::JsValue::Int(42))
+                ),
                 "{source}: {result:?}"
             );
             assert!(runtime.0.state.borrow().active_frames.is_empty());
@@ -533,7 +610,10 @@ mod owned_definition_tests {
                 .unwrap();
             let _costs = profile.snapshot();
             assert!(
-                matches!(result, Completion::Return(Value::Int(42))),
+                matches!(
+                    result,
+                    Completion::Return(crate::engine::value::JsValue::Int(42))
+                ),
                 "{source}: {result:?}"
             );
             assert!(runtime.0.state.borrow().active_frames.is_empty());

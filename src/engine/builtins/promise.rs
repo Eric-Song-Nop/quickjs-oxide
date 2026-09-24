@@ -19,7 +19,7 @@ use crate::engine::object::{
     PropertyKey, WellKnownSymbol,
 };
 use crate::engine::value::conversion::NativeConversion;
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{ConstructorRef, NativeArguments, NativeInvocation};
 use std::cell::Cell;
@@ -62,7 +62,6 @@ impl PromiseSnapshot {
         self.state
     }
 
-    #[must_use]
     pub const fn result(&self) -> &Value {
         &self.result
     }
@@ -79,7 +78,6 @@ impl PromiseRejectionEvent {
         &self.promise
     }
 
-    #[must_use]
     pub const fn reason(&self) -> &Value {
         &self.reason
     }
@@ -127,7 +125,7 @@ impl Runtime {
         };
         Ok(Some(PromiseSnapshot {
             state: snapshot.state,
-            result: self.root_raw_value(&snapshot.result)?,
+            result: self.root_raw_value(snapshot.result.clone())?,
         }))
     }
 
@@ -287,11 +285,12 @@ impl Runtime {
         &self,
         realm: ContextId,
         promise: ObjectRef,
-        reason: Value,
+        reason: &RawValue,
         handled: bool,
     ) -> Result<(), RuntimeError> {
         let tracker = self.0.promise_rejection_tracker.borrow().clone();
         if let Some(tracker) = tracker {
+            let reason = self.root_raw_value(reason.clone())?;
             self.with_host_callback(|| {
                 tracker(PromiseRejectionEvent {
                     context: realm,
@@ -449,9 +448,15 @@ impl Runtime {
     pub(crate) fn new_rejected_default_promise(
         &self,
         realm: ContextId,
-        reason: Value,
+        reason: JsValue,
     ) -> Result<ObjectRef, RuntimeError> {
-        let capability = self.new_default_promise_capability(realm)?;
+        let capability = match self.new_default_promise_capability(realm) {
+            Ok(capability) => capability,
+            Err(error) => {
+                self.release_jsvalue(reason)?;
+                return Err(error);
+            }
+        };
         let promise = capability.promise.clone();
         self.settle_promise(realm, &promise, PromiseState::Rejected, reason)?;
         Ok(promise)
@@ -479,15 +484,20 @@ impl Runtime {
         completion: Completion,
     ) -> Result<NativeConversion<RootedPromiseCapability>, RuntimeError> {
         let promise = match completion {
-            Completion::Return(Value::Object(promise)) => promise,
-            Completion::Return(_) => {
-                return Ok(NativeConversion::Throw(self.new_native_error(
+            Completion::Return(JsValue::Object(id)) => {
+                ObjectRef::from_owned_handle(self.clone(), id)
+            }
+            Completion::Return(value) => {
+                self.release_jsvalue(value)?;
+                return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "not an object",
                 )?));
             }
-            Completion::Throw(value) => return Ok(NativeConversion::Throw(value)),
+            Completion::Throw(value) => {
+                return Ok(NativeConversion::Throw(value));
+            }
         };
         let capture = self
             .0
@@ -496,27 +506,33 @@ impl Runtime {
             .heap
             .promise_capability_capture(executor.as_object().object_id())?;
         let (Some(resolve), Some(reject)) = (capture.resolve, capture.reject) else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "resolving function is not callable",
             )?));
         };
-        let resolve = self.root_raw_value(&resolve)?;
-        let reject = self.root_raw_value(&reject)?;
+        let resolve = JsValue::from_raw(resolve.clone()).ok_or(RuntimeError::Invariant(
+            "Promise resolve capture is an internal sentinel",
+        ))?;
+        let reject = JsValue::from_raw(reject.clone()).ok_or(RuntimeError::Invariant(
+            "Promise reject capture is an internal sentinel",
+        ))?;
         let resolve = match resolve {
-            Value::Object(object) => match self.as_callable(&object)? {
-                Some(callable) => callable,
-                None => {
-                    return Ok(NativeConversion::Throw(self.new_native_error(
-                        realm,
-                        NativeErrorKind::Type,
-                        "resolving function is not callable",
-                    )?));
+            JsValue::Object(object) => {
+                match self.as_callable(&ObjectRef::from_borrowed_handle(self.clone(), object)?)? {
+                    Some(callable) => callable,
+                    None => {
+                        return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+                            realm,
+                            NativeErrorKind::Type,
+                            "resolving function is not callable",
+                        )?));
+                    }
                 }
-            },
+            }
             _ => {
-                return Ok(NativeConversion::Throw(self.new_native_error(
+                return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "resolving function is not callable",
@@ -524,18 +540,20 @@ impl Runtime {
             }
         };
         let reject = match reject {
-            Value::Object(object) => match self.as_callable(&object)? {
-                Some(callable) => callable,
-                None => {
-                    return Ok(NativeConversion::Throw(self.new_native_error(
-                        realm,
-                        NativeErrorKind::Type,
-                        "resolving function is not callable",
-                    )?));
+            JsValue::Object(object) => {
+                match self.as_callable(&ObjectRef::from_borrowed_handle(self.clone(), object)?)? {
+                    Some(callable) => callable,
+                    None => {
+                        return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+                            realm,
+                            NativeErrorKind::Type,
+                            "resolving function is not callable",
+                        )?));
+                    }
                 }
-            },
+            }
             _ => {
-                return Ok(NativeConversion::Throw(self.new_native_error(
+                return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "resolving function is not callable",
@@ -560,7 +578,10 @@ impl Runtime {
             PromiseNativeKind::Constructor => {
                 self.call_promise_constructor(realm, invocation, arguments)
             }
-            PromiseNativeKind::Species => self.call_promise_species(invocation),
+            PromiseNativeKind::Species => self
+                .dispatch_borrowed_invocation(invocation, |invocation| {
+                    self.call_promise_species(invocation)
+                }),
             PromiseNativeKind::Then => self.call_promise_then(realm, invocation, arguments),
             PromiseNativeKind::Catch => self.call_promise_catch(realm, invocation, arguments),
             PromiseNativeKind::Finally => self.call_promise_finally(realm, invocation, arguments),
@@ -578,14 +599,14 @@ impl Runtime {
 
     fn call_promise_species(
         &self,
-        invocation: NativeInvocation,
+        invocation: &NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
         let NativeInvocation::Getter { this_value } = invocation else {
             return Err(RuntimeError::Invariant(
                 "Promise species did not receive a getter invocation",
             ));
         };
-        Ok(Completion::Return(this_value))
+        Ok(Completion::Return(self.dup_jsvalue(this_value)?))
     }
 
     fn call_promise_constructor(
@@ -594,14 +615,16 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::PromiseStep::start(
-            self,
-            realm,
-            NativeFunctionId::Promise(PromiseNativeKind::Constructor),
-            &invocation,
-            arguments,
-        )?
-        .finish(self, realm)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::PromiseStep::start(
+                self,
+                realm,
+                NativeFunctionId::Promise(PromiseNativeKind::Constructor),
+                invocation,
+                arguments,
+            )?
+            .finish(self, realm)
+        })
     }
 
     pub(crate) fn call_promise_resolving(
@@ -611,14 +634,16 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::PromiseStep::start(
-            self,
-            realm,
-            NativeFunctionId::PromiseResolving(target_kind),
-            &invocation,
-            arguments,
-        )?
-        .finish(self, realm)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::PromiseStep::start(
+                self,
+                realm,
+                NativeFunctionId::PromiseResolving(target_kind),
+                invocation,
+                arguments,
+            )?
+            .finish(self, realm)
+        })
     }
 
     pub(crate) fn call_promise_capability_executor(
@@ -627,44 +652,42 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Promise capability executor received a constructor invocation",
             ));
         };
+        invocation.release(self)?;
         let active = self.active_function()?;
         let resolve = arguments
             .readable
             .first()
-            .cloned()
             .ok_or(RuntimeError::Invariant(
                 "Promise capability resolve argv was not padded",
-            ))?;
+            ))?
+            .as_raw();
         let reject = arguments
             .readable
             .get(1)
-            .cloned()
             .ok_or(RuntimeError::Invariant(
                 "Promise capability reject argv was not padded",
-            ))?;
-        let raw_resolve = self.raw_property_value(&resolve)?;
-        let raw_reject = self.raw_property_value(&reject)?;
+            ))?
+            .as_raw();
         let mut state = self.0.state.borrow_mut();
-        let retained = state.retain_raw_value_atoms([&raw_resolve, &raw_reject])?;
+        let retained = state.retain_raw_value_atoms([&resolve, &reject])?;
         match state
             .heap
-            .set_promise_capability_capture(active.object_id(), raw_resolve, raw_reject)
+            .set_promise_capability_capture(active.object_id(), resolve, reject)
         {
             Ok(true) => {
                 drop(state);
-                drop(resolve);
-                drop(reject);
-                Ok(Completion::Return(Value::Undefined))
+                Ok(Completion::Return(JsValue::Undefined))
             }
             Ok(false) => {
                 state.release_atoms(retained)?;
                 drop(state);
-                Ok(Completion::Throw(self.new_native_error(
+                Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "resolving function already set",
@@ -682,80 +705,85 @@ impl Runtime {
         realm: ContextId,
         promise: &ObjectRef,
         state: PromiseState,
-        result: Value,
+        result: JsValue,
     ) -> Result<(), RuntimeError> {
-        let snapshot = self
-            .0
-            .state
-            .borrow()
-            .heap
-            .promise_snapshot(promise.object_id())?;
-        if snapshot.state != PromiseState::Pending {
-            return Ok(());
-        }
-        let was_handled = snapshot.is_handled;
-        let reactions = match state {
-            PromiseState::Fulfilled => snapshot.fulfill_reactions,
-            PromiseState::Rejected => snapshot.reject_reactions,
-            PromiseState::Pending => {
-                return Err(RuntimeError::Invariant(
-                    "Promise settlement requested the pending state",
-                ));
-            }
-        };
-        let raw = self.raw_property_value(&result)?;
-
-        // Prepare job-owned roots before detaching the Promise's reactions,
-        // but do not publish the jobs yet. QuickJS exposes the settled state to
-        // its rejection tracker before the selected reactions enter the FIFO;
-        // a reentrant tracker can therefore enqueue work ahead of them.
-        let mut prepared_jobs = Vec::with_capacity(reactions.len());
-        for reaction in reactions {
-            let job = match self.prepare_promise_reaction_job(realm, reaction, raw.clone()) {
-                Ok(job) => job,
-                Err(error) => {
-                    self.discard_prepared_jobs(prepared_jobs)?;
-                    return Err(error);
-                }
-            };
-            prepared_jobs.push(job);
-        }
-
-        let prepared_jobs = crate::engine::jobs::PreparedJobs::new(self, prepared_jobs);
-        let settlement = (|| -> Result<(), RuntimeError> {
-            let mut state_ref = self.0.state.borrow_mut();
-            let retained_atom = if let RawValue::Symbol(atom) = &raw {
-                state_ref.atoms.retain(*atom)?;
-                Some(*atom)
-            } else {
-                None
-            };
-            let cleanup = match state_ref
+        let settlement_result = (|| {
+            let snapshot = self
+                .0
+                .state
+                .borrow()
                 .heap
-                .promise_settle(promise.object_id(), state, raw)
-            {
-                Ok(cleanup) => cleanup,
-                Err(error) => {
-                    if let Some(atom) = retained_atom {
-                        state_ref.atoms.release(atom)?;
-                    }
-                    return Err(error.into());
+                .promise_snapshot(promise.object_id())?;
+            if snapshot.state != PromiseState::Pending {
+                return Ok(());
+            }
+            let was_handled = snapshot.is_handled;
+            let reactions = match state {
+                PromiseState::Fulfilled => snapshot.fulfill_reactions,
+                PromiseState::Rejected => snapshot.reject_reactions,
+                PromiseState::Pending => {
+                    return Err(RuntimeError::Invariant(
+                        "Promise settlement requested the pending state",
+                    ));
                 }
             };
-            state_ref.apply_cleanup(cleanup)
+            let raw = result.as_raw();
+
+            // Prepare job-owned roots before detaching the Promise's reactions,
+            // but do not publish the jobs yet. QuickJS exposes the settled state to
+            // its rejection tracker before the selected reactions enter the FIFO;
+            // a reentrant tracker can therefore enqueue work ahead of them.
+            let mut prepared_jobs = Vec::with_capacity(reactions.len());
+            for reaction in reactions {
+                let job = match self.prepare_promise_reaction_job(realm, reaction, raw.clone()) {
+                    Ok(job) => job,
+                    Err(error) => {
+                        self.discard_prepared_jobs(prepared_jobs)?;
+                        return Err(error);
+                    }
+                };
+                prepared_jobs.push(job);
+            }
+
+            let prepared_jobs = crate::engine::jobs::PreparedJobs::new(self, prepared_jobs);
+            let settlement = (|| -> Result<(), RuntimeError> {
+                let mut state_ref = self.0.state.borrow_mut();
+                let retained_atom = if let RawValue::Symbol(index) = &raw {
+                    state_ref.atoms.retain_index(*index)?;
+                    Some(*index)
+                } else {
+                    None
+                };
+                let cleanup = match state_ref
+                    .heap
+                    .promise_settle(promise.object_id(), state, raw)
+                {
+                    Ok(cleanup) => cleanup,
+                    Err(error) => {
+                        if let Some(index) = retained_atom {
+                            state_ref.atoms.release_index(index)?;
+                        }
+                        return Err(error.into());
+                    }
+                };
+                state_ref.apply_cleanup(cleanup)
+            })();
+            // The transaction retains the stored handle; the input edge is
+            // released after all selected jobs and host notifications complete.
+            settlement?;
+            if state == PromiseState::Rejected && !was_handled {
+                self.notify_host_promise_rejection_tracker(
+                    realm,
+                    promise.clone(),
+                    &result.as_raw(),
+                    false,
+                )?;
+            }
+            prepared_jobs.publish();
+            Ok(())
         })();
-        settlement?;
-        if state == PromiseState::Rejected && !was_handled {
-            self.notify_host_promise_rejection_tracker(
-                realm,
-                promise.clone(),
-                result.clone(),
-                false,
-            )?;
-        }
-        prepared_jobs.publish();
-        drop(result);
-        Ok(())
+        self.release_jsvalue(result)?;
+        settlement_result
     }
 
     pub(crate) fn execute_promise_resolve_thenable_job(
@@ -784,28 +812,31 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::PromiseStep::start(
-            self,
-            realm,
-            NativeFunctionId::Promise(PromiseNativeKind::Then),
-            &invocation,
-            arguments,
-        )?
-        .finish(self, realm)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::PromiseStep::start(
+                self,
+                realm,
+                NativeFunctionId::Promise(PromiseNativeKind::Then),
+                invocation,
+                arguments,
+            )?
+            .finish(self, realm)
+        })
     }
 
     fn finish_promise_then(
         &self,
         realm: ContextId,
         promise: ObjectRef,
-        handlers: [Value; 2],
+        handlers: &[JsValue; 2],
         capability: RootedPromiseCapability,
     ) -> Result<Completion, RuntimeError> {
-        let handler_id = |value: &Value| -> Result<Option<ObjectId>, RuntimeError> {
-            let Value::Object(object) = value else {
+        let handler_id = |value: &JsValue| -> Result<Option<ObjectId>, RuntimeError> {
+            let JsValue::Object(id) = value else {
                 return Ok(None);
             };
-            Ok(self.as_callable(object)?.map(|_| object.object_id()))
+            let object = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
+            Ok(self.as_callable(&object)?.map(|_| *id))
         };
         let fulfill = PromiseReaction {
             kind: PromiseReactionKind::Fulfill,
@@ -834,11 +865,10 @@ impl Runtime {
             }
             PromiseState::Rejected => {
                 if !snapshot.is_handled {
-                    let reason = self.root_raw_value(&snapshot.result)?;
                     self.notify_host_promise_rejection_tracker(
                         realm,
                         promise.clone(),
-                        reason,
+                        &snapshot.result,
                         true,
                     )?;
                 }
@@ -850,7 +880,9 @@ impl Runtime {
             .borrow_mut()
             .heap
             .promise_mark_handled(promise.object_id())?;
-        Ok(Completion::Return(Value::Object(capability.promise)))
+        Ok(Completion::Return(JsValue::Object(
+            capability.promise.into_handle(),
+        )))
     }
 
     fn call_promise_catch(
@@ -859,14 +891,16 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::PromiseStep::start(
-            self,
-            realm,
-            NativeFunctionId::Promise(PromiseNativeKind::Catch),
-            &invocation,
-            arguments,
-        )?
-        .finish(self, realm)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::PromiseStep::start(
+                self,
+                realm,
+                NativeFunctionId::Promise(PromiseNativeKind::Catch),
+                invocation,
+                arguments,
+            )?
+            .finish(self, realm)
+        })
     }
 
     fn call_promise_static_resolve(
@@ -876,44 +910,39 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { this_value } = invocation else {
-            return Err(RuntimeError::Invariant(
-                "Promise resolve/reject received a constructor invocation",
-            ));
-        };
-        let argument = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "Promise resolve/reject argv was not padded",
-            ))?;
-        self.promise_static_resolve_core(realm, kind, this_value, argument)
-    }
-
-    fn promise_static_resolve_core(
-        &self,
-        realm: ContextId,
-        kind: PromiseNativeKind,
-        this_value: Value,
-        argument: Value,
-    ) -> Result<Completion, RuntimeError> {
-        operation::PromiseStep::static_resolve(self, realm, kind, this_value, argument)?
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::PromiseStep::start(
+                self,
+                realm,
+                NativeFunctionId::Promise(kind),
+                invocation,
+                arguments,
+            )?
             .finish(self, realm)
+        })
     }
 
     pub(crate) fn prepare_intrinsic_promise_resolve(
         &self,
         realm: ContextId,
-        value: Value,
+        value: JsValue,
     ) -> Result<operation::PromiseStep, RuntimeError> {
-        let constructor = self.promise_realm_data(realm)?.constructor;
-        let constructor = ObjectRef::from_borrowed_handle(self.clone(), constructor)?;
-        operation::PromiseStep::static_resolve(
+        let constructor = (|| {
+            let id = self.promise_realm_data(realm)?.constructor;
+            ObjectRef::from_borrowed_handle(self.clone(), id).map_err(RuntimeError::from)
+        })();
+        let constructor = match constructor {
+            Ok(constructor) => constructor,
+            Err(error) => {
+                self.release_jsvalue(value)?;
+                return Err(error);
+            }
+        };
+        operation::PromiseStep::static_resolve_jsvalue(
             self,
             realm,
             PromiseNativeKind::Resolve,
-            Value::Object(constructor),
+            JsValue::Object(constructor.into_handle()),
             value,
         )
     }
@@ -969,7 +998,10 @@ impl Runtime {
         )?
         .finish(self, realm)?
         {
-            Completion::Return(_) => Ok(NativeConversion::Value(())),
+            Completion::Return(value) => {
+                self.release_jsvalue(value)?;
+                Ok(NativeConversion::Value(()))
+            }
             Completion::Throw(value) => Ok(NativeConversion::Throw(value)),
         }
     }
@@ -1022,11 +1054,10 @@ impl Runtime {
             }
             PromiseState::Rejected => {
                 if !snapshot.is_handled {
-                    let reason = self.root_raw_value(&snapshot.result)?;
                     self.notify_host_promise_rejection_tracker(
                         realm,
                         promise.clone(),
-                        reason,
+                        &snapshot.result,
                         true,
                     )?;
                 }
@@ -1045,6 +1076,38 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_retains_original_string_node_without_materialization() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let Value::Object(promise) = context.eval("new Promise(() => {})").unwrap() else {
+            panic!("expected promise");
+        };
+        let value = runtime
+            .into_jsvalue(Value::String(JsString::from_static("settled")))
+            .unwrap();
+        let JsValue::String(id) = &value else {
+            unreachable!()
+        };
+        runtime
+            .settle_promise(
+                context.realm,
+                &promise,
+                PromiseState::Fulfilled,
+                runtime.dup_jsvalue(&value).unwrap(),
+            )
+            .unwrap();
+        let snapshot = runtime
+            .0
+            .state
+            .borrow()
+            .heap
+            .promise_snapshot(promise.object_id())
+            .unwrap();
+        assert!(matches!(snapshot.result, RawValue::String(stored) if stored == *id));
+        runtime.release_jsvalue(value).unwrap();
+    }
 
     #[test]
     fn promise_snapshot_rejects_a_promise_from_another_runtime() {

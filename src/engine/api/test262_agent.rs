@@ -475,6 +475,15 @@ fn run_agent_worker(
         // while holding the coordinator mutex. Import and callback execution
         // therefore happen strictly after this worker's ACK.
         let delivery = session.wait_for_broadcast(sequence)?;
+        #[cfg(debug_assertions)]
+        {
+            let state = runtime.0.state.borrow();
+            eprintln!(
+                "[worker-before-import] live={} roots={:?}",
+                state.heap.counts().live,
+                state.heap.debug_external_roots()
+            );
+        }
         let shared = match context.import_shared_array_buffer(delivery.handle) {
             Ok(shared) => shared,
             Err(error) => {
@@ -488,6 +497,15 @@ fn run_agent_worker(
                 break;
             }
         };
+        #[cfg(debug_assertions)]
+        {
+            let state = runtime.0.state.borrow();
+            eprintln!(
+                "[worker-after-import] live={} roots={:?}",
+                state.heap.counts().live,
+                state.heap.debug_external_roots()
+            );
+        }
         if let Err(error) = context.call(
             &callback,
             Value::Undefined,
@@ -501,6 +519,15 @@ fn run_agent_worker(
             );
         }
 
+        #[cfg(debug_assertions)]
+        {
+            let state = runtime.0.state.borrow();
+            eprintln!(
+                "[worker-after-call] live={} roots={:?}",
+                state.heap.counts().live,
+                state.heap.debug_external_roots()
+            );
+        }
         // Pinned QuickJS clears broadcast_func immediately after JS_Call. A
         // synchronous replacement is therefore discarded, while a Promise
         // job can install the next callback during the following drain pass.
@@ -624,13 +651,17 @@ impl Runtime {
             step = match step {
                 AgentStep::Complete(result) => return Ok(result),
                 AgentStep::String { value, resume } => {
+                    let value = self.root_and_release_jsvalue(value)?;
                     let result = match self.native_to_js_string(realm, &value)? {
-                        NativeConversion::Value(value) => Completion::Return(Value::String(value)),
+                        NativeConversion::Value(value) => {
+                            Completion::Return(self.into_jsvalue(Value::String(value))?)
+                        }
                         NativeConversion::Throw(value) => Completion::Throw(value),
                     };
                     resume.resume(self, result)?
                 }
                 AgentStep::Number { value, resume } => {
+                    let value = self.root_and_release_jsvalue(value)?;
                     resume.number(self, self.native_to_number(realm, &value)?)?
                 }
             };
@@ -642,7 +673,7 @@ impl Runtime {
         realm: ContextId,
         message: &str,
     ) -> Result<Completion, RuntimeError> {
-        Ok(Completion::Throw(self.new_native_error(
+        Ok(Completion::Throw(self.new_native_error_jsvalue(
             realm,
             NativeErrorKind::Type,
             message,
@@ -655,35 +686,35 @@ impl Runtime {
         value: &Value,
     ) -> Result<NativeConversion<SharedBufferHandle>, RuntimeError> {
         let Value::Object(object) = value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer object expected",
             )?));
         };
         let Some(access) = self.snapshot_buffer_access_if_branded(object)? else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer object expected",
             )?));
         };
         if access.state.detached {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer is detached",
             )?));
         }
         if !access.is_shared() {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ordinary ArrayBuffer broadcast is unavailable across runtimes",
             )?));
         }
         if access.state.max_byte_length.is_some() {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "growable SharedArrayBuffer broadcast is unavailable across runtimes",
@@ -870,9 +901,10 @@ mod tests {
         let mut context = runtime.new_context();
         let session = Test262AgentSession::new(Runtime::new);
         context.install_test262_host_with_agent(&session).unwrap();
-        context
-            .eval(
-                r#"$262.agent.start(`
+        drop(
+            context
+                .eval(
+                    r#"$262.agent.start(`
   $262.agent.report(Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 0));
   function message(callback) {
     try { callback(); return "missing"; }
@@ -884,8 +916,9 @@ mod tests {
   $262.agent.leaving();
   $262.agent.report("after-leaving");
 `);"#,
-            )
-            .unwrap();
+                )
+                .unwrap(),
+        );
         session.join_workers().unwrap();
         assert_eq!(
             take_reports(&session),
@@ -906,12 +939,14 @@ mod tests {
         let mut context = runtime.new_context();
         let session = Test262AgentSession::new(Runtime::new);
         context.install_test262_host_with_agent(&session).unwrap();
-        context
-            .eval(
-                r#"var child262 = $262.createRealm();
+        drop(
+            context
+                .eval(
+                    r#"var child262 = $262.createRealm();
 child262.agent.start("$262.agent.report('main-child')");"#,
-            )
-            .unwrap();
+                )
+                .unwrap(),
+        );
         session.join_workers().unwrap();
         assert_eq!(take_reports(&session), ["main-child"]);
 
@@ -919,9 +954,10 @@ child262.agent.start("$262.agent.report('main-child')");"#,
         let mut context = runtime.new_context();
         let session = Test262AgentSession::new(Runtime::new);
         context.install_test262_host_with_agent(&session).unwrap();
-        context
-            .eval(
-                r#"$262.agent.start(`
+        drop(
+            context
+                .eval(
+                    r#"$262.agent.start(`
   $262.agent.report("outer-ready");
   $262.agent.sleep(100);
   var child262 = $262.createRealm();
@@ -930,8 +966,9 @@ child262.agent.start("$262.agent.report('main-child')");"#,
   child262.agent.start("$262.agent.report('nested-worker')");
   $262.agent.report("outer-worker");
 `);"#,
-            )
-            .unwrap();
+                )
+                .unwrap(),
+        );
         // Begin cleanup while the outer worker is still live. Its inherited
         // main-role realm must remain allowed to append the nested worker.
         wait_for_report(&session, "outer-ready");
@@ -963,9 +1000,10 @@ child262.agent.start("$262.agent.report('main-child')");"#,
                 .unwrap(),
             Value::Undefined
         );
-        context
-            .eval(
-                r#"$262.agent.start(`
+        drop(
+            context
+                .eval(
+                    r#"$262.agent.start(`
   $262.agent.receiveBroadcast(function (sab, value) {
     $262.agent.report("worker-0:" + value + ":" + sab.byteLength);
   });
@@ -984,8 +1022,9 @@ $262.agent.start(`
   $262.agent.report("ready-2");
 `);
 var cohortBuffer = new SharedArrayBuffer(4);"#,
-            )
-            .unwrap();
+                )
+                .unwrap(),
+        );
         assert_eq!(lock_unpoisoned(&session.inner.workers).slots.len(), 3);
         wait_for_report(&session, "ready-0");
         wait_for_report(&session, "ready-1");
@@ -993,7 +1032,7 @@ var cohortBuffer = new SharedArrayBuffer(4);"#,
         let mut ready = take_reports(&session);
         ready.sort();
         assert_eq!(ready, ["ready-0", "ready-1", "ready-2"]);
-        context.eval("$262.agent.broadcast(cohortBuffer)").unwrap();
+        drop(context.eval("$262.agent.broadcast(cohortBuffer)").unwrap());
         session.join_workers().unwrap();
         let mut reports = take_reports(&session);
         reports.sort();
@@ -1007,9 +1046,10 @@ var cohortBuffer = new SharedArrayBuffer(4);"#,
         let mut context = runtime.new_context();
         let session = Test262AgentSession::new(Runtime::new);
         context.install_test262_host_with_agent(&session).unwrap();
-        context
-            .eval(
-                r#"var ackGate = new SharedArrayBuffer(8);
+        drop(
+            context
+                .eval(
+                    r#"var ackGate = new SharedArrayBuffer(8);
 var ackGateView = new Int32Array(ackGate);
 $262.agent.start(`
   $262.agent.receiveBroadcast(function (sab, value) {
@@ -1020,18 +1060,21 @@ $262.agent.start(`
   });
   $262.agent.report("ready");
 `);"#,
-            )
-            .unwrap();
+                )
+                .unwrap(),
+        );
         wait_for_report(&session, "ready");
 
         // If broadcast waited for callback completion instead of its ACK,
         // the callback's finite wait would time out before this store ran.
-        context
-            .eval(
-                "$262.agent.broadcast(ackGate, 17); \
+        drop(
+            context
+                .eval(
+                    "$262.agent.broadcast(ackGate, 17); \
                  Atomics.store(ackGateView, 1, 1); Atomics.notify(ackGateView, 1);",
-            )
-            .unwrap();
+                )
+                .unwrap(),
+        );
         session.join_workers().unwrap();
         let reports = take_reports(&session);
         assert_eq!(&reports[..2], ["ready", "callback:17"]);
@@ -1092,9 +1135,10 @@ $262.agent.start(`
             "TypeError:must be called inside an agent|TypeError:ArrayBuffer object expected|0|1|TypeError:cannot convert bigint to number|TypeError:ordinary ArrayBuffer broadcast is unavailable across runtimes|0|TypeError:growable SharedArrayBuffer broadcast is unavailable across runtimes|0"
         );
 
-        context
-            .eval(
-                r#"var replacementBuffer = new SharedArrayBuffer(4);
+        drop(
+            context
+                .eval(
+                    r#"var replacementBuffer = new SharedArrayBuffer(4);
 $262.agent.start(`
   var roleTouched = 0;
   try {
@@ -1111,12 +1155,15 @@ $262.agent.start(`
   $262.agent.leaving();
   $262.agent.report("replacement-ready");
 `);"#,
-            )
-            .unwrap();
+                )
+                .unwrap(),
+        );
         wait_for_report(&session, "replacement-ready");
-        context
-            .eval("$262.agent.broadcast(replacementBuffer, -4294967295)")
-            .unwrap();
+        drop(
+            context
+                .eval("$262.agent.broadcast(replacementBuffer, -4294967295)")
+                .unwrap(),
+        );
         session.join_workers().unwrap();
         assert_eq!(
             take_reports(&session),
@@ -1136,9 +1183,10 @@ $262.agent.start(`
         let mut context = runtime.new_context();
         let session = Test262AgentSession::new(Runtime::new);
         context.install_test262_host_with_agent(&session).unwrap();
-        context
-            .eval(
-                r#"var numericShared = new SharedArrayBuffer(16);
+        drop(
+            context
+                .eval(
+                    r#"var numericShared = new SharedArrayBuffer(16);
 var numericInts = new Int32Array(numericShared, 0, 1);
 var numericBigs = new BigInt64Array(numericShared, 8, 1);
 numericInts[0] = 40;
@@ -1153,12 +1201,15 @@ $262.agent.start(`
   });
   $262.agent.report("numeric-ready");
 `);"#,
-            )
-            .unwrap();
+                )
+                .unwrap(),
+        );
         wait_for_report(&session, "numeric-ready");
-        context
-            .eval("$262.agent.broadcast(numericShared, 4294967297)")
-            .unwrap();
+        drop(
+            context
+                .eval("$262.agent.broadcast(numericShared, 4294967297)")
+                .unwrap(),
+        );
         session.join_workers().unwrap();
         assert_eq!(
             take_reports(&session),
@@ -1177,9 +1228,10 @@ $262.agent.start(`
         let mut context = runtime.new_context();
         let session = Test262AgentSession::new(Runtime::new);
         context.install_test262_host_with_agent(&session).unwrap();
-        context
-            .eval(
-                r#"var generationBuffer = new SharedArrayBuffer(4);
+        drop(
+            context
+                .eval(
+                    r#"var generationBuffer = new SharedArrayBuffer(4);
 $262.agent.start(`
   $262.agent.receiveBroadcast(function (sab, value) {
     $262.agent.report("first:" + value);
@@ -1192,15 +1244,18 @@ $262.agent.start(`
   });
   $262.agent.report("generation-ready");
 `);"#,
-            )
-            .unwrap();
+                )
+                .unwrap(),
+        );
         wait_for_report(&session, "generation-ready");
-        context
-            .eval(
-                "$262.agent.broadcast(generationBuffer, 1); \
+        drop(
+            context
+                .eval(
+                    "$262.agent.broadcast(generationBuffer, 1); \
                  $262.agent.broadcast(generationBuffer, 2);",
-            )
-            .unwrap();
+                )
+                .unwrap(),
+        );
         session.join_workers().unwrap();
         assert_eq!(
             take_reports(&session),
@@ -1215,9 +1270,10 @@ $262.agent.start(`
         let mut context = runtime.new_context();
         let session = Test262AgentSession::new(Runtime::new);
         context.install_test262_host_with_agent(&session).unwrap();
-        context
-            .eval(
-                r#"var synchronousReplacementBuffer = new SharedArrayBuffer(4);
+        drop(
+            context
+                .eval(
+                    r#"var synchronousReplacementBuffer = new SharedArrayBuffer(4);
 $262.agent.start(`
   $262.agent.receiveBroadcast(function () {
     $262.agent.receiveBroadcast(function () {
@@ -1227,12 +1283,15 @@ $262.agent.start(`
   });
   $262.agent.report("synchronous-ready");
 `);"#,
-            )
-            .unwrap();
+                )
+                .unwrap(),
+        );
         wait_for_report(&session, "synchronous-ready");
-        context
-            .eval("$262.agent.broadcast(synchronousReplacementBuffer, 1)")
-            .unwrap();
+        drop(
+            context
+                .eval("$262.agent.broadcast(synchronousReplacementBuffer, 1)")
+                .unwrap(),
+        );
         session.join_workers().unwrap();
         assert_eq!(
             take_reports(&session),
@@ -1247,9 +1306,10 @@ $262.agent.start(`
         let mut context = runtime.new_context();
         let session = Test262AgentSession::new(Runtime::new);
         context.install_test262_host_with_agent(&session).unwrap();
-        context
-            .eval(
-                r#"var failureBuffer = new SharedArrayBuffer(4);
+        drop(
+            context
+                .eval(
+                    r#"var failureBuffer = new SharedArrayBuffer(4);
 $262.agent.start(`
   $262.agent.receiveBroadcast(function () {
     $262.agent.report("callback-ran");
@@ -1259,12 +1319,15 @@ $262.agent.start(`
   $262.agent.report("failure-ready");
   throw new Error("source failure");
 `);"#,
-            )
-            .unwrap();
+                )
+                .unwrap(),
+        );
         wait_for_report(&session, "failure-ready");
-        context
-            .eval("$262.agent.broadcast(failureBuffer, 0)")
-            .unwrap();
+        drop(
+            context
+                .eval("$262.agent.broadcast(failureBuffer, 0)")
+                .unwrap(),
+        );
         let error = session.join_workers().unwrap_err().to_string();
         assert!(error.contains("execute agent source"), "{error}");
         assert!(error.contains("call agent broadcast callback"), "{error}");
@@ -1282,9 +1345,11 @@ $262.agent.start(`
         let mut context = runtime.new_context();
         let session = Test262AgentSession::new(Runtime::new);
         context.install_test262_host_with_agent(&session).unwrap();
-        context
-            .eval("$262.agent.start(\"throw new Error('worker failure')\")")
-            .unwrap();
+        drop(
+            context
+                .eval("$262.agent.start(\"throw new Error('worker failure')\")")
+                .unwrap(),
+        );
         let error = session.join_workers().unwrap_err().to_string();
         assert!(error.contains("agent 0: execute agent source"), "{error}");
     }
@@ -1301,17 +1366,466 @@ $262.agent.start(`
             let mut context = runtime.new_context();
             let session = Test262AgentSession::new(Runtime::new);
             context.install_test262_host_with_agent(&session).unwrap();
-            context
-                .eval(&format!(
-                    "$262.agent.start({:?})",
-                    format!("try {{ {source} }} catch (_) {{}}")
-                ))
-                .unwrap();
+            drop(
+                context
+                    .eval(&format!(
+                        "$262.agent.start({:?})",
+                        format!("try {{ {source} }} catch (_) {{}}")
+                    ))
+                    .unwrap(),
+            );
             let error = session.join_workers().unwrap_err().to_string();
             assert!(
                 error.contains("dynamic-import bytecode policy"),
                 "{source}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn zz_probe_bigint_literal() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        drop(context.eval("var x = 12345678901234567890n; 'ok'").unwrap());
+    }
+
+    #[test]
+    fn zz_probe_string_literal() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        drop(context.eval("var x = 'abcdefghij'; 'ok'").unwrap());
+    }
+
+    #[test]
+    fn zz_probe_agent_install_only() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let session = Test262AgentSession::new(Runtime::new);
+        context.install_test262_host_with_agent(&session).unwrap();
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_agent_own_keys() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let session = Test262AgentSession::new(Runtime::new);
+        context.install_test262_host_with_agent(&session).unwrap();
+        eval_string(&mut context, "Reflect.ownKeys($262.agent).length; 'ok'");
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_agent_descriptor_262() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let session = Test262AgentSession::new(Runtime::new);
+        context.install_test262_host_with_agent(&session).unwrap();
+        eval_string(
+            &mut context,
+            "Object.getOwnPropertyDescriptor($262, 'agent') && 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_agent_descriptor_method() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let session = Test262AgentSession::new(Runtime::new);
+        context.install_test262_host_with_agent(&session).unwrap();
+        eval_string(
+            &mut context,
+            "Object.getOwnPropertyDescriptor($262.agent, 'start') && 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_agent_descriptor_name() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let session = Test262AgentSession::new(Runtime::new);
+        context.install_test262_host_with_agent(&session).unwrap();
+        eval_string(
+            &mut context,
+            "Object.getOwnPropertyDescriptor($262.agent.start, 'name') && 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_plain_own_keys() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(&mut context, "Reflect.ownKeys({a:1}).length + ''");
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_plain_gopd() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "Object.getOwnPropertyDescriptor({a:1}, 'a') && 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_plain_keys() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(&mut context, "Object.keys({a:1}).length + ''");
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_gopd_discard() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "Object.getOwnPropertyDescriptor({a:1}, 'a'); 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_gopd_missing() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "Object.getOwnPropertyDescriptor({a:1}, 'b'); 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_reflect_get() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(&mut context, "Reflect.get({a:1}, 'a'); 'ok'");
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_has_own() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(&mut context, "Object.hasOwn({a:1}, 'a'); 'ok'");
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_reflect_has() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(&mut context, "Reflect.has({a:1}, 'a'); 'ok'");
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_reflect_get_receiver() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(&mut context, "Reflect.get({a:1}, 'a', {}); 'ok'");
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_object_define_property() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "Object.defineProperty({}, 'a', {value:1}); 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_call_with_object_argument() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let handle = SharedBufferHandle::new(4, None).unwrap();
+        let shared = context.import_shared_array_buffer(handle).unwrap();
+        let function = context
+            .eval("(function(sab, value){ return sab.byteLength + value; })")
+            .unwrap();
+        let callable = runtime.callable_from_value(function).unwrap();
+        drop(
+            context
+                .call(
+                    &callable,
+                    Value::Undefined,
+                    &[Value::Object(shared), Value::Int(1)],
+                )
+                .unwrap(),
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_call_object_arg_ignored() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let handle = SharedBufferHandle::new(4, None).unwrap();
+        let shared = context.import_shared_array_buffer(handle).unwrap();
+        let function = context.eval("(function(){ return 1; })").unwrap();
+        let callable = runtime.callable_from_value(function).unwrap();
+        drop(
+            context
+                .call(&callable, Value::Undefined, &[Value::Object(shared)])
+                .unwrap(),
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_call_object_arg_returned() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let handle = SharedBufferHandle::new(4, None).unwrap();
+        let shared = context.import_shared_array_buffer(handle).unwrap();
+        let function = context.eval("(function(sab){ return sab; })").unwrap();
+        let callable = runtime.callable_from_value(function).unwrap();
+        let result = context
+            .call(&callable, Value::Undefined, &[Value::Object(shared)])
+            .unwrap();
+        drop(result);
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_call_object_this() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let handle = SharedBufferHandle::new(4, None).unwrap();
+        let shared = context.import_shared_array_buffer(handle).unwrap();
+        let function = context.eval("(function(){ return 1; })").unwrap();
+        let callable = runtime.callable_from_value(function).unwrap();
+        drop(context.call(&callable, Value::Object(shared), &[]).unwrap());
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_call_object_arg_native() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let handle = SharedBufferHandle::new(4, None).unwrap();
+        let shared = context.import_shared_array_buffer(handle).unwrap();
+        let function = context.eval("Object.keys").unwrap();
+        let callable = runtime.callable_from_value(function).unwrap();
+        drop(
+            context
+                .call(&callable, Value::Undefined, &[Value::Object(shared)])
+                .unwrap(),
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_call_object_arg_byte_length() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let handle = SharedBufferHandle::new(4, None).unwrap();
+        let shared = context.import_shared_array_buffer(handle).unwrap();
+        let function = context
+            .eval("(function(sab){ return sab.byteLength; })")
+            .unwrap();
+        let callable = runtime.callable_from_value(function).unwrap();
+        drop(
+            context
+                .call(&callable, Value::Undefined, &[Value::Object(shared)])
+                .unwrap(),
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_call_object_arg_get_prototype() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let handle = SharedBufferHandle::new(4, None).unwrap();
+        let shared = context.import_shared_array_buffer(handle).unwrap();
+        let function = context
+            .eval("(function(sab){ return Object.getPrototypeOf(sab) ? 1 : 0; })")
+            .unwrap();
+        let callable = runtime.callable_from_value(function).unwrap();
+        drop(
+            context
+                .call(&callable, Value::Undefined, &[Value::Object(shared)])
+                .unwrap(),
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_promise_then() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(&mut context, "Promise.resolve().then(function () {}); 'ok'");
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_promise_ctor_direct() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(&mut context, "new Promise(function (r) { r(); }); 'ok'");
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_promise_species_undefined() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "var p = Promise.resolve(); Object.defineProperty(p, 'constructor', {value: undefined}); p.then(function () {}); 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_promise_then_species_ctor() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "class P extends Promise {}; var p = new P(function (r) { r(); }); p.then(function () {}); 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_class_ctor_direct() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "class P extends Promise {}; new P(function (r) { r(); }); 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_class_reflect_construct() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "class P extends Promise {}; Reflect.construct(P, [function (r) { r(); }], P); 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_promise_species_read_only() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "var p = Promise.resolve(); Object.defineProperty(p, 'constructor', {value: {get [Symbol.species]() { return undefined; }}}); p.then(function () {}); 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_promise_resolve() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(&mut context, "Promise.resolve(); 'ok'");
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_ab_construct() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(&mut context, "var b = new ArrayBuffer(4); 'ok'");
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_ab_getter_call() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "var b = new ArrayBuffer(4); var g = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get; var n = g.call(b); 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_shared_byte_length() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "var b = new SharedArrayBuffer(4); var n = b.byteLength; 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_array_buffer_byte_length() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "var b = new ArrayBuffer(4); var n = b.byteLength; 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
+    }
+
+    #[test]
+    fn zz_probe_shared_own_property_descriptor() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        eval_string(
+            &mut context,
+            "var b = new SharedArrayBuffer(4); Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength').get.call(b); 'ok'",
+        );
+        drop(context);
+        runtime.run_gc().unwrap();
     }
 }

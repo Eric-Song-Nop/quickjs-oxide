@@ -6,28 +6,25 @@ use crate::engine::{
         object::ObjectIteratorStep,
     },
     heap::ContextId,
-    object::{
-        CallableRef, DescriptorField, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey,
-        WellKnownSymbol,
-    },
-    value::Value,
+    object::{CallableRef, ObjectRef, PropertyKey, WellKnownSymbol},
+    value::JsValue,
     vm::Completion,
 };
 pub(crate) enum AggregateStep {
     Complete(Completion),
     Read {
-        receiver: Value,
+        receiver: JsValue,
         key: PropertyKey,
         resume: AggregateResume,
     },
     Call {
         callable: CallableRef,
-        receiver: Value,
+        receiver: JsValue,
         resume: AggregateResume,
     },
     Next {
         iterator: ObjectRef,
-        next: Value,
+        next: JsValue,
         resume: AggregateResume,
     },
     Close {
@@ -55,28 +52,48 @@ impl std::ops::DerefMut for AggregateResume {
 }
 const _: () = assert!(std::mem::size_of::<AggregateResume>() <= 8);
 pub(crate) struct AggregateResumeState {
+    runtime: Runtime,
     realm: ContextId,
     phase: Phase,
-    iterable: Value,
+    iterable: JsValue,
     iterator: Option<ObjectRef>,
-    next: Value,
+    next: JsValue,
     result: Option<ObjectRef>,
     index: u64,
+    item: Option<JsValue>,
+}
+impl Drop for AggregateResumeState {
+    /// Release the internal edges still owned when the request is abandoned.
+    /// Consumption goes through `std::mem::replace` or a duplicate, so drained
+    /// fields are `Undefined` here; releases are defer-safe and nothrow.
+    fn drop(&mut self) {
+        if let Some(value) = self.item.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if !matches!(self.iterable, JsValue::Undefined) {
+            let iterable = std::mem::replace(&mut self.iterable, JsValue::Undefined);
+            let _ = self.runtime.release_jsvalue(iterable);
+        }
+        if !matches!(self.next, JsValue::Undefined) {
+            let next = std::mem::replace(&mut self.next, JsValue::Undefined);
+            let _ = self.runtime.release_jsvalue(next);
+        }
+    }
 }
 impl AggregateStep {
     pub(crate) fn start(
         runtime: &Runtime,
         realm: ContextId,
-        iterable: Value,
+        iterable: JsValue,
     ) -> Result<Self, RuntimeError> {
-        if matches!(iterable, Value::Null | Value::Undefined) {
+        if matches!(iterable, JsValue::Null | JsValue::Undefined) {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(
+                runtime.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     &format!(
                         "cannot read property 'Symbol.iterator' of {}",
-                        if matches!(iterable, Value::Null) {
+                        if matches!(iterable, JsValue::Null) {
                             "null"
                         } else {
                             "undefined"
@@ -85,18 +102,22 @@ impl AggregateStep {
                 )?,
             )));
         }
+        let resume = AggregateResume(Box::new(AggregateResumeState {
+            runtime: runtime.clone(),
+            realm,
+            phase: Phase::Method,
+            iterable,
+            iterator: None,
+            next: JsValue::Undefined,
+            result: None,
+            index: 0,
+            item: None,
+        }));
+        let receiver = runtime.dup_jsvalue(&resume.0.iterable)?;
         Ok(Self::Read {
-            receiver: iterable.clone(),
+            receiver,
             key: PropertyKey::from(runtime.well_known_symbol(WellKnownSymbol::Iterator)),
-            resume: AggregateResume(Box::new(AggregateResumeState {
-                realm,
-                phase: Phase::Method,
-                iterable,
-                iterator: None,
-                next: Value::Undefined,
-                result: None,
-                index: 0,
-            })),
+            resume,
         })
     }
 }
@@ -114,13 +135,15 @@ impl AggregateResume {
         };
         match self.0.phase {
             Phase::Method => {
-                let callable = match value {
-                    Value::Object(object) => runtime.as_callable(&object)?,
-                    _ => None,
+                let callable = match &value {
+                    JsValue::Object(id) => runtime.as_callable_object(*id),
+                    _ => Ok(None),
                 };
+                runtime.release_jsvalue(value)?;
+                let callable = callable?;
                 let Some(callable) = callable else {
                     return Ok(AggregateStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             "value is not iterable",
@@ -130,41 +153,48 @@ impl AggregateResume {
                 self.0.phase = Phase::Iterator;
                 Ok(AggregateStep::Call {
                     callable,
-                    receiver: self.0.iterable.clone(),
+                    receiver: runtime.dup_jsvalue(&self.0.iterable)?,
                     resume: self,
                 })
             }
             Phase::Iterator => {
-                let Value::Object(iterator) = value else {
+                let JsValue::Object(iterator) = value else {
+                    runtime.release_jsvalue(value)?;
                     return Ok(AggregateStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             "not an object",
                         )?,
                     )));
                 };
-                self.0.iterable = Value::Undefined;
+                let iterator = ObjectRef::from_owned_handle(runtime.clone(), iterator);
+                let iterable = std::mem::replace(&mut self.0.iterable, JsValue::Undefined);
+                runtime.release_jsvalue(iterable)?;
                 self.0.iterator = Some(iterator.clone());
                 self.0.phase = Phase::NextMethod;
+                let key =
+                    runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Next)?;
                 Ok(AggregateStep::Read {
-                    receiver: Value::Object(iterator),
-                    key: runtime
-                        .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Next)?,
+                    receiver: JsValue::Object(iterator.into_handle()),
+                    key,
                     resume: self,
                 })
             }
             Phase::NextMethod => {
-                self.0.next = value;
+                runtime.release_jsvalue(std::mem::replace(&mut self.0.next, value))?;
                 self.0.result = Some(runtime.new_array(self.0.realm)?);
-                self.next()
+                self.next(runtime)
             }
-            _ => Err(RuntimeError::Invariant(
-                "AggregateError value phase mismatch",
-            )),
+            _ => {
+                runtime.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant(
+                    "AggregateError value phase mismatch",
+                ))
+            }
         }
     }
-    fn next(mut self) -> Result<AggregateStep, RuntimeError> {
+    fn next(mut self, runtime: &Runtime) -> Result<AggregateStep, RuntimeError> {
         self.0.phase = Phase::Next;
         Ok(AggregateStep::Next {
             iterator: self
@@ -172,16 +202,17 @@ impl AggregateResume {
                 .iterator
                 .clone()
                 .ok_or(RuntimeError::Invariant("AggregateError iterator missing"))?,
-            next: self.0.next.clone(),
+            next: runtime.dup_jsvalue(&self.0.next)?,
             resume: self,
         })
     }
-    fn close(self, value: Value) -> Result<AggregateStep, RuntimeError> {
+    fn close(self, runtime: &Runtime, value: JsValue) -> Result<AggregateStep, RuntimeError> {
+        let Some(iterator) = self.0.iterator.clone() else {
+            runtime.release_jsvalue(value)?;
+            return Err(RuntimeError::Invariant("AggregateError iterator missing"));
+        };
         Ok(AggregateStep::Close {
-            iterator: self
-                .0
-                .iterator
-                .ok_or(RuntimeError::Invariant("AggregateError iterator missing"))?,
+            iterator,
             completion: Completion::Throw(value),
         })
     }
@@ -191,6 +222,9 @@ impl AggregateResume {
         result: ObjectIteratorStep,
     ) -> Result<AggregateStep, RuntimeError> {
         if !matches!(self.0.phase, Phase::Next) {
+            if let ObjectIteratorStep::Yield(value) | ObjectIteratorStep::Throw(value) = result {
+                runtime.release_jsvalue(value)?;
+            }
             return Err(RuntimeError::Invariant(
                 "AggregateError iterator phase mismatch",
             ));
@@ -198,43 +232,42 @@ impl AggregateResume {
         let value = match result {
             ObjectIteratorStep::Yield(value) => value,
             ObjectIteratorStep::Done => {
-                return Ok(AggregateStep::Complete(Completion::Return(Value::Object(
-                    self.0
-                        .result
-                        .ok_or(RuntimeError::Invariant("AggregateError result missing"))?,
-                ))));
+                let result = self
+                    .0
+                    .result
+                    .clone()
+                    .ok_or(RuntimeError::Invariant("AggregateError result missing"))?;
+                return Ok(AggregateStep::Complete(Completion::Return(
+                    JsValue::Object(result.into_handle()),
+                )));
             }
-            ObjectIteratorStep::Throw(value) => return self.close(value),
+            ObjectIteratorStep::Throw(value) => return self.close(runtime, value),
         };
+        self.0.item = Some(value);
         let result = self
             .0
             .result
             .as_ref()
             .ok_or(RuntimeError::Invariant("AggregateError result missing"))?;
         let key = runtime.intern_property_key(&self.0.index.to_string())?;
-        // The result has not been exposed to JavaScript: own data definition on this fresh Array is callback-free.
-        match runtime.define_own_property(
-            result,
-            &key,
-            &OrdinaryPropertyDescriptor {
-                value: DescriptorField::Present(value),
-                writable: DescriptorField::Present(true),
-                enumerable: DescriptorField::Present(true),
-                configurable: DescriptorField::Present(true),
-                ..OrdinaryPropertyDescriptor::new()
-            },
-        )? {
-            true => {}
-            false => {
+        let outcome =
+            runtime.define_selected_set_data(result, &key, self.0.item.as_ref().unwrap(), false)?;
+        runtime.release_jsvalue(self.0.item.take().unwrap())?;
+        match outcome {
+            crate::engine::object::operations::PropertyDefineOutcome::Defined(true) => {}
+            crate::engine::object::operations::PropertyDefineOutcome::Defined(false) => {
                 return Err(RuntimeError::Invariant(
                     "fresh AggregateError Array rejected indexed property",
                 ));
+            }
+            crate::engine::object::operations::PropertyDefineOutcome::Throw(value) => {
+                return Ok(AggregateStep::Complete(Completion::Throw(value)));
             }
         }
         self.0.index = self.0.index.checked_add(1).ok_or(RuntimeError::Invariant(
             "AggregateError iterable exceeded Uint64 indices",
         ))?;
-        self.next()
+        self.next(runtime)
     }
 }
 pub(crate) fn finish(
@@ -251,7 +284,7 @@ pub(crate) fn finish(
                 resume,
             } => resume.resume(
                 runtime,
-                runtime.get_value_property_in_realm(realm, receiver, &key)?,
+                runtime.get_value_property_in_realm_jsvalue(realm, receiver, &key)?,
             )?,
             AggregateStep::Call {
                 callable,
@@ -259,7 +292,7 @@ pub(crate) fn finish(
                 resume,
             } => resume.resume(
                 runtime,
-                runtime.call_internal(realm, &callable, receiver, &[])?,
+                runtime.call_internal_jsvalue(realm, &callable, receiver, Vec::new())?,
             )?,
             AggregateStep::Next {
                 iterator,
@@ -270,7 +303,7 @@ pub(crate) fn finish(
                 finish_next(
                     runtime,
                     realm,
-                    NextStep::start(runtime, realm, iterator, next)?,
+                    NextStep::start_jsvalue(runtime, realm, iterator, next)?,
                 )?,
             )?,
             AggregateStep::Close {

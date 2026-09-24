@@ -7,6 +7,7 @@
 
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
+use crate::engine::atom::AtomIdx;
 use crate::engine::heap::roots::VarRefRoot;
 
 use crate::engine::heap::{ContextId, ObjectData, ObjectPayload, PropertySlot, RawValue};
@@ -21,7 +22,7 @@ use crate::engine::object::{
     CompleteOrdinaryPropertyDescriptor, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey,
     WellKnownSymbol,
 };
-use crate::engine::value::Value;
+use crate::engine::value::{JsValue, Value};
 
 /// Keys remain rooted until the complete layout has retained its atoms.
 /// This concrete builder keeps metadata and slots parallel in one operation.
@@ -42,7 +43,7 @@ impl ArgumentsLayout {
 
     fn push(&mut self, key: PropertyKey, flags: PropertyFlags, slot: PropertySlot) {
         self.entries.push(ShapeEntry {
-            atom: key.atom(),
+            atom: AtomIdx::from_raw(key.atom().raw()),
             flags,
         });
         self.slots.push(slot);
@@ -56,25 +57,28 @@ impl Runtime {
     pub(crate) fn new_unmapped_arguments_object(
         &self,
         realm: ContextId,
-        values: Vec<Value>,
+        values: Vec<JsValue>,
     ) -> Result<ObjectRef, RuntimeError> {
-        for value in &values {
-            self.validate_value_domain(value, "unmapped arguments element")?;
+        let result = (|| {
+            let length = u32::try_from(values.len()).map_err(|_| {
+                RuntimeError::Invariant("actual argument count exceeded QuickJS Uint32 storage")
+            })?;
+            let mut layout = ArgumentsLayout::new(values.len());
+            for (index, value) in values.iter().enumerate() {
+                let key = self.property_key_for_index(index as u64)?;
+                layout.push(
+                    key,
+                    PropertyFlags::data(true, true, true),
+                    PropertySlot::Data(value.as_raw()),
+                );
+            }
+            self.prepare_arguments_common_properties(realm, length, None, &mut layout)?;
+            self.new_arguments_object_base(realm, false, length, layout)
+        })();
+        for value in values {
+            self.release_jsvalue(value)?;
         }
-        let length = u32::try_from(values.len()).map_err(|_| {
-            RuntimeError::Invariant("actual argument count exceeded QuickJS Uint32 storage")
-        })?;
-        let mut layout = ArgumentsLayout::new(values.len());
-        for (index, value) in values.iter().enumerate() {
-            let key = self.property_key_for_index(index as u64)?;
-            layout.push(
-                key,
-                PropertyFlags::data(true, true, true),
-                PropertySlot::Data(self.raw_property_value(value)?),
-            );
-        }
-        self.prepare_arguments_common_properties(realm, length, None, &mut layout)?;
-        self.new_arguments_object_base(realm, false, length, layout)
+        result
     }
 
     /// Build QuickJS `JS_CLASS_MAPPED_ARGUMENTS`. Each supplied root is one
@@ -169,10 +173,11 @@ impl Runtime {
 
         let length_key =
             self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Length)?;
+        let converted_length = self.raw_property_value(&Self::array_length_value(length))?;
         layout.push(
             length_key,
             PropertyFlags::data(true, false, true),
-            PropertySlot::Data(self.raw_property_value(&Self::array_length_value(length))?),
+            PropertySlot::Data(converted_length.raw()),
         );
 
         let callee = self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Callee)?;
@@ -304,7 +309,7 @@ impl Runtime {
                 enumerable,
                 configurable,
             } => {
-                self.write_var_ref(&var_ref, value)?;
+                self.write_var_ref(&var_ref, self.unroot_value(&value)?)?;
                 self.store_property_slot(
                     object,
                     key,
@@ -318,11 +323,98 @@ impl Runtime {
                 let CompleteOrdinaryPropertyDescriptor::Data { value, .. } = &complete else {
                     unreachable!()
                 };
-                self.write_var_ref(&var_ref, value.clone())?;
+                self.write_var_ref(&var_ref, self.unroot_value(value)?)?;
                 self.store_complete_property(object, key, complete)?;
             }
             complete @ CompleteOrdinaryPropertyDescriptor::Accessor { .. } => {
                 self.store_complete_property(object, key, complete)?;
+            }
+        }
+        Ok(Some(true))
+    }
+
+    pub(crate) fn define_arguments_index_owned(
+        &self,
+        object: &ObjectRef,
+        key: &PropertyKey,
+        descriptor: &crate::engine::object::OwnedPropertyDescriptor,
+    ) -> Result<Option<bool>, RuntimeError> {
+        use crate::engine::object::property::CompletePropertyDescriptor;
+        let Some((index, mapped, fast_len)) = self.arguments_index_state(object, key)? else {
+            return Ok(None);
+        };
+        if fast_len.is_some_and(|fast_len| index < fast_len) {
+            self.set_arguments_fast_len(object, None)?;
+        }
+        let Some(var_ref) = self.own_var_ref_root(object, key)? else {
+            return self
+                .define_ordinary_owned_property(object, key, descriptor)
+                .map(Some);
+        };
+        if !mapped {
+            return Err(RuntimeError::Invariant(
+                "unmapped Arguments object contains a mapped VarRef slot",
+            ));
+        }
+        let current = self
+            .get_own_property_owned(object, key)?
+            .ok_or(RuntimeError::Invariant(
+                "mapped Arguments VarRef lost its property",
+            ))?;
+        let record = descriptor.raw_record();
+        let extensible = self.is_extensible(object)?;
+        let complete = {
+            let state = self.0.state.borrow();
+            validate_and_apply_property_descriptor(
+                extensible,
+                &record,
+                Some(current.record()),
+                &RawValue::Undefined,
+                |a, b| crate::engine::value::collection_key::same_value(&state.heap, a, b),
+            )
+        };
+        let complete = match complete {
+            Ok(value) => value,
+            Err(PropertyDefinitionError::InvalidDescriptor) => {
+                return Err(PropertyDefinitionError::InvalidDescriptor.into());
+            }
+            Err(_) => return Ok(Some(false)),
+        };
+        match &complete {
+            CompletePropertyDescriptor::Data {
+                value,
+                writable: true,
+                enumerable,
+                configurable,
+            } => {
+                self.write_var_ref(
+                    &var_ref,
+                    self.dup_jsvalue(
+                        &JsValue::from_raw(value.clone()).expect("initialized mapped argument"),
+                    )?,
+                )?;
+                self.store_property_slot(
+                    object,
+                    key,
+                    PropertyFlags::data(true, *enumerable, *configurable),
+                    PropertySlot::VarRef(var_ref.id()),
+                )?;
+            }
+            CompletePropertyDescriptor::Data {
+                value,
+                writable: false,
+                ..
+            } => {
+                self.write_var_ref(
+                    &var_ref,
+                    self.dup_jsvalue(
+                        &JsValue::from_raw(value.clone()).expect("initialized mapped argument"),
+                    )?,
+                )?;
+                self.store_complete_raw_property(object, key, complete)?;
+            }
+            CompletePropertyDescriptor::Accessor { .. } => {
+                self.store_complete_raw_property(object, key, complete)?
             }
         }
         Ok(Some(true))
@@ -334,7 +426,7 @@ impl Runtime {
         &self,
         object: &ObjectRef,
         key: &PropertyKey,
-        value: &Value,
+        value: &JsValue,
     ) -> Result<bool, RuntimeError> {
         if self.arguments_index_state(object, key)?.is_none() {
             return Ok(false);
@@ -343,7 +435,7 @@ impl Runtime {
             let state = self.0.state.borrow();
             let object_data = state.heap.object(object.object_id())?;
             let shape = state.heap.shape(object_data.shape)?;
-            let Some(index) = shape.find(key.atom()) else {
+            let Some(index) = shape.find(AtomIdx::from_raw(key.atom().raw())) else {
                 return Ok(false);
             };
             let index = usize::try_from(index)
@@ -359,15 +451,16 @@ impl Runtime {
         match slot {
             PropertySlot::VarRef(id) => {
                 let root = VarRefRoot::from_borrowed_handle(self.clone(), id)?;
-                self.write_var_ref(&root, value.clone())?;
+                self.write_var_ref(&root, self.dup_jsvalue(value)?)?;
             }
             PropertySlot::Data(_) => {
-                self.store_property_slot(
+                let stored = self.store_property_slot(
                     object,
                     key,
                     flags,
-                    PropertySlot::Data(self.raw_property_value(value)?),
-                )?;
+                    PropertySlot::Data(value.as_raw()),
+                );
+                stored?;
             }
             PropertySlot::Accessor { .. } | PropertySlot::AutoInit(_) => return Ok(false),
         }
@@ -411,7 +504,7 @@ mod tests {
         );
 
         let arguments = runtime
-            .new_unmapped_arguments_object(context.realm, vec![Value::Int(10), Value::Int(20)])
+            .new_unmapped_arguments_object(context.realm, vec![JsValue::Int(10), JsValue::Int(20)])
             .unwrap();
         assert_eq!(
             runtime
@@ -544,7 +637,7 @@ mod tests {
         let mut context = runtime.new_context();
         let callee = context.function_prototype().unwrap();
         let root = runtime
-            .new_var_ref(Value::Int(1), false, false, ClosureVariableKind::Normal)
+            .new_var_ref(JsValue::Int(1), false, false, ClosureVariableKind::Normal)
             .unwrap();
         let arguments = runtime
             .new_mapped_arguments_object(context.realm, &callee, vec![root.clone()])
@@ -556,10 +649,10 @@ mod tests {
                 .set_property(&arguments, &zero, Value::Int(2))
                 .unwrap()
         );
-        assert_eq!(runtime.read_var_ref(&root).unwrap(), Value::Int(2));
+        assert_eq!(runtime.read_var_ref(&root).unwrap(), JsValue::Int(2));
         assert_eq!(runtime.arguments_fast_len(&arguments), Ok(Some(1)));
 
-        runtime.write_var_ref(&root, Value::Int(3)).unwrap();
+        runtime.write_var_ref(&root, JsValue::Int(3)).unwrap();
         assert_eq!(
             context.get_property(&arguments, &zero).unwrap(),
             Value::Int(3)
@@ -577,9 +670,9 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert_eq!(runtime.read_var_ref(&root).unwrap(), Value::Int(4));
+        assert_eq!(runtime.read_var_ref(&root).unwrap(), JsValue::Int(4));
         assert_eq!(runtime.arguments_fast_len(&arguments), Ok(None));
-        runtime.write_var_ref(&root, Value::Int(5)).unwrap();
+        runtime.write_var_ref(&root, JsValue::Int(5)).unwrap();
         assert_eq!(
             context.get_property(&arguments, &zero).unwrap(),
             Value::Int(5)
@@ -598,8 +691,8 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert_eq!(runtime.read_var_ref(&root).unwrap(), Value::Int(6));
-        runtime.write_var_ref(&root, Value::Int(7)).unwrap();
+        assert_eq!(runtime.read_var_ref(&root).unwrap(), JsValue::Int(6));
+        runtime.write_var_ref(&root, JsValue::Int(7)).unwrap();
         assert_eq!(
             context.get_property(&arguments, &zero).unwrap(),
             Value::Int(6)
@@ -622,10 +715,10 @@ mod tests {
         let mut context = runtime.new_context();
         let callee = context.function_prototype().unwrap();
         let first = runtime
-            .new_var_ref(Value::Int(1), false, false, ClosureVariableKind::Normal)
+            .new_var_ref(JsValue::Int(1), false, false, ClosureVariableKind::Normal)
             .unwrap();
         let second = runtime
-            .new_var_ref(Value::Int(2), false, false, ClosureVariableKind::Normal)
+            .new_var_ref(JsValue::Int(2), false, false, ClosureVariableKind::Normal)
             .unwrap();
         let tail = runtime
             .new_mapped_arguments_object(
@@ -649,7 +742,7 @@ mod tests {
         assert!(runtime.delete_property(&middle, &zero).unwrap());
         assert_eq!(runtime.arguments_fast_len(&middle), Ok(None));
         assert!(context.set_property(&middle, &zero, Value::Int(8)).unwrap());
-        runtime.write_var_ref(&first, Value::Int(9)).unwrap();
+        runtime.write_var_ref(&first, JsValue::Int(9)).unwrap();
         assert_eq!(context.get_property(&middle, &zero).unwrap(), Value::Int(8));
     }
 }

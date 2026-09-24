@@ -1,9 +1,10 @@
 //! Bounded native-stack dispatch for read requests.
+use super::JsValue;
 use super::{
     Completion, DescriptorStep, DirectCallTarget, Error, NativeConversion, Next, OrdinaryRead,
     PreparedHas, ProxyBooleanKind, ProxyBooleanStep, ProxyGetStep, ProxyOwnStep,
     ProxyPrototypeKind, ProxyPrototypeStep, Query, Resume, ReturnOwner, RunningExecution, Runtime,
-    Step, Value, overflow, runtime_error_to_vm_error,
+    Step, overflow, runtime_error_to_vm_error,
 };
 
 #[inline(never)]
@@ -24,24 +25,22 @@ pub(super) fn prototype(
         let realm = query.realm;
         match &mut *step {
             Step::OwnComplete(descriptor) => {
-                let descriptor = descriptor.take().expect("selected Step field");
-
                 let parent = query
                     .parents
                     .pop()
                     .ok_or_else(|| Error::internal("descriptor reply has no parent operation"))?;
+                let descriptor = descriptor.take().expect("selected Step field");
                 *step = parent
                     .descriptor(runtime, descriptor)
                     .map_err(runtime_error_to_vm_error)?;
                 continue;
             }
             Step::BooleanComplete(result) => {
-                let result = result.take().expect("selected Step field");
-
                 let resume = query
                     .parents
                     .pop()
                     .ok_or_else(|| Error::internal("boolean reply has no parent operation"))?;
+                let result = result.take().expect("selected Step field");
                 *step = resume
                     .boolean(runtime, result)
                     .map_err(runtime_error_to_vm_error)?;
@@ -49,7 +48,6 @@ pub(super) fn prototype(
             }
             Step::GetPrototype { object, resume } => {
                 let object = object.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
                 if runtime
                     .is_proxy_object(&object)
@@ -63,6 +61,8 @@ pub(super) fn prototype(
                             unreachable!()
                         };
                         *step = resume
+                            .take()
+                            .expect("selected Step field")
                             .prototype(runtime, NativeConversion::Throw(value))
                             .map_err(runtime_error_to_vm_error)?;
                         continue;
@@ -71,9 +71,9 @@ pub(super) fn prototype(
                         .parents
                         .try_reserve(1)
                         .map_err(|_| Error::internal("property continuation allocation failed"))?;
-                    query
-                        .parents
-                        .push(Resume::PrototypeGetReply(Box::new(resume)));
+                    query.parents.push(Resume::PrototypeGetReply(Box::new(
+                        resume.take().expect("selected Step field"),
+                    )));
                     *step =
                         ProxyPrototypeStep::start(runtime, realm, object, ProxyPrototypeKind::Get)
                             .map_err(runtime_error_to_vm_error)?
@@ -83,6 +83,8 @@ pub(super) fn prototype(
                         .get_prototype_of(&object)
                         .map_err(runtime_error_to_vm_error)?;
                     *step = resume
+                        .take()
+                        .expect("selected Step field")
                         .prototype(runtime, NativeConversion::Value(result))
                         .map_err(runtime_error_to_vm_error)?;
                 }
@@ -95,7 +97,6 @@ pub(super) fn prototype(
             } => {
                 let object = object.take().expect("selected Step field");
                 let prototype = prototype.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
                 if runtime
                     .is_proxy_object(&object)
@@ -109,6 +110,8 @@ pub(super) fn prototype(
                             unreachable!()
                         };
                         *step = resume
+                            .take()
+                            .expect("selected Step field")
                             .boolean(runtime, NativeConversion::Throw(value))
                             .map_err(runtime_error_to_vm_error)?;
                         continue;
@@ -117,9 +120,9 @@ pub(super) fn prototype(
                         .parents
                         .try_reserve(1)
                         .map_err(|_| Error::internal("property continuation allocation failed"))?;
-                    query
-                        .parents
-                        .push(Resume::PrototypeSetReply(Box::new(resume)));
+                    query.parents.push(Resume::PrototypeSetReply(Box::new(
+                        resume.take().expect("selected Step field"),
+                    )));
                     *step = ProxyPrototypeStep::start(
                         runtime,
                         realm,
@@ -133,6 +136,8 @@ pub(super) fn prototype(
                         .set_prototype_of(&object, prototype.as_ref())
                         .map_err(runtime_error_to_vm_error)?;
                     *step = resume
+                        .take()
+                        .expect("selected Step field")
                         .boolean(runtime, NativeConversion::Value(result))
                         .map_err(runtime_error_to_vm_error)?;
                 }
@@ -167,7 +172,6 @@ pub(super) fn attributes(
             } => {
                 let object = object.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
                 if runtime
                     .is_proxy_object(&object)
@@ -181,6 +185,8 @@ pub(super) fn attributes(
                             unreachable!()
                         };
                         *step = resume
+                            .take()
+                            .expect("selected Step field")
                             .boolean(runtime, NativeConversion::Throw(value))
                             .map_err(runtime_error_to_vm_error)?;
                         continue;
@@ -189,7 +195,9 @@ pub(super) fn attributes(
                         .parents
                         .try_reserve(1)
                         .map_err(|_| Error::internal("property continuation allocation failed"))?;
-                    query.parents.push(resume);
+                    query
+                        .parents
+                        .push(resume.take().expect("selected Step field"));
                     *step = ProxyBooleanStep::start(
                         runtime,
                         realm,
@@ -203,6 +211,8 @@ pub(super) fn attributes(
                         .delete_property(&object, &key)
                         .map_err(runtime_error_to_vm_error)?;
                     *step = resume
+                        .take()
+                        .expect("selected Step field")
                         .boolean(runtime, NativeConversion::Value(result))
                         .map_err(runtime_error_to_vm_error)?;
                 }
@@ -210,7 +220,6 @@ pub(super) fn attributes(
             }
             Step::PreventExtensions { object, resume } => {
                 let object = object.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
                 if runtime
                     .is_proxy_object(&object)
@@ -224,6 +233,8 @@ pub(super) fn attributes(
                             unreachable!()
                         };
                         *step = resume
+                            .take()
+                            .expect("selected Step field")
                             .boolean(runtime, NativeConversion::Throw(value))
                             .map_err(runtime_error_to_vm_error)?;
                         continue;
@@ -232,7 +243,9 @@ pub(super) fn attributes(
                         .parents
                         .try_reserve(1)
                         .map_err(|_| Error::internal("property continuation allocation failed"))?;
-                    query.parents.push(resume);
+                    query
+                        .parents
+                        .push(resume.take().expect("selected Step field"));
                     *step = ProxyBooleanStep::start(
                         runtime,
                         realm,
@@ -246,6 +259,8 @@ pub(super) fn attributes(
                         .internal_prevent_extensions(realm, &object)
                         .map_err(runtime_error_to_vm_error)?;
                     *step = resume
+                        .take()
+                        .expect("selected Step field")
                         .boolean(runtime, result)
                         .map_err(runtime_error_to_vm_error)?;
                 }
@@ -253,7 +268,6 @@ pub(super) fn attributes(
             }
             Step::Extensible { object, resume } => {
                 let object = object.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
                 if runtime
                     .is_proxy_object(&object)
@@ -263,7 +277,9 @@ pub(super) fn attributes(
                         .parents
                         .try_reserve(1)
                         .map_err(|_| Error::internal("property continuation allocation failed"))?;
-                    query.parents.push(resume);
+                    query
+                        .parents
+                        .push(resume.take().expect("selected Step field"));
                     *step = ProxyBooleanStep::start(
                         runtime,
                         realm,
@@ -278,6 +294,8 @@ pub(super) fn attributes(
                     .is_extensible(&object)
                     .map_err(runtime_error_to_vm_error)?;
                 *step = resume
+                    .take()
+                    .expect("selected Step field")
                     .boolean(runtime, NativeConversion::Value(result))
                     .map_err(runtime_error_to_vm_error)?;
                 continue;
@@ -303,27 +321,26 @@ pub(super) fn get(
         let realm = query.realm;
         let (target, receiver, arguments, resume) = match &mut *step {
             Step::Convert { value, resume } => {
-                let value = value.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
-
                 query
                     .parents
                     .try_reserve(1)
                     .map_err(|_| Error::internal("property continuation allocation failed"))?;
-                query.parents.push(resume);
-                *step = DescriptorStep::start(runtime, realm, value)
+                let value = value.take().expect("selected Step field");
+                query
+                    .parents
+                    .push(resume.take().expect("selected Step field"));
+                *step = DescriptorStep::start_jsvalue(runtime, realm, value)
                     .map_err(runtime_error_to_vm_error)?
                     .into();
                 continue;
             }
             Step::Converted(result) => {
-                let result = result.take().expect("selected Step field");
-
                 let Some(resume) = query.parents.pop() else {
                     return Err(Error::internal(
                         "converted descriptor has no matching property operation",
                     ));
                 };
+                let result = result.take().expect("selected Step field");
                 *step = resume
                     .converted(runtime, result)
                     .map_err(runtime_error_to_vm_error)?;
@@ -336,7 +353,6 @@ pub(super) fn get(
             } => {
                 let object = object.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
                 let probe = runtime
                     .prepare_has_property(&object, &key)
@@ -344,18 +360,19 @@ pub(super) fn get(
                 *step = Step::PreparedHas {
                     probe: Some(probe),
                     key: Some(key),
-                    resume: Some(resume),
+                    resume: Some(resume.take().expect("selected Step field")),
                 };
                 continue;
             }
             Step::PreparedHas { probe, key, resume } => {
                 let probe = probe.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
                 match probe {
                     PreparedHas::Complete(value) => {
                         *step = resume
+                            .take()
+                            .expect("selected Step field")
                             .boolean(runtime, NativeConversion::Value(value))
                             .map_err(runtime_error_to_vm_error)?
                     }
@@ -363,7 +380,9 @@ pub(super) fn get(
                         query.parents.try_reserve(1).map_err(|_| {
                             Error::internal("property continuation allocation failed")
                         })?;
-                        query.parents.push(resume);
+                        query
+                            .parents
+                            .push(resume.take().expect("selected Step field"));
                         *step = ProxyBooleanStep::start(
                             runtime,
                             realm,
@@ -385,28 +404,33 @@ pub(super) fn get(
                 let object = object.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
                 let receiver = receiver.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
-                let read = runtime
-                    .prepare_ordinary_read(&object, &key, receiver)
-                    .map_err(runtime_error_to_vm_error)?;
+                let read = runtime.prepare_ordinary_read_selected(&object, &key, &receiver, None);
+                let _ = runtime.release_jsvalue(receiver);
+                let read = match read {
+                    Ok(read) => read,
+                    Err(error) => {
+                        return Err(runtime_error_to_vm_error(error));
+                    }
+                };
                 *step = Step::PreparedRead {
                     read: Some(read),
                     key: Some(key),
-                    resume: Some(resume),
+                    resume: Some(resume.take().expect("selected Step field")),
                 };
                 continue;
             }
             Step::PreparedRead { read, key, resume } => {
                 let read = read.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
                 match read {
                     OrdinaryRead::Complete(value) => {
                         *step = resume
+                            .take()
+                            .expect("selected Step field")
                             .resume(
                                 runtime,
-                                Completion::Return(value.unwrap_or(Value::Undefined)),
+                                Completion::Return(value.unwrap_or(JsValue::Undefined)),
                             )
                             .map_err(runtime_error_to_vm_error)?;
                         continue;
@@ -415,7 +439,7 @@ pub(super) fn get(
                         DirectCallTarget::Callable(getter),
                         receiver,
                         Vec::new(),
-                        resume,
+                        resume.take().expect("selected Step field"),
                     ),
                     OrdinaryRead::Special {
                         object, receiver, ..
@@ -424,22 +448,33 @@ pub(super) fn get(
                             .frames
                             .can_push_with_continuations(query.continuation_depth())
                         {
+                            runtime
+                                .release_jsvalue(receiver)
+                                .map_err(runtime_error_to_vm_error)?;
+                            let completion = overflow(runtime, realm)?;
                             *step = resume
-                                .resume(runtime, overflow(runtime, realm)?)
+                                .take()
+                                .expect("selected Step field")
+                                .resume(runtime, completion)
                                 .map_err(runtime_error_to_vm_error)?;
                             continue;
                         }
-                        query.parents.try_reserve(1).map_err(|_| {
-                            Error::internal("property continuation allocation failed")
-                        })?;
-                        query.parents.push(resume);
+                        if query.parents.try_reserve(1).is_err() {
+                            let _ = runtime.release_jsvalue(receiver);
+                            return Err(Error::internal("property continuation allocation failed"));
+                        }
+                        let arguments = match execution.slots.take_argument_buffer(3) {
+                            Ok(arguments) => arguments,
+                            Err(error) => {
+                                let _ = runtime.release_jsvalue(receiver);
+                                return Err(error);
+                            }
+                        };
+                        query
+                            .parents
+                            .push(resume.take().expect("selected Step field"));
                         *step = ProxyGetStep::start_buffered(
-                            runtime,
-                            realm,
-                            object,
-                            key,
-                            receiver,
-                            execution.slots.take_argument_buffer(3)?,
+                            runtime, realm, object, key, receiver, arguments,
                         )
                         .map_err(runtime_error_to_vm_error)?
                         .into();
@@ -456,8 +491,12 @@ pub(super) fn get(
                 let target = target.take().expect("selected Step field");
                 let receiver = receiver.take().expect("selected Step field");
                 let arguments = arguments.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
-                (target, receiver, arguments, resume)
+                (
+                    target,
+                    receiver,
+                    arguments,
+                    resume.take().expect("selected Step field"),
+                )
             }
             Step::Descriptor {
                 object,
@@ -466,7 +505,6 @@ pub(super) fn get(
             } => {
                 let object = object.take().expect("selected Step field");
                 let key = key.take().expect("selected Step field");
-                let resume = resume.take().expect("selected Step field");
 
                 if runtime
                     .is_proxy_object(&object)
@@ -476,16 +514,20 @@ pub(super) fn get(
                         .parents
                         .try_reserve(1)
                         .map_err(|_| Error::internal("property continuation allocation failed"))?;
-                    query.parents.push(resume);
+                    query
+                        .parents
+                        .push(resume.take().expect("selected Step field"));
                     *step = ProxyOwnStep::start(runtime, realm, object, key)
                         .map_err(runtime_error_to_vm_error)?
                         .into();
                     continue;
                 }
                 let descriptor = runtime
-                    .internal_get_own_property(realm, &object, &key)
+                    .internal_get_own_property_owned(realm, &object, &key)
                     .map_err(runtime_error_to_vm_error)?;
                 *step = resume
+                    .take()
+                    .expect("selected Step field")
                     .descriptor(runtime, descriptor)
                     .map_err(runtime_error_to_vm_error)?;
                 continue;

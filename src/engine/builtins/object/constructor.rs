@@ -3,7 +3,7 @@ use crate::engine::{
     api::{runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
     object::ObjectRef,
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{
         Completion,
         call::{
@@ -15,7 +15,7 @@ use crate::engine::{
 pub(crate) enum ObjectConstructorStep {
     Complete(Completion),
     Prototype {
-        new_target: Value,
+        new_target: JsValue,
         resume: ObjectConstructorResume,
     },
 }
@@ -33,25 +33,27 @@ impl ObjectConstructorStep {
             ));
         };
         let active = runtime.active_function()?;
-        let is_active = matches!(new_target, Value::Object(object) if object == &active);
-        if !matches!(new_target, Value::Undefined) && !is_active {
+        let is_active = matches!(new_target, JsValue::Object(id) if *id == active.object_id());
+        if !matches!(new_target, JsValue::Undefined) && !is_active {
             return Ok(Self::Prototype {
-                new_target: new_target.clone(),
+                new_target: runtime.dup_jsvalue(new_target)?,
                 resume: ObjectConstructorResume,
             });
         }
         let argument = arguments.readable.first().ok_or(RuntimeError::Invariant(
             "Object constructor argv was not padded",
         ))?;
-        if matches!(argument, Value::Null | Value::Undefined) {
+        if matches!(argument, JsValue::Null | JsValue::Undefined) {
             return ObjectConstructorResume.prototype(
                 runtime,
                 NativeConversion::Value(ConstructorPrototypeSource::Realm(realm)),
             );
         }
         Ok(Self::Complete(
-            match runtime.native_to_object(realm, argument.clone())? {
-                NativeConversion::Value(object) => Completion::Return(Value::Object(object)),
+            match runtime.native_to_object_jsvalue(realm, runtime.dup_jsvalue(argument)?)? {
+                NativeConversion::Value(object) => {
+                    Completion::Return(JsValue::Object(object.into_handle()))
+                }
                 NativeConversion::Throw(value) => Completion::Throw(value),
             },
         ))
@@ -80,7 +82,7 @@ impl ObjectConstructorResume {
             }
         };
         Ok(ObjectConstructorStep::Complete(Completion::Return(
-            Value::Object(runtime.new_object(Some(&prototype))?),
+            JsValue::Object(runtime.new_object(Some(&prototype))?.into_handle()),
         )))
     }
 }

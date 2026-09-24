@@ -4,7 +4,7 @@ use crate::engine::{
     builtins::native::TypedArrayElementKind,
     heap::ContextId,
     object::{ObjectRef, PropertyKey},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{
         Completion, ToPrimitiveHint,
         call::{NativeArguments, NativeInvocation},
@@ -13,7 +13,7 @@ use crate::engine::{
 pub(crate) enum TypedSetStep {
     Complete(Completion),
     Primitive {
-        value: Value,
+        value: JsValue,
         resume: TypedSetResume,
     },
     Read {
@@ -23,7 +23,7 @@ pub(crate) enum TypedSetStep {
     },
     Element {
         element: TypedArrayElementKind,
-        value: Value,
+        value: JsValue,
         resume: TypedSetResume,
     },
 }
@@ -41,8 +41,17 @@ impl std::ops::DerefMut for TypedSetResume {
 }
 const _: () = assert!(std::mem::size_of::<TypedSetResume>() <= 8);
 pub(crate) struct TypedSetResumeState {
+    runtime: Runtime,
+    source: JsValue,
     realm: ContextId,
     phase: SetPhase,
+}
+impl Drop for TypedSetResumeState {
+    fn drop(&mut self) {
+        let _ = self
+            .runtime
+            .release_jsvalue(std::mem::replace(&mut self.source, JsValue::Undefined));
+    }
 }
 struct SetState {
     target: ObjectRef,
@@ -53,7 +62,8 @@ struct SetState {
     index: u64,
 }
 enum SetPhase {
-    Offset { target: ObjectRef, source: Value },
+    Empty,
+    Offset { target: ObjectRef },
     Length(SetState),
     LengthNumber(SetState),
     Read(SetState),
@@ -71,31 +81,25 @@ impl TypedSetStep {
                 "TypedArray.prototype.set received a constructor invocation",
             ));
         };
-        let target = match runtime.require_typed_array(realm, this_value.clone())? {
+        let target = match runtime.require_typed_array_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
+            NativeConversion::Throw(value) => {
+                return Ok(Self::Complete(Completion::Throw(value)));
+            }
         };
-        let value = arguments
-            .readable
-            .get(1)
-            .ok_or(RuntimeError::Invariant(
-                "TypedArray.set offset argv was not padded",
-            ))?
-            .clone();
-        let source = arguments
-            .readable
-            .first()
-            .ok_or(RuntimeError::Invariant(
-                "TypedArray.set source argv was not padded",
-            ))?
-            .clone();
-        Ok(Self::Primitive {
-            value,
-            resume: TypedSetResume(Box::new(TypedSetResumeState {
-                realm,
-                phase: SetPhase::Offset { target, source },
-            })),
-        })
+        let mut resume = TypedSetResume(Box::new(TypedSetResumeState {
+            runtime: runtime.clone(),
+            realm,
+            source: JsValue::Undefined,
+            phase: SetPhase::Offset { target },
+        }));
+        resume.0.source = runtime.dup_jsvalue(arguments.readable.first().ok_or(
+            RuntimeError::Invariant("TypedArray.set source argv was not padded"),
+        )?)?;
+        let value = runtime.dup_jsvalue(arguments.readable.get(1).ok_or(
+            RuntimeError::Invariant("TypedArray.set offset argv was not padded"),
+        )?)?;
+        Ok(Self::Primitive { value, resume })
     }
 }
 impl TypedSetResume {
@@ -105,19 +109,23 @@ impl TypedSetResume {
         state: SetState,
     ) -> Result<TypedSetStep, RuntimeError> {
         if state.index == state.length {
-            return Ok(TypedSetStep::Complete(Completion::Return(Value::Undefined)));
+            return Ok(TypedSetStep::Complete(Completion::Return(
+                JsValue::Undefined,
+            )));
         }
         Ok(TypedSetStep::Read {
             object: state.source.clone(),
             key: runtime.property_key_for_index(state.index)?,
             resume: Self(Box::new(TypedSetResumeState {
+                runtime: runtime.clone(),
+                source: JsValue::Undefined,
                 realm,
                 phase: SetPhase::Read(state),
             })),
         })
     }
     pub(crate) fn resume(
-        self,
+        mut self,
         runtime: &Runtime,
         result: Completion,
     ) -> Result<TypedSetStep, RuntimeError> {
@@ -128,22 +136,25 @@ impl TypedSetResume {
             }
         };
         let realm = self.0.realm;
-        match self.0.phase {
-            SetPhase::Offset { target, source } => {
-                if matches!(value, Value::Object(_)) {
+        match std::mem::replace(&mut self.0.phase, SetPhase::Empty) {
+            SetPhase::Offset { target } => {
+                if matches!(value, JsValue::Object(_)) {
+                    runtime.release_jsvalue(value)?;
                     return Err(RuntimeError::Invariant(
                         "TypedArray.set offset conversion returned an object",
                     ));
                 }
-                let offset = match runtime.native_to_int64_sat(realm, &value)? {
-                    NativeConversion::Value(value) => value,
+                let number = runtime.number_from_primitive_jsvalue(realm, &value);
+                runtime.release_jsvalue(value)?;
+                let offset = match number? {
+                    NativeConversion::Value(value) => Runtime::int64_from_number(value),
                     NativeConversion::Throw(value) => {
                         return Ok(TypedSetStep::Complete(Completion::Throw(value)));
                     }
                 };
                 if offset < 0 {
                     return Ok(TypedSetStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             realm,
                             NativeErrorKind::Range,
                             "invalid offset",
@@ -157,24 +168,27 @@ impl TypedSetResume {
                         return Ok(TypedSetStep::Complete(Completion::Throw(value)));
                     }
                 };
-                if let Value::Object(source_object) = &source
-                    && let Some(snapshot) =
-                        runtime.typed_array_snapshot_if_branded(source_object)?
-                {
-                    // Genuine typed elements are Number/BigInt primitives; the
-                    // original overlap-preserving copy has no JS callbacks.
-                    return Ok(TypedSetStep::Complete(
-                        runtime.set_typed_array_from_typed_array(
-                            realm,
-                            &target,
-                            target_length,
-                            offset,
-                            source_object,
-                            snapshot,
-                        )?,
-                    ));
+                if let JsValue::Object(id) = &self.0.source {
+                    let source_object = ObjectRef::from_borrowed_handle(runtime.clone(), *id)?;
+                    if let Some(snapshot) =
+                        runtime.typed_array_snapshot_if_branded(&source_object)?
+                    {
+                        // Genuine typed elements are Number/BigInt primitives; the
+                        // original overlap-preserving copy has no JS callbacks.
+                        return Ok(TypedSetStep::Complete(
+                            runtime.set_typed_array_from_typed_array(
+                                realm,
+                                &target,
+                                target_length,
+                                offset,
+                                &source_object,
+                                snapshot,
+                            )?,
+                        ));
+                    }
                 }
-                let source = match runtime.native_to_object(realm, source)? {
+                let source_value = std::mem::replace(&mut self.0.source, JsValue::Undefined);
+                let source = match runtime.native_to_object_jsvalue(realm, source_value)? {
                     NativeConversion::Value(value) => value,
                     NativeConversion::Throw(value) => {
                         return Ok(TypedSetStep::Complete(Completion::Throw(value)));
@@ -186,6 +200,8 @@ impl TypedSetResume {
                     object: source.clone(),
                     key,
                     resume: Self(Box::new(TypedSetResumeState {
+                        runtime: runtime.clone(),
+                        source: JsValue::Undefined,
                         realm,
                         phase: SetPhase::Length(SetState {
                             target,
@@ -201,18 +217,23 @@ impl TypedSetResume {
             SetPhase::Length(state) => Ok(TypedSetStep::Primitive {
                 value,
                 resume: Self(Box::new(TypedSetResumeState {
+                    runtime: runtime.clone(),
+                    source: JsValue::Undefined,
                     realm,
                     phase: SetPhase::LengthNumber(state),
                 })),
             }),
             SetPhase::LengthNumber(mut state) => {
-                if matches!(value, Value::Object(_)) {
+                if matches!(value, JsValue::Object(_)) {
+                    runtime.release_jsvalue(value)?;
                     return Err(RuntimeError::Invariant(
                         "TypedArray.set source length conversion returned an object",
                     ));
                 }
-                state.length = match runtime.native_to_length(realm, &value)? {
-                    NativeConversion::Value(value) => value,
+                let number = runtime.number_from_primitive_jsvalue(realm, &value);
+                runtime.release_jsvalue(value)?;
+                state.length = match number? {
+                    NativeConversion::Value(value) => Runtime::length_from_number(value),
                     NativeConversion::Throw(value) => {
                         return Ok(TypedSetStep::Complete(Completion::Throw(value)));
                     }
@@ -223,26 +244,45 @@ impl TypedSetResume {
                     .is_none_or(|end| end > u64::from(state.target_length))
                 {
                     return Ok(TypedSetStep::Complete(Completion::Throw(
-                        runtime.new_native_error(realm, NativeErrorKind::Range, "out of bound")?,
+                        runtime.new_native_error_jsvalue(
+                            realm,
+                            NativeErrorKind::Range,
+                            "out of bound",
+                        )?,
                     )));
                 }
                 Self::next(runtime, realm, state)
             }
-            SetPhase::Read(state) => Ok(TypedSetStep::Element {
-                element: runtime.typed_array_snapshot(&state.target)?.element,
-                value,
-                resume: Self(Box::new(TypedSetResumeState {
-                    realm,
-                    phase: SetPhase::Write(state),
-                })),
-            }),
-            SetPhase::Write(_) => Err(RuntimeError::Invariant(
-                "TypedArray.set element write received an untyped reply",
-            )),
+            SetPhase::Read(state) => {
+                let snapshot = runtime.typed_array_snapshot(&state.target);
+                let element = match snapshot {
+                    Ok(snapshot) => snapshot.element,
+                    Err(error) => {
+                        runtime.release_jsvalue(value)?;
+                        return Err(error);
+                    }
+                };
+                Ok(TypedSetStep::Element {
+                    element,
+                    value,
+                    resume: Self(Box::new(TypedSetResumeState {
+                        runtime: runtime.clone(),
+                        source: JsValue::Undefined,
+                        realm,
+                        phase: SetPhase::Write(state),
+                    })),
+                })
+            }
+            SetPhase::Write(_) | SetPhase::Empty => {
+                runtime.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant(
+                    "TypedArray.set element write received an untyped reply",
+                ))
+            }
         }
     }
     pub(crate) fn element(
-        self,
+        mut self,
         runtime: &Runtime,
         result: NativeConversion<[u8; 8]>,
     ) -> Result<TypedSetStep, RuntimeError> {
@@ -252,7 +292,8 @@ impl TypedSetResume {
                 return Ok(TypedSetStep::Complete(Completion::Throw(value)));
             }
         };
-        let SetPhase::Write(mut state) = self.0.phase else {
+        let SetPhase::Write(mut state) = std::mem::replace(&mut self.0.phase, SetPhase::Empty)
+        else {
             return Err(RuntimeError::Invariant(
                 "TypedArray.set received an unexpected element reply",
             ));
@@ -275,8 +316,8 @@ pub(super) fn finish(
         step = match step {
             TypedSetStep::Complete(result) => return Ok(result),
             TypedSetStep::Primitive { value, resume } => {
-                let result = if matches!(value, Value::Object(_)) {
-                    runtime.to_primitive(realm, value, ToPrimitiveHint::Number)?
+                let result = if matches!(value, JsValue::Object(_)) {
+                    runtime.to_primitive_jsvalue(realm, value, ToPrimitiveHint::Number)?
                 } else {
                     Completion::Return(value)
                 };
@@ -288,7 +329,12 @@ pub(super) fn finish(
                 resume,
             } => resume.resume(
                 runtime,
-                runtime.get_property_in_realm(realm, &object, &key)?,
+                runtime.internal_get_jsvalue(
+                    realm,
+                    &object,
+                    &key,
+                    JsValue::Object(object.clone().into_handle()),
+                )?,
             )?,
             TypedSetStep::Element {
                 element,

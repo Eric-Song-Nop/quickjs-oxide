@@ -14,7 +14,7 @@ use crate::engine::code::function::metadata::{
 use crate::engine::code::runtime::PublishedFunctionSnapshot;
 use crate::engine::heap::{ObjectPayload, roots::VarRefRoot};
 use crate::engine::object::ObjectRef;
-use crate::engine::value::Value;
+use crate::engine::value::JsValue;
 
 fn eval_local_kind(
     executable: &PublishedFunctionSnapshot,
@@ -54,10 +54,10 @@ pub(super) fn eval_variable_object<'a>(
             let binding = local(index).ok_or_else(|| {
                 Error::internal("eval variable-object local index is out of bounds")
             })?;
-            if let FrameBinding::Captured(root) = binding {
+            if let FrameBinding::Captured(var_ref) = binding {
                 runtime
                     .validate_var_ref_metadata(
-                        &root,
+                        &crate::engine::heap::roots::VarRefView::from_frame(runtime, *var_ref),
                         ClosureVariable {
                             source: ClosureSource::ParentLocal(index),
                             name: definition
@@ -96,16 +96,15 @@ pub(super) fn eval_variable_object<'a>(
                 .map_err(runtime_error_to_vm_error)?
         }
     };
-    let Value::Object(object) = value else {
+    let JsValue::Object(object) = value else {
+        runtime
+            .release_jsvalue(value)
+            .map_err(runtime_error_to_vm_error)?;
         return Err(Error::internal(
             "eval variable-object binding did not contain an Object",
         ));
     };
-    if !object.belongs_to(runtime) {
-        return Err(Error::internal(
-            "eval variable object belongs to another runtime",
-        ));
-    }
+    let object = ObjectRef::from_owned_handle(runtime.clone(), object);
     let state = runtime.0.state.borrow();
     let object_data = state
         .heap
@@ -148,10 +147,10 @@ pub(super) fn with_object<'a>(
             }
             let binding = local(index)
                 .ok_or_else(|| Error::internal("with-object local index is out of bounds"))?;
-            if let FrameBinding::Captured(root) = binding {
+            if let FrameBinding::Captured(var_ref) = binding {
                 runtime
                     .validate_var_ref_metadata(
-                        &root,
+                        &crate::engine::heap::roots::VarRefView::from_frame(runtime, *var_ref),
                         ClosureVariable {
                             source: ClosureSource::ParentLocal(index),
                             name: definition
@@ -191,14 +190,15 @@ pub(super) fn with_object<'a>(
                 .map_err(runtime_error_to_vm_error)?
         }
     };
-    let Value::Object(object) = value else {
+    let JsValue::Object(object) = value else {
+        runtime
+            .release_jsvalue(value)
+            .map_err(runtime_error_to_vm_error)?;
         return Err(Error::internal(
             "with-object binding did not contain an Object",
         ));
     };
-    if !object.belongs_to(runtime) {
-        return Err(Error::internal("with object belongs to another runtime"));
-    }
+    let object = ObjectRef::from_owned_handle(runtime.clone(), object);
     Ok(object)
 }
 

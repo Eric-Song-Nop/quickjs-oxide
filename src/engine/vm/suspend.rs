@@ -11,13 +11,13 @@ use crate::engine::code::function::metadata::{
 };
 use crate::engine::code::rooted::FunctionBytecodeRef;
 use crate::engine::code::runtime::PublishedFunctionData;
-use crate::engine::heap::roots::VarRefRoot;
+use crate::engine::heap::ownership::ConvertedValue;
 use crate::engine::heap::{
     ContextId, GeneratorActivationData, GeneratorFrameBinding, GeneratorVmActivation, RawValue,
 };
-use crate::engine::object::{ObjectRef, PrivateNameRef};
-use crate::engine::value::Value;
-use crate::engine::vm::bindings::{FrameBinding, is_private_callable_kind};
+use crate::engine::object::ObjectRef;
+use crate::engine::value::JsValue;
+use crate::engine::vm::bindings::{FrameBinding, is_private_callable_kind, release_frame_binding};
 use crate::engine::vm::call::CallableExecution;
 use crate::engine::vm::frames::ActiveFrameToken;
 use crate::engine::vm::{BytecodePc, Completion, VmResume, VmSuspendKind};
@@ -28,36 +28,23 @@ mod owned;
 
 pub(super) use owned::{OwnedSuspension, PreparedResume};
 
-fn encode_generator_frame_binding(
-    runtime: &Runtime,
-    binding: &FrameBinding,
-) -> Result<GeneratorFrameBinding, RuntimeError> {
-    Ok(match binding {
-        FrameBinding::Direct(value) => {
-            GeneratorFrameBinding::Direct(runtime.raw_property_value(value)?)
-        }
-        FrameBinding::Private(name) => {
-            if !name.belongs_to(runtime) {
-                return Err(RuntimeError::WrongRuntime("generator private binding"));
-            }
-            GeneratorFrameBinding::Private(name.atom())
-        }
-        FrameBinding::PrivateCallable(callable) => {
-            if !callable.belongs_to(runtime) {
-                return Err(RuntimeError::WrongRuntime(
-                    "generator private callable binding",
-                ));
-            }
-            GeneratorFrameBinding::PrivateCallable(callable.as_object().object_id())
-        }
+/// Reconstruct one owned internal value from a dormant heap record, retaining
+/// every edge so the decoded value owns them independently of the record.
+fn decode_raw_jsvalue(runtime: &Runtime, raw: RawValue) -> Result<JsValue, RuntimeError> {
+    let value = JsValue::from_raw(raw).ok_or(RuntimeError::Invariant(
+        "dormant activation held an internal-only sentinel",
+    ))?;
+    runtime.dup_jsvalue(&value)
+}
+
+fn encode_generator_frame_binding(binding: &FrameBinding) -> GeneratorFrameBinding {
+    match binding {
+        FrameBinding::Direct(value) => GeneratorFrameBinding::Direct(value.as_raw()),
+        FrameBinding::Private(index) => GeneratorFrameBinding::Private(*index),
+        FrameBinding::PrivateCallable(object) => GeneratorFrameBinding::PrivateCallable(*object),
         FrameBinding::Uninitialized => GeneratorFrameBinding::Uninitialized,
-        FrameBinding::Captured(root) => {
-            if !root.belongs_to(runtime) {
-                return Err(RuntimeError::WrongRuntime("generator captured binding"));
-            }
-            GeneratorFrameBinding::Captured(root.id())
-        }
-    })
+        FrameBinding::Captured(var_ref) => GeneratorFrameBinding::Captured(*var_ref),
+    }
 }
 
 fn validate_decoded_generator_binding(
@@ -98,9 +85,9 @@ fn validate_decoded_generator_binding(
         FrameBinding::Uninitialized if !definition.is_lexical => Err(RuntimeError::Invariant(
             "generator non-lexical binding decoded as uninitialized",
         )),
-        FrameBinding::Captured(root) => {
+        FrameBinding::Captured(var_ref) => {
             let state = runtime.0.state.borrow();
-            let cell = state.heap.var_ref(root.id())?;
+            let cell = state.heap.var_ref(*var_ref)?;
             if (cell.is_lexical, cell.is_const, cell.kind)
                 != (definition.is_lexical, definition.is_const, definition.kind)
             {
@@ -124,31 +111,45 @@ fn decode_generator_frame_binding(
 ) -> Result<FrameBinding, RuntimeError> {
     let binding = match binding {
         GeneratorFrameBinding::Direct(value) => {
-            FrameBinding::Direct(runtime.root_raw_value(value)?)
+            FrameBinding::Direct(decode_raw_jsvalue(runtime, value.clone())?)
         }
-        GeneratorFrameBinding::Private(atom) => {
-            if runtime.0.state.borrow().atoms.kind(*atom)? != AtomKind::Private {
+        GeneratorFrameBinding::Private(index) => {
+            let atom = runtime.0.state.borrow().atoms.brand(*index)?;
+            if runtime.0.state.borrow().atoms.kind(atom)? != AtomKind::Private {
                 return Err(RuntimeError::Invariant(
                     "generator private binding contains a non-private atom",
                 ));
             }
-            FrameBinding::Private(PrivateNameRef::from_borrowed_atom(runtime.clone(), *atom)?)
+            runtime.retain_atom_handle(atom)?;
+            FrameBinding::Private(*index)
         }
         GeneratorFrameBinding::PrivateCallable(object) => {
-            let object = ObjectRef::from_borrowed_handle(runtime.clone(), *object)?;
+            // Validate callability through a temporary root, then retain the
+            // frame's own object edge.
+            let object_root = ObjectRef::from_borrowed_handle(runtime.clone(), *object)?;
             let callable = runtime
-                .as_callable(&object)?
+                .as_callable(&object_root)?
                 .ok_or(RuntimeError::Invariant(
                     "generator private callable binding lost callability",
                 ))?;
-            FrameBinding::PrivateCallable(callable)
+            drop(callable);
+            drop(object_root);
+            runtime.retain_object_handle(*object)?;
+            FrameBinding::PrivateCallable(*object)
         }
         GeneratorFrameBinding::Uninitialized => FrameBinding::Uninitialized,
         GeneratorFrameBinding::Captured(var_ref) => {
-            FrameBinding::Captured(VarRefRoot::from_borrowed_handle(runtime.clone(), *var_ref)?)
+            runtime.retain_var_ref_handle(*var_ref)?;
+            FrameBinding::Captured(*var_ref)
         }
     };
-    validate_decoded_generator_binding(runtime, &binding, definition)?;
+    if let Err(error) = validate_decoded_generator_binding(runtime, &binding, definition) {
+        // A rejected record must not keep the freshly retained edge. Handle
+        // releases are nothrow; a Direct release failure is secondary to the
+        // validation error on this invariant path.
+        let _ = release_frame_binding(runtime, binding);
+        return Err(error);
+    }
     Ok(binding)
 }
 
@@ -159,49 +160,90 @@ fn decode_generator_frame_binding(
 pub(crate) struct EncodedVmActivation {
     pub(crate) kind: VmSuspendKind,
     pub(crate) data: GeneratorActivationData,
-    _entry: super::frame::FrameEntry,
+    _entry: EncodedActivationEntry,
 }
 
 impl EncodedVmActivation {
-    pub(crate) fn atoms(&self) -> Vec<Atom> {
+    /// Brand every retained atom index for the caller's explicit retain pass.
+    /// Every binding stores unbranded indices; this boundary conversion is the
+    /// only place a dormant activation's atoms become branded again.
+    pub(crate) fn atoms(
+        &self,
+        table: &crate::engine::atom::AtomTable,
+    ) -> Result<Vec<Atom>, RuntimeError> {
         let vm = &self.data.vm;
-        vm.stack
+        let mut atoms = Vec::new();
+        for value in vm
+            .stack
             .iter()
             .chain(self.data.original_arguments.iter())
             .chain(std::iter::once(&vm.this_value))
             .chain(vm.normalized_this.iter())
             .chain(std::iter::once(&vm.new_target))
-            .filter_map(generator_raw_value_atom)
-            .chain(
-                self.data
-                    .arguments
-                    .iter()
-                    .chain(self.data.locals.iter())
-                    .filter_map(|binding| match binding {
-                        GeneratorFrameBinding::Direct(value) => generator_raw_value_atom(value),
-                        GeneratorFrameBinding::Private(atom) => Some(*atom),
-                        GeneratorFrameBinding::PrivateCallable(_)
-                        | GeneratorFrameBinding::Uninitialized
-                        | GeneratorFrameBinding::Captured(_) => None,
-                    }),
-            )
-            .collect()
+        {
+            if let RawValue::Symbol(index) | RawValue::Private(index) = value {
+                atoms.push(table.brand(*index)?);
+            }
+        }
+        for binding in self.data.arguments.iter().chain(self.data.locals.iter()) {
+            match binding {
+                GeneratorFrameBinding::Direct(value) => {
+                    if let RawValue::Symbol(index) | RawValue::Private(index) = value {
+                        atoms.push(table.brand(*index)?);
+                    }
+                }
+                GeneratorFrameBinding::Private(index) => atoms.push(table.brand(*index)?),
+                GeneratorFrameBinding::PrivateCallable(_)
+                | GeneratorFrameBinding::Uninitialized
+                | GeneratorFrameBinding::Captured(_) => {}
+            }
+        }
+        Ok(atoms)
+    }
+
+    /// Balance direct storage string/BigInt edges after publication. The
+    /// matching storage cleanup skips these values. CallInput and FrameCold
+    /// independently own this/newTarget/normalized-this, so their raw aliases
+    /// must never be released here.
+    pub(crate) fn release_conversion_edges(&mut self, runtime: &Runtime) {
+        let vm = &self.data.vm;
+        for value in vm.stack.iter().chain(self.data.original_arguments.iter()) {
+            drop(ConvertedValue::new(runtime, value.clone()));
+        }
+        for binding in self.data.arguments.iter().chain(self.data.locals.iter()) {
+            if let GeneratorFrameBinding::Direct(value) = binding {
+                drop(ConvertedValue::new(runtime, value.clone()));
+            }
+        }
     }
 }
 
-fn generator_raw_value_atom(value: &RawValue) -> Option<Atom> {
-    match value {
-        RawValue::Symbol(atom) | RawValue::Private(atom) => Some(*atom),
-        RawValue::Undefined
-        | RawValue::Null
-        | RawValue::Bool(_)
-        | RawValue::Int(_)
-        | RawValue::Float(_)
-        | RawValue::BigInt(_)
-        | RawValue::String(_)
-        | RawValue::Object(_)
-        | RawValue::Uninitialized
-        | RawValue::Exception => None,
+/// Owns the source frame entry across heap publication and releases the
+/// remaining caller-owned object/symbol/binding edges when the activation is
+/// finally abandoned. Direct String/BigInt edges are the boundary-conversion
+/// producer edges already released through `release_conversion_edges`, so the
+/// storage release skips them. The drop runs after any state borrow has been
+/// released, keeping releases nothrow.
+struct EncodedActivationEntry {
+    runtime: Runtime,
+    entry: Option<super::frame::FrameEntry>,
+}
+
+impl Drop for EncodedActivationEntry {
+    fn drop(&mut self) {
+        let Some(mut entry) = self.entry.take() else {
+            return;
+        };
+        let storage = std::mem::replace(
+            &mut entry.storage,
+            super::stack::FrameStorage {
+                original_arguments: Vec::new(),
+                parameters: Vec::new(),
+                locals: Vec::new(),
+                operands: Vec::new(),
+            },
+        );
+        super::stack::release_unconverted_frame_storage(&self.runtime, storage);
     }
 }
 
@@ -209,22 +251,32 @@ fn generator_raw_value_atom(value: &RawValue) -> Option<Atom> {
 /// are detached. `host.active_frame_token` remains a sentinel until the
 /// short-lived bytecode active frame is pushed for the actual resume.
 pub(crate) struct RootedVmActivation {
-    entry: super::frame::FrameEntry,
+    entry: Option<super::frame::FrameEntry>,
     kind: VmSuspendKind,
     saved_pc: usize,
+}
+
+impl Drop for RootedVmActivation {
+    fn drop(&mut self) {
+        let Some(entry) = self.entry.take() else {
+            return;
+        };
+        let runtime = entry.cold.function.runtime().clone();
+        super::stack::release_frame_storage(&runtime, entry.storage);
+    }
 }
 
 pub(crate) enum VmActivationResume {
     Initial,
     Generator(VmResume),
-    AwaitFulfill(Value),
-    AwaitReject(Value),
+    AwaitFulfill(JsValue),
+    AwaitReject(JsValue),
 }
 
 pub(crate) enum VmRunOutcome {
     Complete(Completion),
     Suspend {
-        value: Value,
+        value: JsValue,
         activation: Box<EncodedVmActivation>,
     },
 }
@@ -238,18 +290,21 @@ impl RootedVmActivation {
         // Authenticate the resume input before installing any active frame or
         // invoking an unwinder. The dormant owner remains with the language
         // state machine until thaw has produced this single-use rooted value.
-        if self.entry.cold.function.runtime().domain_id() != runtime.domain_id() {
+        let entry = self
+            .entry
+            .as_ref()
+            .expect("rooted activation entry is present before prepare");
+        if entry.cold.function.runtime().domain_id() != runtime.domain_id() {
             return Err(RuntimeError::WrongRuntime("suspended execution"));
         }
+        // Internal resume values are handle-only and carry no runtime tag, so
+        // their domain is guaranteed by the state machine that produced them;
+        // only the activation's own runtime is authenticated here.
         match resume {
             VmActivationResume::Initial => {}
-            VmActivationResume::Generator(
-                VmResume::Next(value) | VmResume::Return(value) | VmResume::Throw(value),
-            )
-            | VmActivationResume::AwaitFulfill(value)
-            | VmActivationResume::AwaitReject(value) => {
-                runtime.validate_value_domain(value, "suspension resume value")?;
-            }
+            VmActivationResume::Generator(_)
+            | VmActivationResume::AwaitFulfill(_)
+            | VmActivationResume::AwaitReject(_) => {}
         }
         Ok(())
     }
@@ -266,47 +321,81 @@ impl RootedVmActivation {
     }
 
     pub(super) fn prepare_owned(
-        self,
+        mut self,
         runtime: &Runtime,
         resume: VmActivationResume,
     ) -> Result<PreparedResume, RuntimeError> {
-        self.validate_resume(runtime, &resume)?;
-        let Self {
-            mut entry,
-            kind,
-            saved_pc,
-        } = self;
-        let root = entry
-            .executable
-            .root()
-            .ok_or(RuntimeError::Invariant(
-                "resumable frame has no published root",
-            ))?
-            .clone();
-        let guard = runtime.push_bytecode_active_frame(
-            (*entry.cold.function).clone(),
-            root,
-            entry.executable.realm,
-            entry.executable.frame_layout().is_strict(),
-        )?;
-        entry.active_frame = guard.token();
-        runtime.update_active_bytecode_pc(
-            guard.token(),
-            BytecodePc::new(saved_pc.saturating_sub(1)),
-        )?;
-        entry.cold.entry_guard = Some(guard);
-        owned::prepare(entry, kind, saved_pc, resume)
+        let mut pending_resume = Some(resume);
+        let prepared = (|| {
+            self.validate_resume(
+                runtime,
+                pending_resume.as_ref().expect("owned resume input"),
+            )?;
+            let entry = self
+                .entry
+                .as_mut()
+                .expect("rooted activation entry is prepared once");
+            let root = entry
+                .executable
+                .root()
+                .ok_or(RuntimeError::Invariant(
+                    "resumable frame has no published root",
+                ))?
+                .clone();
+            let guard = runtime.push_bytecode_active_frame(
+                (*entry.cold.function).clone(),
+                root,
+                entry.executable.realm,
+                entry.executable.frame_layout().is_strict(),
+            )?;
+            entry.active_frame = guard.token();
+            runtime.update_active_bytecode_pc(
+                guard.token(),
+                BytecodePc::new(self.saved_pc.saturating_sub(1)),
+            )?;
+            entry.cold.entry_guard = Some(guard);
+            // Both frame storage and the resume input retain their original
+            // owners through validation and the final fallible reservation.
+            owned::prepare(entry, self.kind, &mut pending_resume)
+        })();
+        if let Err(error) = prepared {
+            if let Some(resume) = pending_resume {
+                match resume {
+                    VmActivationResume::Initial => {}
+                    VmActivationResume::Generator(
+                        VmResume::Next(value) | VmResume::Return(value) | VmResume::Throw(value),
+                    )
+                    | VmActivationResume::AwaitFulfill(value)
+                    | VmActivationResume::AwaitReject(value) => {
+                        let _ = runtime.release_jsvalue(value);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        Ok(PreparedResume {
+            entry: self.entry.take().expect("prepared activation entry"),
+            pc: self.saved_pc,
+        })
     }
 }
 
 pub(super) fn freeze_entry(
     runtime: &Runtime,
-    mut entry: super::frame::FrameEntry,
+    entry: super::frame::FrameEntry,
     kind: VmSuspendKind,
     pc: usize,
 ) -> Result<EncodedVmActivation, RuntimeError> {
     #[cfg(feature = "profiling")]
     let _profile_phase = crate::engine::api::profiling::PhaseTimer::start_vm("freeze.encode");
+    // Encoding has not yet published or balanced any conversion edges. Keep
+    // the ordinary frame owner until the complete encoded record exists.
+    let mut source = RootedVmActivation {
+        entry: Some(entry),
+        kind,
+        saved_pc: pc,
+    };
+    let entry = source.entry.as_mut().expect("owned encoding source");
     entry
         .cold
         .input
@@ -326,50 +415,50 @@ pub(super) fn freeze_entry(
     let arguments = storage
         .parameters
         .iter()
-        .map(|binding| encode_generator_frame_binding(runtime, binding))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(encode_generator_frame_binding)
+        .collect::<Vec<_>>();
     let locals = storage
         .locals
         .iter()
-        .map(|binding| encode_generator_frame_binding(runtime, binding))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(encode_generator_frame_binding)
+        .collect::<Vec<_>>();
+    let normalized_this = entry.cold.normalized_this.as_ref().map(JsValue::as_raw);
     let vm = GeneratorVmActivation {
         stack: storage
             .operands
             .iter()
-            .map(|value| runtime.raw_property_value(value))
-            .collect::<Result<Vec<_>, _>>()?,
+            .map(|value| value.as_raw())
+            .collect(),
         regions: entry.cold.regions.clone(),
         pc,
         callee_realm: entry.executable.realm,
         current_function: entry.cold.function.object_id(),
-        this_value: runtime.raw_property_value(&input.this_value)?,
-        normalized_this: entry
-            .cold
-            .normalized_this
-            .as_ref()
-            .map(|value| runtime.raw_property_value(value))
-            .transpose()?,
-        new_target: runtime.raw_property_value(&input.new_target)?,
+        this_value: input.this_value.as_raw(),
+        normalized_this,
+        new_target: input.new_target.as_raw(),
         strict: entry.executable.frame_layout().is_strict(),
         callee_global: global.object_id(),
     };
+    let data = GeneratorActivationData {
+        bytecode: bytecode.bytecode_id(),
+        vm,
+        actual_argument_count: storage.original_arguments.len(),
+        original_arguments: storage
+            .original_arguments
+            .iter()
+            .map(|value| value.as_raw())
+            .collect(),
+        arguments,
+        locals,
+        reusable_captured_locals: entry.cold.reusable_captured_locals.clone(),
+    };
     Ok(EncodedVmActivation {
         kind,
-        data: GeneratorActivationData {
-            bytecode: bytecode.bytecode_id(),
-            vm,
-            actual_argument_count: storage.original_arguments.len(),
-            original_arguments: storage
-                .original_arguments
-                .iter()
-                .map(|value| runtime.raw_property_value(value))
-                .collect::<Result<Vec<_>, _>>()?,
-            arguments,
-            locals,
-            reusable_captured_locals: entry.cold.reusable_captured_locals.clone(),
+        data,
+        _entry: EncodedActivationEntry {
+            runtime: runtime.clone(),
+            entry: source.entry.take(),
         },
-        _entry: entry,
     })
 }
 
@@ -434,44 +523,71 @@ pub(crate) fn thaw(
             "resumable closure slot count disagrees with bytecode metadata",
         ));
     }
-    let original_arguments = data
-        .original_arguments
-        .iter()
-        .map(|value| runtime.root_raw_value(value))
-        .collect::<Result<Vec<_>, _>>()?;
-    let arguments = data
-        .arguments
-        .iter()
-        .enumerate()
-        .map(|(index, binding)| {
-            decode_generator_frame_binding(&runtime, binding, argument_definitions.get(index))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let locals = data
-        .locals
-        .iter()
-        .zip(local_definitions.iter())
-        .map(|(binding, definition)| {
-            decode_generator_frame_binding(&runtime, binding, Some(definition))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let callee_global = ObjectRef::from_borrowed_handle(runtime.clone(), data.vm.callee_global)?;
-    let operands = data
-        .vm
-        .stack
-        .iter()
-        .map(|value| runtime.root_raw_value(value))
-        .collect::<Result<Vec<_>, _>>()?;
-    if kind != VmSuspendKind::Initial && !matches!(operands.last(), Some(Value::Undefined)) {
+    // Decode incrementally into an owning guard: a later rejection releases
+    // every root already reconstructed instead of leaking the partial frame.
+    let mut roots = super::stack::FrameStorageGuard::new(
+        &runtime,
+        super::stack::FrameStorage {
+            original_arguments: Vec::new(),
+            parameters: Vec::new(),
+            locals: Vec::new(),
+            operands: Vec::new(),
+        },
+    );
+    {
+        let storage = roots.storage_mut();
+        for value in &data.original_arguments {
+            storage
+                .original_arguments
+                .push(decode_raw_jsvalue(&runtime, value.clone())?);
+        }
+        for (index, binding) in data.arguments.iter().enumerate() {
+            storage.parameters.push(decode_generator_frame_binding(
+                &runtime,
+                binding,
+                argument_definitions.get(index),
+            )?);
+        }
+        for (binding, definition) in data.locals.iter().zip(local_definitions.iter()) {
+            storage.locals.push(decode_generator_frame_binding(
+                &runtime,
+                binding,
+                Some(definition),
+            )?);
+        }
+        for value in &data.vm.stack {
+            storage
+                .operands
+                .push(decode_raw_jsvalue(&runtime, value.clone())?);
+        }
+    }
+    if kind != VmSuspendKind::Initial
+        && !matches!(
+            roots.storage_mut().operands.last(),
+            Some(JsValue::Undefined)
+        )
+    {
         return Err(RuntimeError::Invariant(
             "dormant suspension output was not cleared",
         ));
     }
-    let input = super::CallInput {
-        this_value: runtime.root_raw_value(&data.vm.this_value)?,
-        new_target: runtime.root_raw_value(&data.vm.new_target)?,
-        callee_global: Some(callee_global),
+    let this_value = decode_raw_jsvalue(&runtime, data.vm.this_value.clone())?;
+    let new_target = match decode_raw_jsvalue(&runtime, data.vm.new_target.clone()) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = runtime.release_jsvalue(this_value);
+            return Err(error);
+        }
     };
+    let input = super::CallInput::new(&runtime, this_value, new_target, Some(callee_global));
+    let normalized_this = data
+        .vm
+        .normalized_this
+        .as_ref()
+        .map(|value| decode_raw_jsvalue(&runtime, value.clone()))
+        .transpose()?;
+    let storage = roots.take();
     let mut entry = super::frame::FrameEntry {
         initialize_bindings: false,
         property_generation: 0,
@@ -488,22 +604,12 @@ pub(crate) fn thaw(
             reusable_captured_locals: data.reusable_captured_locals.clone(),
             input: input.into(),
         }),
-        storage: super::stack::FrameStorage {
-            original_arguments,
-            parameters: arguments,
-            locals,
-            operands,
-        },
+        storage,
     };
     entry.cold.regions = data.vm.regions.clone();
-    entry.cold.normalized_this = data
-        .vm
-        .normalized_this
-        .as_ref()
-        .map(|value| runtime.root_raw_value(value))
-        .transpose()?;
+    entry.cold.normalized_this = normalized_this;
     Ok(RootedVmActivation {
-        entry,
+        entry: Some(entry),
         kind,
         saved_pc: data.vm.pc,
     })
@@ -514,6 +620,7 @@ mod tests {
     use super::*;
     use crate::engine::api::Context;
     use crate::engine::heap::GeneratorState;
+    use crate::engine::value::Value;
 
     fn dormant(context: &mut Context) -> (ObjectRef, GeneratorActivationData) {
         let Value::Object(generator) = context
@@ -531,6 +638,24 @@ mod tests {
             .generator_snapshot(generator.object_id())
             .unwrap();
         (generator, data.unwrap())
+    }
+
+    #[test]
+    fn suspended_generator_preserves_primitive_call_input_across_yields() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        assert_eq!(
+            context.eval(r#"(()=>{
+                function* values() { yield 1; yield 2; }
+                for (const receiver of ['held string', 12345678901234567890n]) {
+                    const iterator = values.call(receiver);
+                    if (iterator.next().value !== 1 || iterator.next().value !== 2 || !iterator.next().done) return false;
+                }
+                String.prototype[Symbol.iterator] = values;
+                return Uint32Array.from('anything').join(',') === '1,2';
+            })()"#).unwrap(),
+            crate::engine::value::Value::Bool(true),
+        );
     }
 
     #[test]
@@ -580,7 +705,12 @@ mod tests {
             .generator_snapshot(generator.object_id())
             .unwrap();
         assert_eq!(state, GeneratorState::SuspendedStart);
-        assert_eq!(after.as_ref(), Some(&data));
+        // `GeneratorActivationData` has no `PartialEq` (its VM fields embed
+        // `RawValue`), so equality is checked through the debug rendering.
+        assert_eq!(
+            after.as_ref().map(|entry| format!("{entry:?}")),
+            Some(format!("{data:?}"))
+        );
         assert!(runtime.0.state.borrow().active_frames.is_empty());
     }
 
@@ -609,34 +739,23 @@ mod tests {
     }
 
     #[test]
-    fn resume_rejects_foreign_runtime_and_values_before_registering_a_frame() {
+    fn resume_rejects_foreign_runtime_before_registering_a_frame() {
         let runtime = Runtime::new();
         let other = Runtime::new();
         let mut context = runtime.new_context();
         let (_generator, data) = dormant(&mut context);
-        for foreign_runtime in [true, false] {
-            let rooted = thaw(
-                runtime.clone(),
-                VmSuspendKind::Initial,
-                context.realm,
-                &data,
-                FunctionKind::Generator,
-            )
-            .unwrap();
-            let result = if foreign_runtime {
-                rooted.run(&other, VmActivationResume::Initial)
-            } else {
-                rooted.run(
-                    &runtime,
-                    VmActivationResume::Generator(VmResume::Next(Value::Object(
-                        other.new_object(None).unwrap(),
-                    ))),
-                )
-            };
-            assert!(matches!(result, Err(RuntimeError::WrongRuntime(_))));
-            assert!(runtime.0.state.borrow().active_frames.is_empty());
-            assert!(other.0.state.borrow().active_frames.is_empty());
-        }
+        let rooted = thaw(
+            runtime.clone(),
+            VmSuspendKind::Initial,
+            context.realm,
+            &data,
+            FunctionKind::Generator,
+        )
+        .unwrap();
+        let result = rooted.run(&other, VmActivationResume::Initial);
+        assert!(matches!(result, Err(RuntimeError::WrongRuntime(_))));
+        assert!(runtime.0.state.borrow().active_frames.is_empty());
+        assert!(other.0.state.borrow().active_frames.is_empty());
     }
 }
 

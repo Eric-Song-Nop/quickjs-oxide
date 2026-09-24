@@ -1,7 +1,7 @@
 //! Capability construction roots its executor until the constructor reply is validated.
 use super::{
-    Completion, ContextId, NativeConversion, Phase, PromiseResume, PromiseStep,
-    RootedPromiseCapability, Runtime, RuntimeError, Value,
+    Completion, ContextId, JsValue, NativeConversion, Phase, PromiseResume, PromiseStep,
+    RootedPromiseCapability, Runtime, RuntimeError,
 };
 use crate::engine::vm::call::ConstructorRef;
 
@@ -18,8 +18,10 @@ impl PromiseResume {
         let executor = runtime.prepare_promise_capability_executor(self.realm)?;
         Ok({
             let __pending_field_target = target;
-            let __pending_field_arguments = vec![Value::Object(executor.as_object().clone())];
+            let __pending_field_arguments =
+                vec![JsValue::Object(executor.as_object().clone().into_handle())];
             let __pending_field_resume = Box::new(Self {
+                runtime: runtime.clone(),
                 pending_effect: super::PromiseStepPending::default(),
                 realm: self.realm,
                 phase: Phase::Capability {
@@ -36,7 +38,7 @@ impl PromiseResume {
     }
 
     pub(super) fn capability_ready(
-        self: Box<Self>,
+        mut self: Box<Self>,
         runtime: &Runtime,
         result: NativeConversion<RootedPromiseCapability>,
     ) -> Result<PromiseStep, RuntimeError> {
@@ -46,33 +48,30 @@ impl PromiseResume {
             }
             NativeConversion::Value(capability) => capability,
         };
-        match self.phase {
+        match std::mem::replace(&mut self.phase, Phase::Identity) {
             Phase::AggregateCapability {
                 constructor,
-                iterable,
+                inputs,
                 kind,
-            } => super::aggregate::ready(
-                runtime,
-                self.realm,
-                constructor,
-                iterable,
-                kind,
-                capability,
-            ),
+            } => {
+                super::aggregate::ready(runtime, self.realm, constructor, inputs, kind, capability)
+            }
             Phase::ConvenienceCapability { kind, arguments } => {
                 super::convenience::ready(runtime, self.realm, kind, arguments, capability)
             }
-            Phase::StaticCapability { argument, kind } => {
-                let target = if kind == crate::engine::builtins::native::PromiseNativeKind::Reject {
-                    capability.reject
-                } else {
-                    capability.resolve
-                };
+            Phase::StaticCapability(mut state) => {
+                let target =
+                    if state.kind == crate::engine::builtins::native::PromiseNativeKind::Reject {
+                        capability.reject
+                    } else {
+                        capability.resolve
+                    };
                 Ok({
                     let __pending_field_callable = target;
-                    let __pending_field_receiver = Value::Undefined;
-                    let __pending_field_arguments = vec![argument];
+                    let __pending_field_receiver = JsValue::Undefined;
+                    let __pending_field_arguments = vec![state.take_argument()];
                     let __pending_field_resume = Box::new(Self {
+                        runtime: runtime.clone(),
                         pending_effect: super::PromiseStepPending::default(),
                         realm: self.realm,
                         phase: Phase::ReturnPromise(capability.promise),
@@ -101,7 +100,7 @@ pub(super) fn error(
     message: &'static str,
 ) -> Result<PromiseStep, RuntimeError> {
     Ok(PromiseStep::Complete(Completion::Throw(
-        runtime.new_native_error(
+        runtime.new_native_error_jsvalue(
             realm,
             crate::engine::api::error::NativeErrorKind::Type,
             message,

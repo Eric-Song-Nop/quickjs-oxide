@@ -8,7 +8,7 @@ use crate::engine::{
     builtins::native::TypedArrayElementKind,
     heap::ContextId,
     object::{ObjectRef, PropertyKey},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::Completion,
 };
 
@@ -41,7 +41,7 @@ impl ElementStep {
         runtime: &Runtime,
         realm: ContextId,
         element: TypedArrayElementKind,
-        value: Value,
+        value: JsValue,
     ) -> Result<Self, RuntimeError> {
         from_primitive(
             runtime,
@@ -72,7 +72,7 @@ impl ElementStep {
                     let arguments = resume.take_call_arguments();
                     resume.resume(
                         runtime,
-                        runtime.call_internal(realm, &callable, receiver, &arguments)?,
+                        runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?,
                     )?
                 }
             };
@@ -84,23 +84,27 @@ pub(super) fn encode_primitive(
     runtime: &Runtime,
     realm: ContextId,
     element: TypedArrayElementKind,
-    value: Value,
+    value: JsValue,
 ) -> Result<NativeConversion<[u8; 8]>, RuntimeError> {
-    Ok(if element.is_bigint() {
-        match runtime.bigint_from_primitive(realm, value)? {
-            NativeConversion::Value(bigint) => {
-                NativeConversion::Value(typed_array_encode_bigint(&bigint)?)
+    let result = (|| {
+        Ok(if element.is_bigint() {
+            match runtime.bigint_from_primitive_jsvalue(realm, &value)? {
+                NativeConversion::Value(bigint) => {
+                    NativeConversion::Value(typed_array_encode_bigint(&bigint)?)
+                }
+                NativeConversion::Throw(value) => NativeConversion::Throw(value),
             }
-            NativeConversion::Throw(value) => NativeConversion::Throw(value),
-        }
-    } else {
-        match runtime.number_from_primitive(realm, &value)? {
-            NativeConversion::Value(number) => {
-                NativeConversion::Value(typed_array_encode_number(element, number))
+        } else {
+            match runtime.number_from_primitive_jsvalue(realm, &value)? {
+                NativeConversion::Value(number) => {
+                    NativeConversion::Value(typed_array_encode_number(element, number))
+                }
+                NativeConversion::Throw(value) => NativeConversion::Throw(value),
             }
-            NativeConversion::Throw(value) => NativeConversion::Throw(value),
-        }
-    })
+        })
+    })();
+    runtime.release_jsvalue(value)?;
+    result
 }
 fn from_primitive(
     runtime: &Runtime,
@@ -167,8 +171,8 @@ struct ElementStepPending {
     read_object: Option<ObjectRef>,
     read_key: Option<PropertyKey>,
     call_callable: Option<CallableRef>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
 }
 impl ElementStep {
     pub(crate) fn request_read(
@@ -182,8 +186,8 @@ impl ElementStep {
     }
     pub(crate) fn request_call(
         callable: CallableRef,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: ElementResume,
     ) -> Self {
         resume.0.pending_effect.call_callable = Some(callable);
@@ -214,14 +218,14 @@ impl ElementResume {
             .take()
             .expect("ElementStep Call callable")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver
             .take()
             .expect("ElementStep Call receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .pending_effect
             .call_arguments

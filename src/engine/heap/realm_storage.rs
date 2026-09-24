@@ -43,7 +43,7 @@ impl Heap {
     /// Deliberately corrupt only native realm metadata for rejection-order tests.
     /// Tests must restore the returned realm before releasing the native owner;
     /// this does not alter the retained realm edge or any production capability.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "profiling"))]
     pub(crate) fn replace_native_realm_for_test(
         &mut self,
         object: ObjectId,
@@ -413,7 +413,7 @@ impl Heap {
                 "RegExp object shape does not contain exactly one lastIndex property",
             ));
         };
-        if last_index.atom != last_index_atom
+        if last_index.atom != AtomIdx::from_raw(last_index_atom.raw())
             || last_index.flags != PropertyFlags::data(true, false, false)
         {
             return Err(HeapError::Invariant(

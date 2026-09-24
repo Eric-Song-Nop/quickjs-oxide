@@ -69,6 +69,55 @@ runner verifies matching receipts when present. External engines without a
 receipt are identified by binary hash/version output; attach their compiler
 and build configuration separately when publishing comparisons.
 
+## Profile-guided optimization
+
+`pgo.py` builds a profile-guided CLI in three phases: an instrumented build, a
+training run, and an optimized build. It needs the rustup `llvm-tools`
+component for `llvm-profdata`:
+
+```sh
+rustup component add llvm-tools
+python3 scripts/benchmark/pgo.py --jobs 16 --v8-source ../js-engine-benchmark
+```
+
+By default every `scaling.py` case is trained at sizes 64 and 128, and the
+external v8-v7 suite is added when `--v8-source` points at an
+`js-engine-benchmark` checkout outside this repository. Training failures only
+shrink coverage: raw profiles are kept and merged anyway. The optimized binary
+is written under `--use-target` with a `qjs.build.json` receipt recording the
+merged profile hash, training load and compiler flags. `--skip-training`
+rebuilds from existing raw profiles. Ordinary release builds also take
+`lto = "fat"` and `codegen-units = 1` from `[profile.release]`; comparisons
+must use the same flags on both sides.
+
+Protocol for comparisons during staged performance work (revised 2026-09-22):
+
+- Comparisons use the release profile as shipped: **fat LTO with
+  `codegen-units = 1`** (the `[profile.release]` defaults), identical flags on
+  both sides, no PGO and no `profiling` feature. Baselines must be rebuilt with
+  these flags before comparing. Record the source revision, toolchain, target,
+  effective flags, and binary/workload hashes for both sides; a historical
+  LTO-off binary is not a valid denominator for a current stage comparison.
+- Rationale for the revision: the earlier LTO-off/CGU=16 protocol was meant to
+  keep regressions visible, but measured practice showed CGU partitioning
+  itself injects ±5–10% layout noise (cross-module inlining flips on unrelated
+  edits), and it diverges from the shipped configuration. Stage A records up to
+  §8.12 used the old protocol; those series stay valid against their own
+  LTO-off baselines and must not be mixed with LTO-on numbers.
+- Each stage is compared twice: against the previous stage and against the
+  saved baseline. Identify both baseline source revisions explicitly. If the
+  post-E saved baseline includes stage A, also retain a separate comparison to
+  pre-A `85afd564`, rebuilt with the same fat LTO/CGU1/no-PGO flags, to track
+  unresolved stage A regressions. Improvements over post-E do not by themselves
+  close those regressions.
+- Per-stage PGO retraining is **not** required; at the close of each major stage
+  a full LTO+PGO check (both sides independently retrained with the same training
+  workloads) is recommended. Report it separately; PGO gains cannot offset
+  regressions in the ordinary no-PGO release gate.
+- Cross-protocol comparisons are accepted for cumulative, user-facing deltas;
+  label the build protocol of both sides. They must not be used for stage
+  acceptance or to attribute performance changes to a code change.
+
 ## External V8 v7 suite
 
 ```sh

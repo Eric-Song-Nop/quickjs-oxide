@@ -13,11 +13,8 @@ impl SliceStep {
             self = match self {
                 Self::Read { mut resume } => {
                     let (object, key) = resume.take_read();
-                    let receiver = Value::Object(object);
-                    let Value::Object(object) = &receiver else {
-                        unreachable!()
-                    };
-                    match runtime.prepare_ordinary_read_borrowed(object, &key, &receiver)? {
+                    let receiver = JsValue::Object(object.object_id());
+                    match runtime.prepare_ordinary_read_selected(&object, &key, &receiver, None)? {
                         OrdinaryRead::Complete(value) => {
                             #[cfg(feature = "profiling")]
                             crate::engine::api::profiling::record_owned_execution_event(
@@ -25,17 +22,18 @@ impl SliceStep {
                             );
                             resume.resume_once(
                                 runtime,
-                                Completion::Return(value.unwrap_or(Value::Undefined)),
+                                Completion::Return(value.unwrap_or(JsValue::Undefined)),
                             )?
                         }
                         read => return Ok(Self::make_preparedread(read, key, resume)),
                     }
                 }
                 Self::Number { mut resume }
-                    if !matches!(resume.0.pending.value.as_ref(), Some(Value::Object(_))) =>
+                    if !matches!(resume.0.pending.value.as_ref(), Some(JsValue::Object(_))) =>
                 {
                     let (value,) = resume.take_number();
-                    let NumberStep::Complete(result) = NumberStep::start(runtime, realm, value)?
+                    let NumberStep::Complete(result) =
+                        NumberStep::start_jsvalue(runtime, realm, value)?
                     else {
                         return Err(RuntimeError::Invariant(
                             "primitive slice conversion suspended",
@@ -61,7 +59,7 @@ impl SliceStep {
                     )? =>
                 {
                     let (object, key, descriptor) = resume.take_define();
-                    let result = define_local(runtime, realm, &object, &key, &descriptor)?;
+                    let result = define_local(runtime, realm, &object, &key, descriptor)?;
                     resume.defined_once(runtime, result)?
                 }
                 step => return Ok(step),
@@ -75,19 +73,9 @@ pub(super) fn define_local(
     realm: ContextId,
     object: &ObjectRef,
     key: &PropertyKey,
-    descriptor: &OrdinaryPropertyDescriptor,
+    descriptor: OwnedPropertyDescriptor,
 ) -> Result<NativeConversion<InternalDefineResult>, RuntimeError> {
-    let result = match runtime.define_own_property_in_realm(Some(realm), object, key, descriptor)? {
-        crate::engine::object::operations::PropertyDefineOutcome::Defined(true) => {
-            NativeConversion::Value(InternalDefineResult::Defined)
-        }
-        crate::engine::object::operations::PropertyDefineOutcome::Defined(false) => {
-            NativeConversion::Value(InternalDefineResult::RejectedOrdinary(object.clone()))
-        }
-        crate::engine::object::operations::PropertyDefineOutcome::Throw(value) => {
-            NativeConversion::Throw(value)
-        }
-    };
+    let result = runtime.internal_define_owned_property(realm, object, key, descriptor)?;
     #[cfg(feature = "profiling")]
     crate::engine::api::profiling::record_owned_execution_event("array_slice_local_define");
     Ok(result)

@@ -19,7 +19,7 @@ use crate::engine::api::runtime_error::RuntimeError;
 use crate::engine::heap::{ContextId, ObjectData, ObjectPayload};
 use crate::engine::object::ObjectRef;
 
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
 
@@ -56,26 +56,28 @@ impl Runtime {
         let text = format_date_string(fields.as_ref(), DateStringKind::String).map_err(|_| {
             RuntimeError::Invariant("the host clock produced an invalid Date string")
         })?;
-        Ok(Completion::Return(Value::String(JsString::try_from_utf8(
-            &text,
-        )?)))
+        Ok(Completion::Return(self.unroot_value(&Value::String(
+            JsString::try_from_utf8(&text)?,
+        ))?))
     }
 
     fn call_date_now(&self) -> Result<Completion, RuntimeError> {
-        Ok(Completion::Return(Value::number(
-            self.date_now_millis() as f64
-        )))
+        Ok(
+            Completion::Return(
+                crate::engine::value::number::operations::Number::compact(
+                    self.date_now_millis() as f64
+                )
+                .into(),
+            ),
+        )
     }
 
-    fn genuine_date_value(&self, value: &Value) -> Result<Option<f64>, RuntimeError> {
-        let Value::Object(object) = value else {
+    fn genuine_date_value(&self, value: &JsValue) -> Result<Option<f64>, RuntimeError> {
+        let JsValue::Object(object) = value else {
             return Ok(None);
         };
-        if !object.belongs_to(self) {
-            return Err(RuntimeError::WrongRuntime("Date argument"));
-        }
         let state = self.0.state.borrow();
-        let object = state.heap.object(object.object_id())?;
+        let object = state.heap.object(*object)?;
         Ok(match &object.payload {
             ObjectPayload::Date(value) => Some(*value),
             _ => None,

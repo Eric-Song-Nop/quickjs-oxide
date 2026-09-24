@@ -5,7 +5,7 @@ use crate::engine::{
     code::dynamic_source::DynamicSourceBuilder,
     heap::ContextId,
     object::{ObjectRef, PropertyKey},
-    value::{JsString, Value, conversion::NativeConversion},
+    value::{JsString, JsValue, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
@@ -37,19 +37,40 @@ impl std::ops::DerefMut for DynamicFunctionResume {
 }
 const _: () = assert!(std::mem::size_of::<DynamicFunctionResume>() <= 8);
 pub(crate) struct DynamicFunctionResumeState {
+    runtime: Runtime,
     pending_effect: DynamicFunctionStepPending,
     realm: ContextId,
     kind: DynamicFunctionKind,
-    new_target: Value,
-    arguments: Vec<Value>,
+    new_target: JsValue,
+    arguments: Vec<JsValue>,
     index: usize,
     source: Option<DynamicSourceBuilder>,
     phase: Phase,
-    value: Value,
+    value: JsValue,
+}
+impl Drop for DynamicFunctionResumeState {
+    /// Release the internal edges still owned when the request is abandoned.
+    /// Consumption goes through `Option::take`/`mem::replace`, so drained
+    /// fields are `None`/`Undefined` here; releases are defer-safe and nothrow.
+    fn drop(&mut self) {
+        if let Some(value) = self.pending_effect.string_value.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.pending_effect.read_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        for value in self.arguments.drain(..) {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        let value = std::mem::replace(&mut self.value, JsValue::Undefined);
+        let _ = self.runtime.release_jsvalue(value);
+        let new_target = std::mem::replace(&mut self.new_target, JsValue::Undefined);
+        let _ = self.runtime.release_jsvalue(new_target);
+    }
 }
 impl DynamicFunctionStep {
     pub(crate) fn start(
-        _runtime: &Runtime,
+        runtime: &Runtime,
         realm: ContextId,
         kind: DynamicFunctionKind,
         invocation: &NativeInvocation,
@@ -76,18 +97,26 @@ impl DynamicFunctionStep {
             source.push_str("*")?;
         }
         source.push_str(" anonymous(")?;
+        let mut owned_arguments = Vec::new();
+        owned_arguments
+            .try_reserve_exact(arguments.actual_arg_count)
+            .map_err(|_| RuntimeError::Invariant("Function constructor argv allocation failed"))?;
+        for value in &arguments.readable[..arguments.actual_arg_count] {
+            owned_arguments.push(runtime.dup_jsvalue(value)?);
+        }
         DynamicFunctionResume(Box::new(DynamicFunctionResumeState {
+            runtime: runtime.clone(),
             pending_effect: DynamicFunctionStepPending::default(),
             realm,
             kind,
-            new_target: new_target.clone(),
-            arguments: arguments.readable[..arguments.actual_arg_count].to_vec(),
+            new_target: runtime.dup_jsvalue(new_target)?,
+            arguments: owned_arguments,
             index: 0,
             source: Some(source),
             phase: Phase::Parameters,
-            value: Value::Undefined,
+            value: JsValue::Undefined,
         }))
-        .parameter()
+        .parameter(runtime)
     }
 }
 impl DynamicFunctionResume {
@@ -97,19 +126,20 @@ impl DynamicFunctionResume {
             .as_mut()
             .ok_or(RuntimeError::Invariant("Function source builder missing"))
     }
-    fn parameter(mut self) -> Result<DynamicFunctionStep, RuntimeError> {
+    fn parameter(mut self, runtime: &Runtime) -> Result<DynamicFunctionStep, RuntimeError> {
         if self.0.index < self.0.arguments.len().saturating_sub(1) {
             if self.0.index != 0 {
                 self.source()?.push_str(",")?;
             }
             return Ok({
-                let __pending_field_value = self.0.arguments[self.0.index].clone();
+                let __pending_field_value = runtime.dup_jsvalue(&self.0.arguments[self.0.index])?;
                 let __pending_field_resume = self;
                 DynamicFunctionStep::request_string(__pending_field_value, __pending_field_resume)
             });
         }
         self.source()?.push_str("\n) {\n")?;
-        if let Some(value) = self.0.arguments.last().cloned() {
+        if let Some(value) = self.0.arguments.last() {
+            let value = runtime.dup_jsvalue(value)?;
             self.0.phase = Phase::Body;
             return Ok({
                 let __pending_field_value = value;
@@ -121,6 +151,7 @@ impl DynamicFunctionResume {
     }
     pub(crate) fn string(
         mut self,
+        runtime: &Runtime,
         result: NativeConversion<JsString>,
     ) -> Result<DynamicFunctionStep, RuntimeError> {
         let value = match result {
@@ -133,7 +164,7 @@ impl DynamicFunctionResume {
         match self.0.phase {
             Phase::Parameters => {
                 self.0.index += 1;
-                self.parameter()
+                self.parameter(runtime)
             }
             Phase::Body => self.eval(),
             _ => Err(RuntimeError::Invariant(
@@ -169,29 +200,25 @@ impl DynamicFunctionResume {
         };
         match self.0.phase {
             Phase::Eval => {
-                if matches!(self.0.new_target, Value::Undefined) {
+                if matches!(self.0.new_target, JsValue::Undefined) {
                     return Ok(DynamicFunctionStep::Complete(Completion::Return(value)));
                 }
                 self.0.value = value;
                 self.0.phase = Phase::Prototype;
-                Ok({
-                    let __pending_field_receiver = self.0.new_target.clone();
-                    let __pending_field_key = runtime
-                        .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Prototype)?;
-                    let __pending_field_resume = self;
-                    DynamicFunctionStep::request_read(
-                        __pending_field_receiver,
-                        __pending_field_key,
-                        __pending_field_resume,
-                    )
-                })
+                Ok(DynamicFunctionStep::request_read(
+                    runtime.dup_jsvalue(&self.0.new_target)?,
+                    runtime
+                        .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Prototype)?,
+                    self,
+                ))
             }
             Phase::Prototype => {
-                let prototype = if let Value::Object(object) = value {
-                    object
+                let prototype = if let JsValue::Object(object) = value {
+                    ObjectRef::from_owned_handle(runtime.clone(), object)
                 } else {
+                    runtime.release_jsvalue(value)?;
                     let realm = match runtime
-                        .function_realm_from_value(self.0.realm, &self.0.new_target)?
+                        .function_realm_from_jsvalue(self.0.realm, &self.0.new_target)?
                     {
                         NativeConversion::Value(realm) => realm,
                         NativeConversion::Throw(value) => {
@@ -210,18 +237,19 @@ impl DynamicFunctionResume {
                     };
                     ObjectRef::from_borrowed_handle(runtime.clone(), prototype)?
                 };
-                let Value::Object(function) = self.0.value else {
+                let JsValue::Object(function) = self.0.value else {
                     return Ok(DynamicFunctionStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             "not an object",
                         )?,
                     )));
                 };
+                let function = ObjectRef::from_borrowed_handle(runtime.clone(), function)?;
                 if !runtime.set_prototype_of(&function, Some(&prototype))? {
                     return Ok(DynamicFunctionStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             "prototype is immutable",
@@ -229,12 +257,15 @@ impl DynamicFunctionResume {
                     )));
                 }
                 Ok(DynamicFunctionStep::Complete(Completion::Return(
-                    Value::Object(function),
+                    std::mem::replace(&mut self.0.value, JsValue::Undefined),
                 )))
             }
-            _ => Err(RuntimeError::Invariant(
-                "Function constructor value reply phase mismatch",
-            )),
+            _ => {
+                runtime.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant(
+                    "Function constructor value reply phase mismatch",
+                ))
+            }
         }
     }
 }
@@ -248,7 +279,7 @@ pub(crate) fn finish(
             DynamicFunctionStep::Complete(result) => return Ok(result),
             DynamicFunctionStep::String { mut resume } => {
                 let value = resume.take_string_value();
-                resume.string(runtime.native_to_dynamic_source_fragment(realm, &value)?)?
+                resume.string(runtime, runtime.native_to_js_string_jsvalue(realm, value)?)?
             }
             DynamicFunctionStep::Eval { mut resume } => {
                 let source = resume.take_eval_source();
@@ -262,7 +293,7 @@ pub(crate) fn finish(
                 let key = resume.take_read_key();
                 resume.resume(
                     runtime,
-                    runtime.get_value_property_in_realm(realm, receiver, &key)?,
+                    runtime.get_value_property_in_realm_jsvalue(realm, receiver, &key)?,
                 )?
             }
         };
@@ -271,13 +302,13 @@ pub(crate) fn finish(
 
 #[derive(Default)]
 struct DynamicFunctionStepPending {
-    string_value: Option<Value>,
+    string_value: Option<JsValue>,
     eval_source: Option<JsString>,
-    read_receiver: Option<Value>,
+    read_receiver: Option<JsValue>,
     read_key: Option<PropertyKey>,
 }
 impl DynamicFunctionStep {
-    pub(crate) fn request_string(value: Value, mut resume: DynamicFunctionResume) -> Self {
+    pub(crate) fn request_string(value: JsValue, mut resume: DynamicFunctionResume) -> Self {
         resume.0.pending_effect.string_value = Some(value);
         Self::String { resume }
     }
@@ -286,7 +317,7 @@ impl DynamicFunctionStep {
         Self::Eval { resume }
     }
     pub(crate) fn request_read(
-        receiver: Value,
+        receiver: JsValue,
         key: PropertyKey,
         mut resume: DynamicFunctionResume,
     ) -> Self {
@@ -296,7 +327,7 @@ impl DynamicFunctionStep {
     }
 }
 impl DynamicFunctionResume {
-    pub(crate) fn take_string_value(&mut self) -> Value {
+    pub(crate) fn take_string_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .string_value
@@ -310,7 +341,7 @@ impl DynamicFunctionResume {
             .take()
             .expect("DynamicFunctionStep Eval source")
     }
-    pub(crate) fn take_read_receiver(&mut self) -> Value {
+    pub(crate) fn take_read_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .read_receiver

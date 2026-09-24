@@ -14,6 +14,7 @@ use crate::engine::code::debug::{DebugInfoMode, Pc2LineEntry, Pc2LineTable};
 use crate::engine::code::dynamic_source::DynamicSourceBuilder;
 use crate::source::LineColumn;
 
+use crate::engine::atom::AtomIdx;
 use crate::engine::code::function::metadata::{
     ClosureSource, ClosureVariable, ClosureVariableKind, ClosureVariableName, ConstructorKind,
     EvalKind, FunctionKind, FunctionMetadata,
@@ -34,7 +35,7 @@ use crate::engine::object::{
     AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, DescriptorField,
     OrdinaryPropertyDescriptor, PropertyKey, WellKnownSymbol,
 };
-use crate::engine::value::{JsString, JsStringError, Value};
+use crate::engine::value::{JsString, JsStringError, JsValue, Value};
 use crate::engine::vm::call::CallableExecution;
 
 use crate::engine::vm::{Completion, ToPrimitiveHint};
@@ -489,9 +490,12 @@ fn set_property(
     match runtime.prepare_set_property(object, key, value)? {
         PropertySetAction::Complete => Ok(true),
         PropertySetAction::Rejected(_) | PropertySetAction::RejectedProxyTrap => Ok(false),
-        PropertySetAction::Throw(_) => Err(RuntimeError::Invariant(
-            "context-free property test produced a JavaScript throw",
-        )),
+        PropertySetAction::Throw(value) => {
+            runtime.release_jsvalue(value)?;
+            Err(RuntimeError::Invariant(
+                "context-free property test produced a JavaScript throw",
+            ))
+        }
         PropertySetAction::Call { .. } => Err(RuntimeError::Invariant(
             "ordinary-property test helper unexpectedly reached a setter",
         )),
@@ -508,9 +512,12 @@ fn set_property_with_receiver(
     match runtime.prepare_set_property_with_receiver(object, key, value, receiver)? {
         PropertySetAction::Complete => Ok(true),
         PropertySetAction::Rejected(_) | PropertySetAction::RejectedProxyTrap => Ok(false),
-        PropertySetAction::Throw(_) => Err(RuntimeError::Invariant(
-            "context-free property test produced a JavaScript throw",
-        )),
+        PropertySetAction::Throw(value) => {
+            runtime.release_jsvalue(value)?;
+            Err(RuntimeError::Invariant(
+                "context-free property test produced a JavaScript throw",
+            ))
+        }
         PropertySetAction::Call { .. } => Err(RuntimeError::Invariant(
             "ordinary-property test helper unexpectedly reached a setter",
         )),

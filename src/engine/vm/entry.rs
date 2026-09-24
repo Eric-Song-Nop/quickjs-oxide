@@ -7,7 +7,7 @@ use crate::engine::object::{
     CallableRef, CompleteOrdinaryPropertyDescriptor, ObjectRef, OrdinaryPropertyDescriptor,
     PropertyKey,
 };
-use crate::engine::value::{Value, conversion::NativeConversion};
+use crate::engine::value::{JsValue, Value, conversion::NativeConversion};
 
 pub(super) type DescriptorReply = NativeConversion<Option<CompleteOrdinaryPropertyDescriptor>>;
 pub(crate) fn call(
@@ -46,16 +46,32 @@ pub(crate) fn construct(
     let (constructor, new_target) =
         match runtime.prepare_constructor_pair(realm, constructor, new_target)? {
             NativeConversion::Value(pair) => pair,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
+    let mut js_arguments = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        match runtime.unroot_value(argument) {
+            Ok(value) => js_arguments.push(value),
+            Err(error) => {
+                for value in js_arguments {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                return Err(error);
+            }
+        }
+    }
     let normalized = match runtime.normalize_constructor(
         realm,
         constructor,
         ConstructNewTarget::Validated(new_target),
-        arguments.to_vec(),
+        js_arguments,
     )? {
         NativeConversion::Value(normalized) => normalized,
-        NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+        NativeConversion::Throw(value) => {
+            return Ok(Completion::Throw(value));
+        }
     };
     execute_root(runtime.clone(), realm, RootOperation::Construct(normalized))
         .map_err(RuntimeError::Engine)
@@ -109,6 +125,7 @@ pub(crate) fn define(
     runtime.validate_object_and_key(object, key)?;
     runtime.validate_descriptor_domains(descriptor)?;
     boolean(
+        runtime,
         execute_root(
             runtime.clone(),
             realm,
@@ -133,6 +150,7 @@ pub(crate) fn set(
     runtime.validate_value_domain(&value, "property value")?;
     runtime.validate_value_domain(&receiver, "property receiver")?;
     boolean(
+        runtime,
         execute_root(
             runtime.clone(),
             realm,
@@ -146,13 +164,19 @@ pub(crate) fn set(
         .map_err(RuntimeError::Engine)?,
     )
 }
-fn boolean(completion: Completion) -> Result<NativeConversion<bool>, RuntimeError> {
+fn boolean(
+    runtime: &Runtime,
+    completion: Completion,
+) -> Result<NativeConversion<bool>, RuntimeError> {
     match completion {
-        Completion::Return(Value::Bool(value)) => Ok(NativeConversion::Value(value)),
+        Completion::Return(JsValue::Bool(value)) => Ok(NativeConversion::Value(value)),
         Completion::Throw(value) => Ok(NativeConversion::Throw(value)),
-        _ => Err(RuntimeError::Invariant(
-            "property entry did not return a boolean",
-        )),
+        Completion::Return(value) => {
+            runtime.release_jsvalue(value)?;
+            Err(RuntimeError::Invariant(
+                "property entry did not return a boolean",
+            ))
+        }
     }
 }
 
@@ -208,6 +232,7 @@ mod tests {
         assert!(context.set_property(&proxy, &key, Value::Int(42)).unwrap());
         assert_eq!(context.get_property(&proxy, &key).unwrap(), Value::Int(42));
         let snapshot = profile.snapshot();
+        assert!(snapshot.owned_instructions > 0);
     }
 
     #[test]
@@ -246,6 +271,7 @@ mod tests {
         };
         assert_eq!(context.get_property(&result, &key).unwrap(), Value::Int(9));
         let snapshot = profile.snapshot();
+        assert!(snapshot.owned_instructions > 0);
     }
     #[test]
     fn template_value_constants_keep_identity_and_roots_through_owned_entry_and_gc() {
@@ -290,5 +316,6 @@ mod tests {
             Value::String(crate::engine::value::JsString::from_static("alive"))
         );
         let snapshot = profile.snapshot();
+        assert!(snapshot.owned_instructions > 0);
     }
 }

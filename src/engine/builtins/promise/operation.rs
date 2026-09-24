@@ -10,7 +10,7 @@ mod then;
 use crate::engine::builtins::native::{NativeFunctionId, PromiseNativeKind, PromiseResolvingKind};
 use crate::engine::heap::{ContextId, InternalCallableData, PromiseState};
 use crate::engine::object::{CallableRef, ObjectRef, PropertyKey};
-use crate::engine::value::{Value, conversion::NativeConversion};
+use crate::engine::value::{JsValue, conversion::NativeConversion};
 use crate::engine::vm::{
     Completion,
     call::{ConstructorPrototypeSource, NativeArguments, NativeInvocation},
@@ -28,9 +28,94 @@ pub(crate) enum PromiseStep {
 }
 
 pub(crate) struct PromiseResume {
+    runtime: Runtime,
     pending_effect: PromiseStepPending,
     realm: ContextId,
     phase: Phase,
+}
+
+impl Drop for PromiseResume {
+    fn drop(&mut self) {
+        for value in [
+            self.pending_effect.next_method.take(),
+            self.pending_effect.read_receiver.take(),
+            self.pending_effect.call_receiver.take(),
+            self.pending_effect.prototype_new_target.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        for values in [
+            self.pending_effect.call_arguments.take(),
+            self.pending_effect.construct_arguments.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for value in values {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+        if let Some(Completion::Return(value) | Completion::Throw(value)) =
+            self.pending_effect.close_completion.take()
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(step) = self.pending_effect.nested_step.take() {
+            step.release(&self.runtime);
+        }
+        if let Phase::ConvenienceCapability { arguments, .. } = &mut self.phase {
+            for value in arguments.readable.drain(..) {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+    }
+}
+impl PromiseStep {
+    pub(crate) fn release(self, runtime: &Runtime) {
+        match self {
+            Self::Complete(Completion::Return(value) | Completion::Throw(value)) => {
+                let _ = runtime.release_jsvalue(value);
+            }
+            Self::Next { resume }
+            | Self::Close { resume }
+            | Self::Nested { resume }
+            | Self::Read { resume }
+            | Self::Call { resume }
+            | Self::Construct { resume }
+            | Self::Prototype { resume } => drop(resume),
+        }
+    }
+}
+
+/// Owns all operands while a dynamic Promise method is being acquired.
+struct InvocationState {
+    runtime: Runtime,
+    receiver: JsValue,
+    arguments: Vec<JsValue>,
+}
+impl InvocationState {
+    fn new(runtime: &Runtime, receiver: JsValue, arguments: Vec<JsValue>) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            receiver,
+            arguments,
+        }
+    }
+    fn take_receiver(&mut self) -> JsValue {
+        std::mem::replace(&mut self.receiver, JsValue::Undefined)
+    }
+}
+impl Drop for InvocationState {
+    fn drop(&mut self) {
+        let receiver = self.take_receiver();
+        let _ = self.runtime.release_jsvalue(receiver);
+        for value in self.arguments.drain(..) {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
 }
 
 enum Phase {
@@ -38,39 +123,26 @@ enum Phase {
     IgnoreReturn,
     AggregateCapability {
         constructor: ObjectRef,
-        iterable: Value,
+        inputs: aggregate::Inputs,
         kind: PromiseNativeKind,
     },
     Aggregate(aggregate::Phase),
-    InvokeThen {
-        receiver: Value,
-        arguments: Vec<Value>,
-    },
+    InvokeThen(InvocationState),
     Finally(finally::Phase),
     ConvenienceCapability {
         kind: PromiseNativeKind,
         arguments: NativeArguments,
     },
     TryCallback(RootedPromiseCapability),
-    CatchThen {
-        receiver: Value,
-        handler: Value,
-    },
+    CatchThen(InvocationState),
     Thenable(CallableRef),
     Reaction(Option<jobs::ReactionTargets>),
     Capability {
         executor: CallableRef,
         after: Box<PromiseResume>,
     },
-    StaticConstructor {
-        constructor: ObjectRef,
-        argument: Value,
-        kind: PromiseNativeKind,
-    },
-    StaticCapability {
-        argument: Value,
-        kind: PromiseNativeKind,
-    },
+    StaticConstructor(resolve::ResolveState),
+    StaticCapability(resolve::ResolveState),
     ThenConstructor {
         promise: ObjectRef,
         handlers: then::ThenHandlers,
@@ -97,12 +169,18 @@ enum Phase {
 }
 
 impl PromiseStep {
-    pub(super) fn ignore_return(realm: ContextId, callable: CallableRef, argument: Value) -> Self {
+    pub(super) fn ignore_return(
+        realm: ContextId,
+        callable: CallableRef,
+        argument: JsValue,
+    ) -> Self {
+        let runtime = callable.runtime().clone();
         {
             let __pending_field_callable = callable;
-            let __pending_field_receiver = Value::Undefined;
+            let __pending_field_receiver = JsValue::Undefined;
             let __pending_field_arguments = vec![argument];
             let __pending_field_resume = Box::new(PromiseResume {
+                runtime: runtime.clone(),
                 pending_effect: PromiseStepPending::default(),
                 realm,
                 phase: Phase::IgnoreReturn,
@@ -130,19 +208,20 @@ impl PromiseStep {
                 | PromiseNativeKind::Race),
             ) => Self::aggregate(runtime, realm, kind, invocation, arguments),
             NativeFunctionId::PromiseAllResolveElement => {
-                runtime.prepare_promise_all_resolve_element(realm, invocation.clone(), arguments)
+                runtime.prepare_promise_all_resolve_element(realm, invocation, arguments)
             }
-            NativeFunctionId::PromiseAllSettledElement(kind) => runtime
-                .prepare_promise_all_settled_element(kind, realm, invocation.clone(), arguments),
+            NativeFunctionId::PromiseAllSettledElement(kind) => {
+                runtime.prepare_promise_all_settled_element(kind, realm, invocation, arguments)
+            }
             NativeFunctionId::PromiseAnyRejectElement => {
-                runtime.prepare_promise_any_reject_element(realm, invocation.clone(), arguments)
+                runtime.prepare_promise_any_reject_element(realm, invocation, arguments)
             }
             NativeFunctionId::Promise(PromiseNativeKind::Finally)
             | NativeFunctionId::PromiseFinallyHandler(_) => {
                 finally::start(runtime, realm, target, invocation, arguments)
             }
             NativeFunctionId::PromiseFinallyThunk(kind) => runtime
-                .call_promise_finally_thunk(kind, invocation.clone())
+                .call_promise_finally_thunk(kind, invocation.dup(runtime)?)
                 .map(Self::Complete),
             NativeFunctionId::Promise(
                 kind @ (PromiseNativeKind::Try | PromiseNativeKind::WithResolvers),
@@ -153,33 +232,27 @@ impl PromiseStep {
                         "Promise.prototype.catch received a constructor invocation",
                     ));
                 };
-                let handler =
-                    arguments
-                        .readable
-                        .first()
-                        .cloned()
-                        .ok_or(RuntimeError::Invariant(
-                            "Promise.catch reject argv was not padded",
-                        ))?;
-                Ok({
-                    let __pending_field_receiver = this_value.clone();
-                    let __pending_field_key = runtime
-                        .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Then)?;
-                    let __pending_field_resume = Box::new(PromiseResume {
-                        pending_effect: PromiseStepPending::default(),
-                        realm,
-                        phase: Phase::CatchThen {
-                            receiver: this_value.clone(),
-                            handler,
-                        },
-                    });
-                    Self::request_read(
-                        __pending_field_receiver,
-                        __pending_field_key,
-                        __pending_field_resume,
-                    )
-                })
+                let argument = arguments.readable.first().ok_or(RuntimeError::Invariant(
+                    "Promise.catch reject argv was not padded",
+                ))?;
+                let mut inputs = InvocationState::new(
+                    runtime,
+                    runtime.dup_jsvalue(this_value)?,
+                    vec![JsValue::Undefined],
+                );
+                inputs.arguments.push(runtime.dup_jsvalue(argument)?);
+                let key =
+                    runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Then)?;
+                let receiver = runtime.dup_jsvalue(&inputs.receiver)?;
+                let resume = Box::new(PromiseResume {
+                    runtime: runtime.clone(),
+                    pending_effect: PromiseStepPending::default(),
+                    realm,
+                    phase: Phase::CatchThen(inputs),
+                });
+                Ok(Self::request_read(receiver, key, resume))
             }
+
             NativeFunctionId::Promise(PromiseNativeKind::Then) => {
                 Self::then(runtime, realm, invocation, arguments)
             }
@@ -191,18 +264,14 @@ impl PromiseStep {
                         "Promise resolve/reject received a constructor invocation",
                     ));
                 };
-                Self::static_resolve(
+                Self::static_resolve_borrowed(
                     runtime,
                     realm,
                     kind,
-                    this_value.clone(),
-                    arguments
-                        .readable
-                        .first()
-                        .cloned()
-                        .ok_or(RuntimeError::Invariant(
-                            "Promise resolve/reject argv was not padded",
-                        ))?,
+                    this_value,
+                    arguments.readable.first().ok_or(RuntimeError::Invariant(
+                        "Promise resolve/reject argv was not padded",
+                    ))?,
                 )
             }
             NativeFunctionId::PromiseResolving(kind) => {
@@ -214,13 +283,13 @@ impl PromiseStep {
                         "Promise constructor did not receive a constructor invocation",
                     ));
                 };
-                let executor =
-                    runtime.callable_from_value(arguments.readable.first().cloned().ok_or(
-                        RuntimeError::Invariant("Promise executor argv was not padded"),
-                    )?)?;
+                let executor = runtime.callable_from_jsvalue(arguments.readable.first().ok_or(
+                    RuntimeError::Invariant("Promise executor argv was not padded"),
+                )?)?;
                 Ok({
-                    let __pending_field_new_target = new_target.clone();
+                    let __pending_field_new_target = runtime.dup_jsvalue(new_target)?;
                     let __pending_field_resume = Box::new(PromiseResume {
+                        runtime: runtime.clone(),
                         pending_effect: PromiseStepPending::default(),
                         realm,
                         phase: Phase::ConstructorPrototype { executor },
@@ -228,11 +297,11 @@ impl PromiseStep {
                     Self::request_prototype(__pending_field_new_target, __pending_field_resume)
                 })
             }
-            NativeFunctionId::Promise(PromiseNativeKind::Species) => runtime
-                .call_promise_species(invocation.clone())
-                .map(Self::Complete),
+            NativeFunctionId::Promise(PromiseNativeKind::Species) => {
+                runtime.call_promise_species(invocation).map(Self::Complete)
+            }
             NativeFunctionId::PromiseCapabilityExecutor => runtime
-                .call_promise_capability_executor(realm, invocation.clone(), arguments)
+                .call_promise_capability_executor(realm, invocation.dup(runtime)?, arguments)
                 .map(Self::Complete),
             _ => Err(RuntimeError::Invariant("unregistered Promise operation")),
         }
@@ -276,21 +345,23 @@ impl PromiseStep {
             ));
         }
         if already_resolved.replace(true) {
-            return Ok(Self::Complete(Completion::Return(Value::Undefined)));
+            return Ok(Self::Complete(Completion::Return(JsValue::Undefined)));
         }
-        let resolution = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "Promise resolving argv was not padded",
-            ))?;
+        let resolution = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "Promise resolving argv was not padded",
+        ))?;
         let promise = ObjectRef::from_borrowed_handle(runtime.clone(), promise)?;
         if kind == PromiseResolvingKind::Reject {
-            runtime.settle_promise(realm, &promise, PromiseState::Rejected, resolution)?;
-        } else if let Value::Object(object) = resolution {
+            runtime.settle_promise(
+                realm,
+                &promise,
+                PromiseState::Rejected,
+                runtime.dup_jsvalue(resolution)?,
+            )?;
+        } else if let JsValue::Object(id) = resolution {
+            let object = ObjectRef::from_borrowed_handle(runtime.clone(), *id)?;
             if object == promise {
-                let reason = runtime.new_native_error(
+                let reason = runtime.new_native_error_jsvalue(
                     realm,
                     crate::engine::api::error::NativeErrorKind::Type,
                     "promise self resolution",
@@ -298,10 +369,11 @@ impl PromiseStep {
                 runtime.settle_promise(realm, &promise, PromiseState::Rejected, reason)?;
             } else {
                 return Ok({
-                    let __pending_field_receiver = Value::Object(object.clone());
+                    let __pending_field_receiver = JsValue::Object(object.clone().into_handle());
                     let __pending_field_key = runtime
                         .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Then)?;
                     let __pending_field_resume = Box::new(PromiseResume {
+                        runtime: runtime.clone(),
                         pending_effect: PromiseStepPending::default(),
                         realm,
                         phase: Phase::ResolveThen {
@@ -317,9 +389,14 @@ impl PromiseStep {
                 });
             }
         } else {
-            runtime.settle_promise(realm, &promise, PromiseState::Fulfilled, resolution)?;
+            runtime.settle_promise(
+                realm,
+                &promise,
+                PromiseState::Fulfilled,
+                runtime.dup_jsvalue(resolution)?,
+            )?;
         }
-        Ok(Self::Complete(Completion::Return(Value::Undefined)))
+        Ok(Self::Complete(Completion::Return(JsValue::Undefined)))
     }
 
     pub(crate) fn finish(
@@ -340,11 +417,16 @@ impl PromiseStep {
 
 impl PromiseResume {
     pub(crate) fn prototype(
-        self: Box<Self>,
+        mut self: Box<Self>,
         runtime: &Runtime,
         result: NativeConversion<ConstructorPrototypeSource>,
     ) -> Result<PromiseStep, RuntimeError> {
-        let Phase::ConstructorPrototype { executor } = self.phase else {
+        let Phase::ConstructorPrototype { executor } =
+            std::mem::replace(&mut self.phase, Phase::Identity)
+        else {
+            if let NativeConversion::Throw(value) = result {
+                runtime.release_jsvalue(value)?;
+            }
             return Err(RuntimeError::Invariant(
                 "Promise prototype reply has wrong phase",
             ));
@@ -364,14 +446,15 @@ impl PromiseResume {
         let promise = runtime.new_promise_object(&prototype)?;
         let (resolve, reject) = runtime.create_promise_resolving_functions(self.realm, &promise)?;
         let arguments = vec![
-            Value::Object(resolve.as_object().clone()),
-            Value::Object(reject.as_object().clone()),
+            JsValue::Object(resolve.as_object().clone().into_handle()),
+            JsValue::Object(reject.as_object().clone().into_handle()),
         ];
         Ok({
             let __pending_field_callable = executor;
-            let __pending_field_receiver = Value::Undefined;
+            let __pending_field_receiver = JsValue::Undefined;
             let __pending_field_arguments = arguments;
             let __pending_field_resume = Box::new(Self {
+                runtime: runtime.clone(),
                 pending_effect: PromiseStepPending::default(),
                 realm: self.realm,
                 phase: Phase::ConstructorExecutor {
@@ -392,36 +475,38 @@ impl PromiseResume {
     }
 
     pub(crate) fn resume(
-        self: Box<Self>,
+        mut self: Box<Self>,
         runtime: &Runtime,
         completion: Completion,
     ) -> Result<PromiseStep, RuntimeError> {
         let realm = self.realm;
-        match self.phase {
+        match std::mem::replace(&mut self.phase, Phase::Identity) {
             Phase::ConvenienceCapability { .. } => Err(RuntimeError::Invariant(
                 "Promise convenience expected capability",
             )),
-            Phase::TryCallback(capability) => convenience::settle(realm, capability, completion),
+            Phase::TryCallback(capability) => {
+                convenience::settle(runtime, realm, capability, completion)
+            }
             Phase::Finally(phase) => finally::resume(runtime, realm, phase, completion),
-            Phase::InvokeThen {
-                receiver,
-                arguments,
-            } => {
+            Phase::InvokeThen(mut inputs) => {
                 let value = match completion {
                     Completion::Return(value) => value,
                     Completion::Throw(value) => {
                         return Ok(PromiseStep::Complete(Completion::Throw(value)));
                     }
                 };
-                match runtime.promise_callable(realm, value)? {
+                let callable = runtime.promise_callable(realm, &value);
+                runtime.release_jsvalue(value)?;
+                match callable? {
                     NativeConversion::Throw(value) => {
                         Ok(PromiseStep::Complete(Completion::Throw(value)))
                     }
                     NativeConversion::Value(callable) => Ok({
                         let __pending_field_callable = callable;
-                        let __pending_field_receiver = receiver;
-                        let __pending_field_arguments = arguments;
+                        let __pending_field_receiver = inputs.take_receiver();
+                        let __pending_field_arguments = std::mem::take(&mut inputs.arguments);
                         let __pending_field_resume = Box::new(Self {
+                            runtime: runtime.clone(),
                             pending_effect: PromiseStepPending::default(),
                             realm,
                             phase: Phase::Identity,
@@ -440,30 +525,36 @@ impl PromiseResume {
             )),
             Phase::Aggregate(phase) => aggregate::resume(runtime, realm, phase, completion),
             Phase::IgnoreReturn => Ok(PromiseStep::Complete(match completion {
-                Completion::Return(_) => Completion::Return(Value::Undefined),
+                Completion::Return(value) => {
+                    runtime.release_jsvalue(value)?;
+                    Completion::Return(JsValue::Undefined)
+                }
                 other => other,
             })),
             Phase::Identity => Ok(PromiseStep::Complete(completion)),
-            Phase::CatchThen { receiver, handler } => {
+            Phase::CatchThen(mut inputs) => {
                 let method = match completion {
                     Completion::Throw(value) => {
                         return Ok(PromiseStep::Complete(Completion::Throw(value)));
                     }
                     Completion::Return(value) => value,
                 };
-                let callable = if let Value::Object(object) = method {
-                    runtime.as_callable(&object)?
-                } else {
-                    None
+                let callable = match &method {
+                    JsValue::Object(id) => ObjectRef::from_borrowed_handle(runtime.clone(), *id)
+                        .map_err(RuntimeError::from)
+                        .and_then(|object| runtime.as_callable(&object)),
+                    _ => Ok(None),
                 };
-                let Some(callable) = callable else {
+                runtime.release_jsvalue(method)?;
+                let Some(callable) = callable? else {
                     return capability::error(runtime, realm, "not a function");
                 };
                 Ok({
                     let __pending_field_callable = callable;
-                    let __pending_field_receiver = receiver;
-                    let __pending_field_arguments = vec![Value::Undefined, handler];
+                    let __pending_field_receiver = inputs.take_receiver();
+                    let __pending_field_arguments = std::mem::take(&mut inputs.arguments);
                     let __pending_field_resume = Box::new(Self {
+                        runtime: runtime.clone(),
                         pending_effect: PromiseStepPending::default(),
                         realm,
                         phase: Phase::Identity,
@@ -480,9 +571,10 @@ impl PromiseResume {
                 Completion::Return(value) => Ok(PromiseStep::Complete(Completion::Return(value))),
                 Completion::Throw(reason) => Ok({
                     let __pending_field_callable = reject;
-                    let __pending_field_receiver = Value::Undefined;
+                    let __pending_field_receiver = JsValue::Undefined;
                     let __pending_field_arguments = vec![reason];
                     let __pending_field_resume = Box::new(Self {
+                        runtime: runtime.clone(),
                         pending_effect: PromiseStepPending::default(),
                         realm,
                         phase: Phase::Identity,
@@ -497,7 +589,9 @@ impl PromiseResume {
             },
             Phase::Reaction(targets) => {
                 let Some(targets) = targets else {
-                    return Ok(PromiseStep::Complete(Completion::Return(Value::Undefined)));
+                    return Ok(PromiseStep::Complete(Completion::Return(
+                        JsValue::Undefined,
+                    )));
                 };
                 let (target, value) = match completion {
                     Completion::Return(value) => (targets.resolve, value),
@@ -510,9 +604,10 @@ impl PromiseResume {
                     ))?;
                 Ok({
                     let __pending_field_callable = callable;
-                    let __pending_field_receiver = Value::Undefined;
+                    let __pending_field_receiver = JsValue::Undefined;
                     let __pending_field_arguments = vec![value];
                     let __pending_field_resume = Box::new(Self {
+                        runtime: runtime.clone(),
                         pending_effect: PromiseStepPending::default(),
                         realm,
                         phase: Phase::Identity,
@@ -535,12 +630,10 @@ impl PromiseResume {
             Phase::ThenSpecies { promise, handlers } => {
                 then::species(runtime, realm, promise, handlers, completion)
             }
-            Phase::StaticConstructor {
-                constructor,
-                argument,
-                kind,
-            } => resolve::constructor(runtime, realm, constructor, argument, kind, completion),
-            Phase::ThenCapability { .. } | Phase::StaticCapability { .. } => Err(
+            Phase::StaticConstructor(state) => {
+                resolve::constructor(runtime, realm, state, completion)
+            }
+            Phase::ThenCapability { .. } | Phase::StaticCapability(..) => Err(
                 RuntimeError::Invariant("Promise operation expected a capability"),
             ),
             Phase::ResolveThen {
@@ -552,12 +645,16 @@ impl PromiseResume {
                         runtime.settle_promise(realm, &promise, PromiseState::Rejected, reason)?
                     }
                     Completion::Return(then) => {
-                        let then = if let Value::Object(object) = then {
-                            runtime.as_callable(&object)?
-                        } else {
-                            None
+                        let callable = match &then {
+                            JsValue::Object(id) => {
+                                ObjectRef::from_borrowed_handle(runtime.clone(), *id)
+                                    .map_err(RuntimeError::from)
+                                    .and_then(|object| runtime.as_callable(&object))
+                            }
+                            _ => Ok(None),
                         };
-                        if let Some(then) = then {
+                        runtime.release_jsvalue(then)?;
+                        if let Some(then) = callable? {
                             runtime.enqueue_promise_resolve_thenable_job(
                                 realm,
                                 promise.object_id(),
@@ -569,20 +666,23 @@ impl PromiseResume {
                                 realm,
                                 &promise,
                                 PromiseState::Fulfilled,
-                                Value::Object(resolution),
+                                JsValue::Object(resolution.into_handle()),
                             )?;
                         }
                     }
                 }
-                Ok(PromiseStep::Complete(Completion::Return(Value::Undefined)))
+                Ok(PromiseStep::Complete(Completion::Return(
+                    JsValue::Undefined,
+                )))
             }
             Phase::ConstructorExecutor { capability } => {
                 if let Completion::Throw(reason) = completion {
                     return Ok({
                         let __pending_field_callable = capability.reject;
-                        let __pending_field_receiver = Value::Undefined;
+                        let __pending_field_receiver = JsValue::Undefined;
                         let __pending_field_arguments = vec![reason];
                         let __pending_field_resume = Box::new(Self {
+                            runtime: runtime.clone(),
                             pending_effect: PromiseStepPending::default(),
                             realm,
                             phase: Phase::ReturnPromise(capability.promise),
@@ -595,13 +695,16 @@ impl PromiseResume {
                         )
                     });
                 }
-                Ok(PromiseStep::Complete(Completion::Return(Value::Object(
-                    capability.promise,
+                Ok(PromiseStep::Complete(Completion::Return(JsValue::Object(
+                    capability.promise.into_handle(),
                 ))))
             }
             Phase::ReturnPromise(promise) => Ok(PromiseStep::Complete(match completion {
                 Completion::Throw(value) => Completion::Throw(value),
-                Completion::Return(_) => Completion::Return(Value::Object(promise)),
+                Completion::Return(value) => {
+                    runtime.release_jsvalue(value)?;
+                    Completion::Return(JsValue::Object(promise.into_handle()))
+                }
             })),
             Phase::ConstructorPrototype { .. } => Err(RuntimeError::Invariant(
                 "Promise constructor expected prototype source",
@@ -612,11 +715,13 @@ impl PromiseResume {
 
 impl PromiseResume {
     pub(crate) fn next(
-        self: Box<Self>,
+        mut self: Box<Self>,
         runtime: &Runtime,
         result: crate::engine::builtins::object::ObjectIteratorStep,
     ) -> Result<PromiseStep, RuntimeError> {
-        let Phase::Aggregate(aggregate::Phase::Next(state)) = self.phase else {
+        let Phase::Aggregate(aggregate::Phase::Next(state)) =
+            std::mem::replace(&mut self.phase, Phase::Identity)
+        else {
             return Err(RuntimeError::Invariant(
                 "Promise iterator reply has wrong phase",
             ));
@@ -628,23 +733,23 @@ impl PromiseResume {
 #[derive(Default)]
 struct PromiseStepPending {
     next_iterator: Option<ObjectRef>,
-    next_method: Option<Value>,
+    next_method: Option<JsValue>,
     close_iterator: Option<ObjectRef>,
     close_completion: Option<Completion>,
     nested_step: Option<Box<PromiseStep>>,
-    read_receiver: Option<Value>,
+    read_receiver: Option<JsValue>,
     read_key: Option<PropertyKey>,
     call_callable: Option<CallableRef>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
     construct_target: Option<crate::engine::vm::call::ConstructorRef>,
-    construct_arguments: Option<Vec<Value>>,
-    prototype_new_target: Option<Value>,
+    construct_arguments: Option<Vec<JsValue>>,
+    prototype_new_target: Option<JsValue>,
 }
 impl PromiseStep {
     pub(crate) fn request_next(
         iterator: ObjectRef,
-        method: Value,
+        method: JsValue,
         mut resume: Box<PromiseResume>,
     ) -> Self {
         resume.pending_effect.next_iterator = Some(iterator);
@@ -665,7 +770,7 @@ impl PromiseStep {
         Self::Nested { resume }
     }
     pub(crate) fn request_read(
-        receiver: Value,
+        receiver: JsValue,
         key: PropertyKey,
         mut resume: Box<PromiseResume>,
     ) -> Self {
@@ -675,8 +780,8 @@ impl PromiseStep {
     }
     pub(crate) fn request_call(
         callable: CallableRef,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: Box<PromiseResume>,
     ) -> Self {
         resume.pending_effect.call_callable = Some(callable);
@@ -686,14 +791,14 @@ impl PromiseStep {
     }
     pub(crate) fn request_construct(
         target: crate::engine::vm::call::ConstructorRef,
-        arguments: Vec<Value>,
+        arguments: Vec<JsValue>,
         mut resume: Box<PromiseResume>,
     ) -> Self {
         resume.pending_effect.construct_target = Some(target);
         resume.pending_effect.construct_arguments = Some(arguments);
         Self::Construct { resume }
     }
-    pub(crate) fn request_prototype(new_target: Value, mut resume: Box<PromiseResume>) -> Self {
+    pub(crate) fn request_prototype(new_target: JsValue, mut resume: Box<PromiseResume>) -> Self {
         resume.pending_effect.prototype_new_target = Some(new_target);
         Self::Prototype { resume }
     }
@@ -705,7 +810,7 @@ impl PromiseResume {
             .take()
             .expect("PromiseStep Next iterator")
     }
-    pub(crate) fn take_next_method(&mut self) -> Value {
+    pub(crate) fn take_next_method(&mut self) -> JsValue {
         self.pending_effect
             .next_method
             .take()
@@ -729,7 +834,7 @@ impl PromiseResume {
             .take()
             .expect("PromiseStep Nested step")
     }
-    pub(crate) fn take_read_receiver(&mut self) -> Value {
+    pub(crate) fn take_read_receiver(&mut self) -> JsValue {
         self.pending_effect
             .read_receiver
             .take()
@@ -747,13 +852,13 @@ impl PromiseResume {
             .take()
             .expect("PromiseStep Call callable")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.pending_effect
             .call_receiver
             .take()
             .expect("PromiseStep Call receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.pending_effect
             .call_arguments
             .take()
@@ -765,13 +870,13 @@ impl PromiseResume {
             .take()
             .expect("PromiseStep Construct target")
     }
-    pub(crate) fn take_construct_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_construct_arguments(&mut self) -> Vec<JsValue> {
         self.pending_effect
             .construct_arguments
             .take()
             .expect("PromiseStep Construct arguments")
     }
-    pub(crate) fn take_prototype_new_target(&mut self) -> Value {
+    pub(crate) fn take_prototype_new_target(&mut self) -> JsValue {
         self.pending_effect
             .prototype_new_target
             .take()

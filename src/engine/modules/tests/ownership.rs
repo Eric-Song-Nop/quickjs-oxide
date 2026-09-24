@@ -17,9 +17,11 @@ fn module_handle_rejects_another_runtime() {
 fn first_execute_context_owns_module_global_resolution_and_evaluates_once() {
     let runtime = Runtime::new();
     let mut compilation_context = runtime.new_context();
-    compilation_context
-        .eval("globalThis.__realmMarker = 1")
-        .unwrap();
+    drop(
+        compilation_context
+            .eval("globalThis.__realmMarker = 1")
+            .unwrap(),
+    );
     let module = compilation_context
         .compile_module(
             r#"
@@ -30,11 +32,13 @@ fn first_execute_context_owns_module_global_resolution_and_evaluates_once() {
         .unwrap();
 
     let mut first_execute_context = runtime.new_context();
-    first_execute_context
-        .eval("globalThis.__realmMarker = 2")
-        .unwrap();
+    drop(
+        first_execute_context
+            .eval("globalThis.__realmMarker = 2")
+            .unwrap(),
+    );
     let mut later_context = runtime.new_context();
-    later_context.eval("globalThis.__realmMarker = 3").unwrap();
+    drop(later_context.eval("globalThis.__realmMarker = 3").unwrap());
 
     let first = module_evaluation_promise(&mut first_execute_context, &module);
     assert_script_true(
@@ -82,7 +86,7 @@ fn cloned_module_handle_roots_compilation_and_first_link_realms() {
         assert_eq!(runtime.heap_counts().context_nodes, 2);
         let snapshot = module_evaluation_snapshot(&mut link_context, &surviving_handle);
         assert_eq!(snapshot.state, PromiseState::Fulfilled);
-        assert_eq!(snapshot.result, RawValue::Undefined);
+        assert!(matches!(snapshot.result, RawValue::Undefined));
         assert_script_true(&mut link_context, "__rootedModuleRealm === 42");
     }
 
@@ -106,17 +110,17 @@ fn cross_linked_module_caches_do_not_leak_a_context_cycle() {
         .compile_module("globalThis.__secondCrossCacheModule = 2")
         .unwrap();
 
-    second_context.execute_module(&first_module).unwrap();
-    first_context.execute_module(&second_module).unwrap();
+    drop(second_context.execute_module(&first_module).unwrap());
+    drop(first_context.execute_module(&second_module).unwrap());
 
-    assert_eq!(
+    assert!(matches!(
         runtime.module_record(first_module.raw).unwrap().link_realm,
-        Some(RawModuleLinkRealm::Other(second_context.realm))
-    );
-    assert_eq!(
+        Some(RawModuleLinkRealm::Other(realm)) if realm == second_context.realm
+    ));
+    assert!(matches!(
         runtime.module_record(second_module.raw).unwrap().link_realm,
-        Some(RawModuleLinkRealm::Other(first_context.realm))
-    );
+        Some(RawModuleLinkRealm::Other(realm)) if realm == first_context.realm
+    ));
     assert_eq!(runtime.heap_counts().context_nodes, 2);
 
     drop(first_module);
@@ -176,9 +180,11 @@ fn json_module_handle_roots_its_parse_realm_across_context_gc() {
     let _loader_registration = runtime.set_module_loader(loader);
     let module = {
         let mut compilation_context = runtime.new_context();
-        compilation_context
-            .eval("Object.prototype.__jsonParseRealm = 41")
-            .unwrap();
+        drop(
+            compilation_context
+                .eval("Object.prototype.__jsonParseRealm = 41")
+                .unwrap(),
+        );
         compilation_context
             .compile_module_with_filename(
                 r#"
@@ -197,7 +203,7 @@ fn json_module_handle_roots_its_parse_realm_across_context_gc() {
 
     {
         let mut execution_context = runtime.new_context();
-        execution_context.execute_module(&module).unwrap();
+        drop(execution_context.execute_module(&module).unwrap());
         assert_script_true(
             &mut execution_context,
             "__jsonParseRealm === 42 && __jsonParsePrototype !== Object.prototype",

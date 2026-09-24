@@ -9,7 +9,7 @@ use crate::engine::api::{
 };
 use crate::engine::code::bytecode::PrivateNameSource;
 use crate::engine::code::function::metadata::ClosureVariableKind;
-use crate::engine::value::Value;
+use crate::engine::value::JsValue;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Access {
@@ -22,7 +22,7 @@ pub(super) enum Access {
 pub(super) enum Outcome {
     Entered,
     Done,
-    Throw(Value),
+    Throw(JsValue),
 }
 
 #[inline(never)]
@@ -60,7 +60,7 @@ pub(super) fn step(
                 };
                 Ok(Outcome::Throw(
                     runtime
-                        .new_native_error_from_error(realm, kind, &error)
+                        .new_native_error_from_error_jsvalue(realm, kind, &error)
                         .map_err(runtime_error_to_vm_error)?,
                 ))
             }
@@ -84,13 +84,15 @@ pub(super) fn step(
     let realm = frame.executable.realm;
     #[cfg(feature = "profiling")]
     let depth = execution.slots.depth(&frame.window);
+    let mut value = None;
+    let mut base_owner = None;
     let result = (|| -> Result<(), Error> {
-        let value = if matches!(access, Access::Put | Access::Define) {
+        value = if matches!(access, Access::Put | Access::Define) {
             Some(execution.slots.pop(&mut frame.window)?)
         } else {
             None
         };
-        let base = execution.slots.pop(&mut frame.window)?;
+        base_owner = Some(execution.slots.pop(&mut frame.window)?);
         let source = match source {
             PrivateNameSource::Local(index) => PrivateSource::Local(
                 frame.executable.local_definitions[usize::from(index)],
@@ -122,9 +124,15 @@ pub(super) fn step(
                 return Err(super::bindings::lexical_read_only_error(runtime, name)?);
             }
             if access == Access::In {
-                let Value::Object(receiver) = base else {
+                let base_value = base_owner.take().unwrap();
+                let JsValue::Object(receiver) = base_value else {
+                    runtime
+                        .release_jsvalue(base_value)
+                        .map_err(runtime_error_to_vm_error)?;
                     return Err(Error::new(ErrorKind::Type, "invalid 'in' operand"));
                 };
+                let receiver =
+                    crate::engine::object::ObjectRef::from_owned_handle(runtime.clone(), receiver);
                 let present = if let Some(method) =
                     private_bindings::optional_callable(runtime, source, kind)?
                 {
@@ -148,23 +156,33 @@ pub(super) fn step(
                 };
                 execution
                     .slots
-                    .push(&mut frame.window, Value::Bool(present))?;
+                    .push(&mut frame.window, JsValue::Bool(present))?;
             } else {
                 let method = private_bindings::optional_callable(runtime, source, kind)?
                     .ok_or_else(|| Error::new(ErrorKind::Type, "not an object"))?;
-                let receiver = private_bindings::branded_receiver(runtime, &method, kind, base)?;
+                let receiver = private_bindings::branded_receiver(
+                    runtime,
+                    &method,
+                    kind,
+                    base_owner.take().unwrap(),
+                )?;
                 if access == Access::GetKeep {
                     execution
                         .slots
-                        .push(&mut frame.window, Value::Object(receiver))?;
+                        .push(&mut frame.window, JsValue::Object(receiver.into_handle()))?;
                 }
-                execution
-                    .slots
-                    .push(&mut frame.window, Value::Object(method.as_object().clone()))?;
+                execution.slots.push(
+                    &mut frame.window,
+                    JsValue::Object(method.as_object().clone().into_handle()),
+                )?;
             }
             return Ok(());
         }
-        let Value::Object(receiver) = base else {
+        let base_value = base_owner.take().unwrap();
+        let JsValue::Object(receiver) = base_value else {
+            runtime
+                .release_jsvalue(base_value)
+                .map_err(runtime_error_to_vm_error)?;
             return Err(Error::new(
                 ErrorKind::Type,
                 if access == Access::In {
@@ -174,6 +192,8 @@ pub(super) fn step(
                 },
             ));
         };
+        let receiver =
+            crate::engine::object::ObjectRef::from_owned_handle(runtime.clone(), receiver);
         let name = private_bindings::optional_field_name(runtime, source)?;
         if access == Access::In {
             let present = if let Some(name) = name {
@@ -190,7 +210,7 @@ pub(super) fn step(
             };
             execution
                 .slots
-                .push(&mut frame.window, Value::Bool(present))?;
+                .push(&mut frame.window, JsValue::Bool(present))?;
         } else {
             let name = name.ok_or_else(|| Error::new(ErrorKind::Type, "not a symbol"))?;
             match access {
@@ -201,26 +221,36 @@ pub(super) fn step(
                     if access == Access::GetKeep {
                         execution
                             .slots
-                            .push(&mut frame.window, Value::Object(receiver))?;
+                            .push(&mut frame.window, JsValue::Object(receiver.into_handle()))?;
                     }
                     execution.slots.push(&mut frame.window, value)?;
                 }
                 Access::Put => runtime
-                    .set_private_field_own(&receiver, &name, value.unwrap())
+                    .set_private_field_own(&receiver, &name, value.take().unwrap())
                     .map_err(runtime_error_to_vm_error)?,
                 Access::Define => {
                     runtime
-                        .define_private_field_own(&receiver, &name, value.unwrap())
+                        .define_private_field_own(&receiver, &name, value.take().unwrap())
                         .map_err(runtime_error_to_vm_error)?;
                     execution
                         .slots
-                        .push(&mut frame.window, Value::Object(receiver))?;
+                        .push(&mut frame.window, JsValue::Object(receiver.into_handle()))?;
                 }
                 Access::In => unreachable!(),
             }
         }
         Ok(())
     })();
+    if let Some(value) = value {
+        runtime
+            .release_jsvalue(value)
+            .map_err(runtime_error_to_vm_error)?;
+    }
+    if let Some(base) = base_owner {
+        runtime
+            .release_jsvalue(base)
+            .map_err(runtime_error_to_vm_error)?;
+    }
     match result {
         Ok(()) => {
             frame.resume_pc = frame
@@ -237,7 +267,7 @@ pub(super) fn step(
             };
             Ok(Outcome::Throw(
                 runtime
-                    .new_native_error_from_error(realm, kind, &error)
+                    .new_native_error_from_error_jsvalue(realm, kind, &error)
                     .map_err(runtime_error_to_vm_error)?,
             ))
         }
@@ -274,16 +304,10 @@ fn enter_accessor(
     let callable = private_bindings::optional_callable(runtime, binding, kind)?
         .ok_or_else(|| Error::new(ErrorKind::Type, "not an object"))?;
     let setter = access == Access::Put;
-    let base = execution
-        .slots
-        .peek(&frame.window, usize::from(setter))?
-        .clone();
+    let base = runtime
+        .dup_jsvalue(execution.slots.peek(&frame.window, usize::from(setter))?)
+        .map_err(runtime_error_to_vm_error)?;
     let receiver = private_bindings::branded_receiver(runtime, &callable, kind, base)?;
-    if setter {
-        runtime
-            .validate_value_domain(execution.slots.peek(&frame.window, 0)?, "call argument")
-            .map_err(runtime_error_to_vm_error)?;
-    }
     #[cfg(feature = "profiling")]
     let depth = execution.slots.depth(&frame.window);
     let frame = execution.frames.current_mut(id)?;
@@ -297,6 +321,10 @@ fn enter_accessor(
     let base = execution.slots.pop(&mut frame.window)?;
     if access == Access::GetKeep {
         execution.slots.push(&mut frame.window, base)?;
+    } else {
+        runtime
+            .release_jsvalue(base)
+            .map_err(runtime_error_to_vm_error)?;
     }
     frame.resume_pc = frame
         .fault_pc
@@ -309,7 +337,7 @@ fn enter_accessor(
         execution,
         id,
         callable,
-        Value::Object(receiver),
+        JsValue::Object(receiver.into_handle()),
         arguments,
         if setter {
             ReturnValue::Discard

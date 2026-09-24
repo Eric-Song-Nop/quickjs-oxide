@@ -1,3 +1,4 @@
+use crate::engine::atom::AtomIdx;
 use crate::engine::heap::{AutoInitProperty, PropertySlot};
 use crate::engine::object::shape::PropertyFlags;
 
@@ -24,11 +25,21 @@ fn string_create_html_family_is_ordered_autoinit_and_has_distinct_stable_functio
         let state = runtime.0.state.borrow();
         let object = state.heap.object(prototype.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_indices = keys
-            .each_ref()
-            .map(|(_, _, _, key)| usize::try_from(shape.find(key.atom()).unwrap()).unwrap());
-        let iterator_slot = usize::try_from(shape.find(iterator.atom()).unwrap()).unwrap();
-        let constructor_slot = usize::try_from(shape.find(constructor.atom()).unwrap()).unwrap();
+        let slot_indices = keys.each_ref().map(|(_, _, _, key)| {
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap()
+        });
+        let iterator_slot = usize::try_from(
+            shape
+                .find(AtomIdx::from_raw(iterator.atom().raw()))
+                .unwrap(),
+        )
+        .unwrap();
+        let constructor_slot = usize::try_from(
+            shape
+                .find(AtomIdx::from_raw(constructor.atom().raw()))
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             slot_indices[0],
             iterator_slot + 1,
@@ -309,9 +320,10 @@ fn string_create_html_escapes_only_quotes_and_preserves_raw_utf16_nul_and_ropes(
 fn string_create_html_small_limit_latches_too_long_but_attribute_throw_wins() {
     let runtime = Runtime::new();
     let mut context = runtime.new_context();
-    context
-        .eval(
-            r#"globalThis.createHtmlLimitLog="";
+    drop(
+        context
+            .eval(
+                r#"globalThis.createHtmlLimitLog="";
                 globalThis.createHtmlLimitReceiver=Object();
                 createHtmlLimitReceiver[Symbol.toPrimitive]=function(hint){
                     createHtmlLimitLog+="r:"+hint+",";return "B"
@@ -328,26 +340,29 @@ fn string_create_html_small_limit_latches_too_long_but_attribute_throw_wins() {
                 createHtmlLimitThrow[Symbol.toPrimitive]=function(hint){
                     createHtmlLimitLog+="t:"+hint+",";throw 72
                 };"#,
-        )
-        .unwrap();
+            )
+            .unwrap(),
+    );
     let receiver = context.eval("createHtmlLimitReceiver").unwrap();
     let attribute = context.eval("createHtmlLimitAttribute").unwrap();
     let extra = context.eval("createHtmlLimitExtra").unwrap();
+    let arguments = NativeArguments {
+        actual_arg_count: 2,
+        readable: vec![js(&runtime, attribute), js(&runtime, extra)],
+    };
     let completion = runtime
         .call_string_prototype_create_html_with_limit(
             context.realm,
             StringCreateHtmlKind::Anchor,
             NativeInvocation::Call {
-                this_value: receiver.clone(),
+                this_value: runtime.unroot_value(&receiver).unwrap(),
             },
-            &NativeArguments {
-                actual_arg_count: 2,
-                readable: vec![attribute.clone(), extra],
-            },
+            &arguments,
             16,
         )
         .unwrap();
-    let Completion::Throw(Value::Object(error)) = completion else {
+    release_arguments(&runtime, arguments);
+    let Value::Object(error) = thrown(&runtime, completion) else {
         panic!("one-below-boundary CreateHTML did not throw an Error object");
     };
     for (name, expected) in [("name", "InternalError"), ("message", "string too long")] {
@@ -365,43 +380,49 @@ fn string_create_html_small_limit_latches_too_long_but_attribute_throw_wins() {
         "a latched prefix failure skipped the attribute or read an extra argument",
     );
 
+    let arguments = NativeArguments {
+        actual_arg_count: 1,
+        readable: vec![js(&runtime, Value::String(JsString::from_static("Q")))],
+    };
+    let completion = runtime
+        .call_string_prototype_create_html_with_limit(
+            context.realm,
+            StringCreateHtmlKind::Anchor,
+            NativeInvocation::Call {
+                this_value: js(&runtime, Value::String(JsString::from_static("B"))),
+            },
+            &arguments,
+            17,
+        )
+        .unwrap();
+    release_arguments(&runtime, arguments);
     assert_eq!(
-        runtime
-            .call_string_prototype_create_html_with_limit(
-                context.realm,
-                StringCreateHtmlKind::Anchor,
-                NativeInvocation::Call {
-                    this_value: Value::String(JsString::from_static("B")),
-                },
-                &NativeArguments {
-                    actual_arg_count: 1,
-                    readable: vec![Value::String(JsString::from_static("Q"))],
-                },
-                17,
-            )
-            .unwrap(),
-        Completion::Return(Value::String(JsString::from_static("<a name=\"Q\">B</a>",))),
+        returned(&runtime, completion),
+        Value::String(JsString::from_static("<a name=\"Q\">B</a>",)),
         "the exact CreateHTML output limit was rejected",
     );
 
-    context.eval("createHtmlLimitLog=''").unwrap();
+    drop(context.eval("createHtmlLimitLog=''").unwrap());
     let throwing_attribute = context.eval("createHtmlLimitThrow").unwrap();
+    let arguments = NativeArguments {
+        actual_arg_count: 1,
+        readable: vec![js(&runtime, throwing_attribute)],
+    };
+    let completion = runtime
+        .call_string_prototype_create_html_with_limit(
+            context.realm,
+            StringCreateHtmlKind::Anchor,
+            NativeInvocation::Call {
+                this_value: js(&runtime, receiver),
+            },
+            &arguments,
+            1,
+        )
+        .unwrap();
+    release_arguments(&runtime, arguments);
     assert_eq!(
-        runtime
-            .call_string_prototype_create_html_with_limit(
-                context.realm,
-                StringCreateHtmlKind::Anchor,
-                NativeInvocation::Call {
-                    this_value: receiver,
-                },
-                &NativeArguments {
-                    actual_arg_count: 1,
-                    readable: vec![throwing_attribute],
-                },
-                1,
-            )
-            .unwrap(),
-        Completion::Throw(Value::Int(72)),
+        thrown(&runtime, completion),
+        Value::Int(72),
         "CreateHTML's latched TooLong replaced a later user throw",
     );
     assert_eq!(
@@ -432,9 +453,10 @@ fn string_create_html_reservation_oom_uses_defining_realm_is_latched_and_recover
     };
     assert_ne!(defining_internal_error, caller_internal_error);
 
-    caller
-        .eval(
-            r#"globalThis.createHtmlReservationLog="";
+    drop(
+        caller
+            .eval(
+                r#"globalThis.createHtmlReservationLog="";
                 globalThis.createHtmlReservationReceiver=Object();
                 createHtmlReservationReceiver[Symbol.toPrimitive]=function(hint){
                     createHtmlReservationLog+="r:"+hint+",";return "B"
@@ -447,8 +469,9 @@ fn string_create_html_reservation_oom_uses_defining_realm_is_latched_and_recover
                 createHtmlReservationThrow[Symbol.toPrimitive]=function(hint){
                     createHtmlReservationLog+="t:"+hint+",";throw 73
                 };"#,
-        )
-        .unwrap();
+            )
+            .unwrap(),
+    );
     let receiver = caller.eval("createHtmlReservationReceiver").unwrap();
     let attribute = caller.eval("createHtmlReservationAttribute").unwrap();
 
@@ -487,7 +510,7 @@ fn string_create_html_reservation_oom_uses_defining_realm_is_latched_and_recover
         "runtime did not recover after CreateHTML reservation OOM",
     );
 
-    caller.eval("createHtmlReservationLog=''").unwrap();
+    drop(caller.eval("createHtmlReservationLog=''").unwrap());
     let throwing_attribute = caller.eval("createHtmlReservationThrow").unwrap();
     crate::engine::value::fail_next_create_html_reservation_for_test();
     assert_eq!(

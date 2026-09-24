@@ -17,7 +17,7 @@ use crate::engine::api::context::Context;
 use crate::engine::api::error::{Error, ErrorKind, NativeErrorKind, NativeErrorMessage};
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
-use crate::engine::atom::Atom;
+use crate::engine::atom::AtomIdx;
 
 use crate::engine::builtins::native::{DynamicImportHandlerKind, ModuleEvaluationKind};
 use crate::engine::code::bytecode_publish;
@@ -37,6 +37,7 @@ use crate::engine::compiler::{
     compile_unlinked_module_bytes_with_name_and_attribute_checker,
     compile_unlinked_module_with_name_and_attribute_checker,
 };
+use crate::engine::heap::ownership::ConvertedValue;
 use crate::engine::heap::roots::VarRefRoot;
 use crate::engine::heap::runtime::RuntimeState;
 
@@ -55,7 +56,7 @@ use crate::engine::object::{
     WellKnownSymbol,
 };
 use crate::engine::value::conversion::NativeConversion;
-use crate::engine::value::{JsString, JsStringError, Value};
+use crate::engine::value::{JsString, JsStringError, JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
 use crate::engine::vm::frames::ExplicitBacktraceLocation;
@@ -248,7 +249,6 @@ impl ModuleImportMetaProperty {
         &self.key
     }
 
-    #[must_use]
     pub const fn value(&self) -> &Value {
         &self.value
     }
@@ -459,7 +459,7 @@ struct ModuleEvaluationDfs {
     next_index: usize,
     stack: Vec<ModuleId>,
     entries: HashMap<ModuleId, ModuleDfsEntry>,
-    exception: Option<Value>,
+    exception: Option<JsValue>,
 }
 
 struct ModuleResolveFrame {
@@ -487,9 +487,15 @@ struct ModuleResolvedBinding {
     target: ModuleResolvedBindingTarget,
 }
 
+/// `RawModuleRef` deliberately carries no `PartialEq`; identity is the pair of
+/// plain arena handles, compared here at the module-language boundary.
+fn same_raw_module(left: RawModuleRef, right: RawModuleRef) -> bool {
+    left.cache == right.cache && left.module == right.module
+}
+
 impl ModuleResolvedBinding {
     fn has_same_identity(&self, other: &Self) -> bool {
-        if self.module != other.module {
+        if !same_raw_module(self.module, other.module) {
             return false;
         }
         match (&self.target, &other.target) {
@@ -568,7 +574,7 @@ enum ModuleEvaluationVisit {
     Evaluating,
     EvaluatingAsync,
     Evaluated,
-    Errored(Value),
+    Errored(JsValue),
     Poisoned,
 }
 
@@ -614,12 +620,20 @@ struct ModuleLoaderAttributeChecker<'a> {
     context: Context,
     parsing_module: RawModuleRef,
     runtime_failure: Option<RuntimeError>,
-    thrown: Option<Value>,
+    thrown: Option<JsValue>,
 }
 
 enum ModuleHostCallbackOutcome<T> {
     Completed(Result<T, ModuleLoaderError>),
-    Throw(Value),
+    Throw(JsValue),
+}
+
+impl Drop for ModuleLoaderAttributeChecker<'_> {
+    fn drop(&mut self) {
+        if let Some(value) = self.thrown.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
 }
 
 impl ModuleImportAttributeChecker for ModuleLoaderAttributeChecker<'_> {
@@ -668,7 +682,18 @@ impl ModuleImportAttributeChecker for ModuleLoaderAttributeChecker<'_> {
             ModuleHostCallbackOutcome::Completed(Err(ModuleLoaderError {
                 kind: ModuleLoaderErrorKind::Exception(exception),
             })) => {
-                self.thrown = Some(exception);
+                match self
+                    .runtime
+                    .validate_value_domain(&exception, "module loader exception")
+                    .and_then(|()| self.runtime.into_jsvalue(exception))
+                {
+                    Ok(value) => {
+                        self.thrown = Some(value);
+                    }
+                    Err(error) => {
+                        self.runtime_failure = Some(error);
+                    }
+                }
                 Err(ModuleCompileFailure::Host)
             }
         }
@@ -698,7 +723,7 @@ impl ModuleEvaluationDfs {
 
 enum ModuleCompilation {
     Published(RawModuleRef),
-    Throw(Value),
+    Throw(JsValue),
 }
 
 impl ModuleBytecodeRef {
@@ -729,7 +754,7 @@ impl ModuleBytecodeRef {
 
 impl PartialEq for ModuleBytecodeRef {
     fn eq(&self, other: &Self) -> bool {
-        self.runtime.is_same_runtime(&other.runtime) && self.raw == other.raw
+        self.runtime.is_same_runtime(&other.runtime) && same_raw_module(self.raw, other.raw)
     }
 }
 
@@ -827,11 +852,13 @@ impl Runtime {
     ) -> Result<ModuleHostCallbackOutcome<T>, RuntimeError> {
         let Ok(_guard) = crate::engine::vm::native_stack::ModuleHostCallbackGuard::enter(self)
         else {
-            return Ok(ModuleHostCallbackOutcome::Throw(self.new_native_error(
-                context.realm,
-                NativeErrorKind::Internal,
-                "stack overflow",
-            )?));
+            return Ok(ModuleHostCallbackOutcome::Throw(
+                self.new_native_error_jsvalue(
+                    context.realm,
+                    NativeErrorKind::Internal,
+                    "stack overflow",
+                )?,
+            ));
         };
 
         let boundary =
@@ -849,7 +876,7 @@ impl Runtime {
         match outcome {
             ModuleHostCallbackOutcome::Completed(result) => Ok(result),
             ModuleHostCallbackOutcome::Throw(exception) => {
-                self.set_pending_exception(exception)?;
+                self.set_pending_exception_jsvalue(exception)?;
                 Err(RuntimeError::Exception)
             }
         }
@@ -907,7 +934,7 @@ impl Runtime {
             ModuleHostCallbackOutcome::Completed(Ok(())) => Ok(NativeConversion::Value(())),
             ModuleHostCallbackOutcome::Completed(Err(ModuleLoaderError {
                 kind: ModuleLoaderErrorKind::Message(message),
-            })) => Ok(NativeConversion::Throw(self.new_native_error(
+            })) => Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 &message,
@@ -916,7 +943,7 @@ impl Runtime {
                 kind: ModuleLoaderErrorKind::Exception(exception),
             })) => {
                 self.validate_value_domain(&exception, "module loader exception")?;
-                Ok(NativeConversion::Throw(exception))
+                Ok(NativeConversion::Throw(self.into_jsvalue(exception)?))
             }
         }
     }
@@ -1056,7 +1083,7 @@ impl Runtime {
         })
     }
 
-    fn module_value_atoms(record: &ModuleRecord) -> Vec<Atom> {
+    fn module_value_atoms(record: &ModuleRecord) -> Vec<AtomIdx> {
         let mut atoms = Vec::with_capacity(2);
         if let ModuleRecordBody::Json {
             default_value: RawValue::Symbol(atom) | RawValue::Private(atom),
@@ -1075,7 +1102,7 @@ impl Runtime {
     fn module_value_atom_delta(
         current: &ModuleRecord,
         replacement: &ModuleRecord,
-    ) -> (Vec<Atom>, Vec<Atom>) {
+    ) -> (Vec<AtomIdx>, Vec<AtomIdx>) {
         let mut old = Self::module_value_atoms(current);
         let new = Self::module_value_atoms(replacement);
         let mut added = Vec::with_capacity(new.len());
@@ -1091,11 +1118,11 @@ impl Runtime {
 
     fn retain_module_atoms(
         state: &mut RuntimeState,
-        atoms: Vec<Atom>,
-    ) -> Result<Vec<Atom>, RuntimeError> {
+        atoms: Vec<AtomIdx>,
+    ) -> Result<Vec<AtomIdx>, RuntimeError> {
         for (retained, &atom) in atoms.iter().enumerate() {
-            if let Err(error) = state.atoms.retain(atom) {
-                state.release_atoms(atoms[..retained].iter().copied())?;
+            if let Err(error) = state.atoms.retain_index(atom) {
+                state.release_atom_indices(atoms[..retained].iter().copied())?;
                 return Err(error.into());
             }
         }
@@ -1114,7 +1141,7 @@ impl Runtime {
             Ok(module) => Ok(module),
             Err(error) => {
                 state
-                    .release_atoms(retained_atoms)
+                    .release_atom_indices(retained_atoms)
                     .expect("loaded-module atom rollback failed after rejected publication");
                 Err(error.into())
             }
@@ -1129,7 +1156,11 @@ impl Runtime {
         let mut state = self.0.state.borrow_mut();
         let current = state.heap.loaded_module(module)?;
         let (added_atoms, removed_atoms) = Self::module_value_atom_delta(&current, &replacement);
-        state.preflight_atom_releases(&removed_atoms)?;
+        let mut removed_branded = Vec::with_capacity(removed_atoms.len());
+        for &index in &removed_atoms {
+            removed_branded.push(state.atoms.brand(index)?);
+        }
+        state.preflight_atom_releases(&removed_branded)?;
         let retained_atoms = Self::retain_module_atoms(&mut state, added_atoms)?;
         match state.heap.replace_loaded_module(module, replacement) {
             Ok(cleanup) => {
@@ -1139,7 +1170,7 @@ impl Runtime {
             }
             Err(error) => {
                 state
-                    .release_atoms(retained_atoms)
+                    .release_atom_indices(retained_atoms)
                     .expect("loaded-module atom rollback failed after rejected replacement");
                 Err(error.into())
             }
@@ -1235,7 +1266,11 @@ impl Runtime {
             .iter()
             .flat_map(Self::module_value_atoms)
             .collect::<Vec<_>>();
-        state.preflight_atom_releases(&removed_atoms)?;
+        let mut removed_branded = Vec::with_capacity(removed_atoms.len());
+        for &index in &removed_atoms {
+            removed_branded.push(state.atoms.brand(index)?);
+        }
+        state.preflight_atom_releases(&removed_branded)?;
         let cleanup = state.heap.unpublish_loaded_modules(cache, &doomed)?;
         debug_assert!(cleanup.atoms.starts_with(&removed_atoms));
         state.apply_committed_cleanup(cleanup);
@@ -1294,7 +1329,9 @@ impl Runtime {
             )
         }));
         match outcome {
-            Ok(Ok(ModuleCompilation::Published(module))) if module == parsing_module => {
+            Ok(Ok(ModuleCompilation::Published(module)))
+                if same_raw_module(module, parsing_module) =>
+            {
                 Ok(ModuleCompilation::Published(module))
             }
             Ok(Ok(ModuleCompilation::Published(_))) => {
@@ -1346,7 +1383,6 @@ impl Runtime {
                 let exception = checker.thrown.take().ok_or(RuntimeError::Invariant(
                     "module checker aborted without a thrown value",
                 ))?;
-                self.validate_value_domain(&exception, "module loader exception")?;
                 return Ok(ModuleCompilation::Throw(exception));
             }
             Err(ModuleCompileFailure::Engine(error)) => {
@@ -1374,11 +1410,16 @@ impl Runtime {
                     None
                 };
                 let exception = if error.kind() == ErrorKind::Syntax {
-                    self.new_native_error_without_backtrace_from_error(realm, kind, &error)?
+                    self.new_native_error_without_backtrace_from_error_jsvalue(realm, kind, &error)?
                 } else {
-                    self.new_native_error_from_error(realm, kind, &error)?
+                    self.new_native_error_from_error_jsvalue(realm, kind, &error)?
                 };
-                self.ensure_error_backtrace(&exception, false, explicit_location)?;
+                if let Err(error) =
+                    self.ensure_error_backtrace_jsvalue(&exception, false, explicit_location)
+                {
+                    let _ = self.release_jsvalue(exception);
+                    return Err(error);
+                }
                 return Ok(ModuleCompilation::Throw(exception));
             }
         };
@@ -1584,7 +1625,7 @@ impl Runtime {
                     let popped = stack.pop().ok_or(RuntimeError::Invariant(
                         "module resolution stack unexpectedly became empty",
                     ))?;
-                    if popped.module != completed {
+                    if !same_raw_module(popped.module, completed) {
                         return Err(RuntimeError::Invariant(
                             "module resolution stack changed during record publication",
                         ));
@@ -1689,7 +1730,7 @@ impl Runtime {
                     match compilation {
                         ModuleCompilation::Published(dependency) => dependency,
                         ModuleCompilation::Throw(exception) => {
-                            self.set_pending_exception(exception)?;
+                            self.set_pending_exception_jsvalue(exception)?;
                             return Err(RuntimeError::Exception);
                         }
                     }
@@ -1742,8 +1783,8 @@ impl Runtime {
                 let kind = NativeErrorKind::from_javascript_error(error.kind()).ok_or(
                     RuntimeError::Invariant("module loader error lost native kind"),
                 )?;
-                let exception = self.new_native_error_from_error(realm, kind, &error)?;
-                self.set_pending_exception(exception)?;
+                let exception = self.new_native_error_from_error_jsvalue(realm, kind, &error)?;
+                self.set_pending_exception_jsvalue(exception)?;
                 Err(RuntimeError::Exception)
             }
             result => result,
@@ -1829,7 +1870,7 @@ impl Runtime {
                 match compilation {
                     ModuleCompilation::Published(module) => module,
                     ModuleCompilation::Throw(exception) => {
-                        self.set_pending_exception(exception)?;
+                        self.set_pending_exception_jsvalue(exception)?;
                         return Err(RuntimeError::Exception);
                     }
                 }
@@ -1844,8 +1885,8 @@ impl Runtime {
                 let kind = NativeErrorKind::from_javascript_error(error.kind()).ok_or(
                     RuntimeError::Invariant("dynamic module loader error lost native kind"),
                 )?;
-                let exception = self.new_native_error_from_error(realm, kind, &error)?;
-                self.set_pending_exception(exception)?;
+                let exception = self.new_native_error_from_error_jsvalue(realm, kind, &error)?;
+                self.set_pending_exception_jsvalue(exception)?;
                 Err(RuntimeError::Exception)
             }
             result => result,
@@ -1979,14 +2020,13 @@ impl Runtime {
         &self,
         realm: ContextId,
         name: JsString,
-        default_value: Value,
+        default_value: crate::engine::value::JsValue,
     ) -> Result<RawModuleRef, RuntimeError> {
-        self.validate_value_domain(&default_value, "JSON module value")?;
-        let raw_default_value = self.raw_property_value(&default_value)?;
+        // The parser owns the input until publication retains the record edge.
         let record = ModuleRecord {
             name,
             body: ModuleRecordBody::Json {
-                default_value: raw_default_value,
+                default_value: default_value.as_raw(),
             },
             import_meta: None,
             has_top_level_await: false,
@@ -2016,9 +2056,9 @@ impl Runtime {
             link_realm: None,
             compile_realm: realm,
         };
-        let published = self.publish_module_record(realm, record)?;
-        drop(default_value);
-        Ok(published)
+        let published = self.publish_module_record(realm, record);
+        self.release_jsvalue(default_value)?;
+        published
     }
 
     fn raw_module_dependencies(
@@ -2241,7 +2281,7 @@ impl Runtime {
                     }
                     let meta = self.get_or_create_module_import_meta(module)?;
                     Some(self.new_var_ref(
-                        Value::Object(meta),
+                        JsValue::Object(meta.into_handle()),
                         true,
                         true,
                         ClosureVariableKind::Normal,
@@ -2277,7 +2317,7 @@ impl Runtime {
             // is `undefined`; the module initializer writes the JSON value at
             // evaluation time.
             slots.push(Some(self.new_var_ref(
-                Value::Undefined,
+                JsValue::Undefined,
                 false,
                 false,
                 ClosureVariableKind::Normal,
@@ -2626,7 +2666,7 @@ impl Runtime {
     ) -> Result<ObjectRef, RuntimeError> {
         match self.module_record(module)?.namespace {
             ModuleNamespaceState::Building(object) => {
-                if !created.contains(&module) {
+                if !created.iter().any(|entry| same_raw_module(*entry, module)) {
                     return Err(RuntimeError::Invariant(
                         "module namespace cache retained a stale Building record",
                     ));
@@ -2672,12 +2712,22 @@ impl Runtime {
         }
 
         let tag = PropertyKey::from(self.well_known_symbol(WellKnownSymbol::ToStringTag));
-        self.store_property_slot(
+        // A genuine value-producing boundary: mint the string node outside the
+        // store borrow, then hand its producer edge to the transactional store.
+        let tag_string = {
+            let mut state = self.0.state.borrow_mut();
+            state
+                .heap
+                .allocate_string(JsString::from_static("Module"))?
+        };
+        let converted_tag = ConvertedValue::new(self, RawValue::String(tag_string));
+        let stored = self.store_property_slot(
             &namespace,
             &tag,
             PropertyFlags::data(false, false, false),
-            PropertySlot::Data(RawValue::String(JsString::from_static("Module"))),
-        )?;
+            PropertySlot::Data(converted_tag.raw()),
+        );
+        stored?;
         self.transition_module_record(
             module,
             RawModuleTransition::FinishNamespace(namespace.object_id()),
@@ -2750,7 +2800,7 @@ impl Runtime {
                     let namespace =
                         self.build_module_namespace(target, realm, namespace_transaction)?;
                     return self.new_var_ref(
-                        Value::Object(namespace),
+                        JsValue::Object(namespace.into_handle()),
                         true,
                         true,
                         ClosureVariableKind::Normal,
@@ -2841,7 +2891,7 @@ impl Runtime {
                                         namespace_transaction,
                                     )?;
                                     return self.new_var_ref(
-                                        Value::Object(namespace),
+                                        JsValue::Object(namespace.into_handle()),
                                         true,
                                         true,
                                         ClosureVariableKind::Normal,
@@ -3004,7 +3054,7 @@ impl Runtime {
                             "namespace import has no preallocated declaration cell",
                         ))?;
                     let slot = VarRefRoot::from_borrowed_handle(self.clone(), slot)?;
-                    self.write_var_ref(&slot, Value::Object(namespace))?;
+                    self.write_var_ref(&slot, self.into_jsvalue(Value::Object(namespace))?)?;
                     continue;
                 }
                 ModuleImportName::Name(import_name) => {
@@ -3107,7 +3157,10 @@ impl Runtime {
         module: RawModuleRef,
         dfs: &mut ModuleLinkDfs,
     ) -> Result<ModuleDfsFrame, RuntimeError> {
-        if self.module_record(module)?.link_status != ModuleLinkStatus::Unlinked {
+        if !matches!(
+            self.module_record(module)?.link_status,
+            ModuleLinkStatus::Unlinked
+        ) {
             return Err(RuntimeError::Invariant(
                 "link DFS entered a module which was not unlinked",
             ));
@@ -3157,14 +3210,17 @@ impl Runtime {
             )
             .map_err(RuntimeError::Engine)?;
             match completion {
-                Completion::Return(Value::Undefined) => Ok(()),
+                Completion::Return(JsValue::Undefined) => Ok(()),
                 Completion::Throw(value) => {
-                    self.set_pending_exception(value)?;
+                    self.set_pending_exception_jsvalue(value)?;
                     Err(RuntimeError::Exception)
                 }
-                _ => Err(RuntimeError::Invariant(
-                    "module link entry returned a non-undefined value",
-                )),
+                Completion::Return(value) => {
+                    self.release_jsvalue(value)?;
+                    Err(RuntimeError::Invariant(
+                        "module link entry returned a non-undefined value",
+                    ))
+                }
             }
         }
     }
@@ -3362,18 +3418,30 @@ impl Runtime {
         &self,
         realm: ContextId,
         target: ObjectId,
-        value: Value,
+        value: JsValue,
     ) -> Result<Completion, RuntimeError> {
-        let target = self.dynamic_import_settler(target)?;
+        let target = match self.dynamic_import_settler(target) {
+            Ok(target) => target,
+            Err(error) => {
+                let _ = self.release_jsvalue(value);
+                return Err(error);
+            }
+        };
 
         let completion =
-            crate::engine::vm::entry::call(self, realm, &target, Value::Undefined, &[value])?;
+            self.call_internal_jsvalue(realm, &target, JsValue::Undefined, vec![value])?;
 
         match completion {
-            Completion::Return(_) => Ok(Completion::Return(Value::Undefined)),
-            Completion::Throw(_) => Err(RuntimeError::Invariant(
-                "intrinsic dynamic import resolving function threw",
-            )),
+            Completion::Return(value) => {
+                self.release_jsvalue(value)?;
+                Ok(Completion::Return(JsValue::Undefined))
+            }
+            Completion::Throw(value) => {
+                self.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant(
+                    "intrinsic dynamic import resolving function threw",
+                ))
+            }
         }
     }
 
@@ -3381,10 +3449,10 @@ impl Runtime {
         &self,
         realm: ContextId,
         error: RuntimeError,
-    ) -> Result<Value, RuntimeError> {
+    ) -> Result<JsValue, RuntimeError> {
         match error {
             RuntimeError::Exception => {
-                self.take_pending_exception()?
+                self.take_pending_exception_jsvalue()?
                     .ok_or(RuntimeError::Invariant(
                         "dynamic import failure had no pending exception",
                     ))
@@ -3393,14 +3461,14 @@ impl Runtime {
                 let Some(kind) = NativeErrorKind::from_javascript_error(error.kind()) else {
                     return Err(RuntimeError::Engine(error));
                 };
-                self.new_native_error_from_error(realm, kind, &error)
+                self.new_native_error_from_error_jsvalue(realm, kind, &error)
             }
-            RuntimeError::AbortedModule => self.new_native_error(
+            RuntimeError::AbortedModule => self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Internal,
                 "module construction or resolution was rolled back",
             ),
-            RuntimeError::IncompleteModuleResolution => self.new_native_error(
+            RuntimeError::IncompleteModuleResolution => self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Internal,
                 "module resolution is incomplete and cannot be linked safely",
@@ -3446,7 +3514,7 @@ impl Runtime {
         attributes: &ModuleImportAttributes,
     ) -> Result<Completion, RuntimeError> {
         let Some(base_name) = base_name else {
-            let reason = self.new_native_error(
+            let reason = self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "no function filename for import()",
@@ -3472,15 +3540,15 @@ impl Runtime {
             resolve,
             reject,
         )? {
-            NativeConversion::Value(()) => Ok(Completion::Return(Value::Undefined)),
+            NativeConversion::Value(()) => Ok(Completion::Return(JsValue::Undefined)),
             NativeConversion::Throw(value) => {
                 // `JS_LoadModuleInternal` frees the abrupt `js_promise_then`
                 // result and the surrounding load job still returns
                 // undefined. The runtime's current exception remains set,
                 // while the caller-facing import Promise deliberately stays
                 // pending in this edge case.
-                self.set_pending_exception(value)?;
-                Ok(Completion::Return(Value::Undefined))
+                self.set_pending_exception_jsvalue(value)?;
+                Ok(Completion::Return(JsValue::Undefined))
             }
         }
     }
@@ -3490,22 +3558,18 @@ impl Runtime {
         cache: ContextId,
         cycle_root: ModuleId,
         active: &[ModuleId],
-        exception: &Value,
+        exception: &JsValue,
     ) -> Result<(), RuntimeError> {
-        self.validate_value_domain(exception, "module evaluation exception")?;
-        let raw = self.raw_property_value(exception)?;
+        let raw = exception.as_raw();
         let mut evaluating = Vec::with_capacity(active.len());
         for &id in active {
-            if matches!(
-                self.module_record(RawModuleRef { cache, module: id })?
-                    .evaluation,
-                ModuleEvaluationState::Evaluating
-            ) {
+            let record = self.module_record(RawModuleRef { cache, module: id })?;
+            if matches!(record.evaluation, ModuleEvaluationState::Evaluating) {
                 evaluating.push(id);
             }
         }
         let mut state = self.0.state.borrow_mut();
-        state.retain_raw_root(&raw)?;
+        state.retain_raw_root(raw.clone())?;
         let retained_atoms = match &raw {
             RawValue::Symbol(atom) => {
                 let count = evaluating.len();
@@ -3526,7 +3590,7 @@ impl Runtime {
                 .publish_loaded_module_errors(cache, &evaluating, cycle_root, raw.clone())
         {
             state
-                .release_atoms(retained_atoms)
+                .release_atom_indices(retained_atoms)
                 .expect("module evaluation error atom rollback failed");
             state.release_owned_raw_root_committed(raw);
             return Err(error.into());
@@ -3537,6 +3601,7 @@ impl Runtime {
         if let Some(previous) = previous {
             state.release_owned_raw_root_committed(previous);
         }
+        drop(state);
         Ok(())
     }
 
@@ -3652,7 +3717,7 @@ impl Context {
         match compilation {
             ModuleCompilation::Published(module) => self.runtime.root_module(module),
             ModuleCompilation::Throw(exception) => {
-                self.runtime.set_pending_exception(exception)?;
+                self.runtime.set_pending_exception_jsvalue(exception)?;
                 Err(RuntimeError::Exception)
             }
         }

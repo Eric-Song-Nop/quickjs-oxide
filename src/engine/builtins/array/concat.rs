@@ -3,10 +3,10 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
     object::{
-        DescriptorField, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, WellKnownSymbol,
+        DescriptorField, ObjectRef, OwnedPropertyDescriptor, PropertyKey, WellKnownSymbol,
         operations::{InternalDefineResult, InternalSetResult},
     },
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
@@ -45,16 +45,33 @@ impl std::ops::DerefMut for ConcatResume {
 }
 const _: () = assert!(std::mem::size_of::<ConcatResume>() <= 8);
 pub(crate) struct ConcatResumeState {
+    runtime: Runtime,
     pending_effect: ConcatStepPending,
     scheduler_set_key: Option<PropertyKey>,
     realm: ContextId,
     phase: Phase,
     result: Option<ObjectRef>,
-    elements: std::vec::IntoIter<Value>,
-    element: Value,
+    elements: std::vec::IntoIter<JsValue>,
+    element: JsValue,
     next_index: u64,
     index: u64,
     length: u64,
+}
+impl Drop for ConcatResumeState {
+    fn drop(&mut self) {
+        for value in self.elements.by_ref() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        let _ = self
+            .runtime
+            .release_jsvalue(std::mem::replace(&mut self.element, JsValue::Undefined));
+        if let Some(value) = self.pending_effect.number_value.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.pending_effect.set_value.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
 }
 impl ConcatStep {
     pub(crate) fn start(
@@ -68,34 +85,44 @@ impl ConcatStep {
                 "Array concat requires generic invocation",
             ));
         };
-        let source = match runtime.native_to_object(realm, this_value.clone())? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
-        };
+        let source =
+            match runtime.native_to_object_jsvalue(realm, runtime.dup_jsvalue(this_value)?)? {
+                NativeConversion::Value(value) => value,
+                NativeConversion::Throw(value) => {
+                    return Ok(Self::Complete(Completion::Throw(value)));
+                }
+            };
+        let mut resume = ConcatResume(Box::new(ConcatResumeState {
+            runtime: runtime.clone(),
+            pending_effect: ConcatStepPending::default(),
+            scheduler_set_key: None,
+            realm,
+            phase: Phase::Species,
+            result: None,
+            elements: Vec::new().into_iter(),
+            element: JsValue::Undefined,
+            next_index: 0,
+            index: 0,
+            length: 0,
+        }));
         let mut elements = Vec::with_capacity(arguments.actual_arg_count + 1);
-        elements.push(Value::Object(source.clone()));
-        elements.extend(
-            arguments.readable[..arguments.actual_arg_count]
-                .iter()
-                .cloned(),
-        );
-        Ok(Self::request_species(
-            source,
-            ConcatResume(Box::new(ConcatResumeState {
-                pending_effect: ConcatStepPending::default(),
-                scheduler_set_key: None,
-                realm,
-                phase: Phase::Species,
-                result: None,
-                elements: elements.into_iter(),
-                element: Value::Undefined,
-                next_index: 0,
-                index: 0,
-                length: 0,
-            })),
-        ))
+        elements.push(JsValue::Object(source.clone().into_handle()));
+        for value in &arguments.readable[..arguments.actual_arg_count] {
+            match runtime.dup_jsvalue(value) {
+                Ok(value) => elements.push(value),
+                Err(error) => {
+                    for value in elements {
+                        let _ = runtime.release_jsvalue(value);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        resume.0.elements = elements.into_iter();
+        Ok(Self::request_species(source, resume))
     }
 }
+
 impl ConcatResume {
     pub(crate) fn with_scheduler_set_key(mut self, key: PropertyKey) -> Self {
         self.0.scheduler_set_key = Some(key);
@@ -107,7 +134,9 @@ impl ConcatResume {
 
     fn object(&self) -> Result<ObjectRef, RuntimeError> {
         match &self.0.element {
-            Value::Object(object) => Ok(object.clone()),
+            JsValue::Object(id) => {
+                ObjectRef::from_borrowed_handle(self.0.runtime.clone(), *id).map_err(Into::into)
+            }
             _ => Err(RuntimeError::Invariant(
                 "Array concat spread source missing",
             )),
@@ -121,7 +150,11 @@ impl ConcatResume {
     }
     fn too_long(&self, runtime: &Runtime) -> Result<ConcatStep, RuntimeError> {
         Ok(ConcatStep::Complete(Completion::Throw(
-            runtime.new_native_error(self.0.realm, NativeErrorKind::Type, "Array loo long")?,
+            runtime.new_native_error_jsvalue(
+                self.0.realm,
+                NativeErrorKind::Type,
+                "Array loo long",
+            )?,
         )))
     }
     pub(crate) fn resume(
@@ -135,24 +168,28 @@ impl ConcatResume {
         };
         match self.0.phase {
             Phase::Species => {
-                let Value::Object(object) = value else {
+                let JsValue::Object(id) = value else {
+                    runtime.release_jsvalue(value)?;
                     return Err(RuntimeError::Invariant(
                         "ArraySpeciesCreate returned a primitive",
                     ));
                 };
-                self.0.result = Some(object);
+                self.0.result = Some(ObjectRef::from_owned_handle(runtime.clone(), id));
                 self.next(runtime)
             }
             Phase::Spread => {
-                let spread = if matches!(value, Value::Undefined) {
-                    match runtime.internal_is_array(self.0.realm, &self.0.element)? {
+                let spread = if matches!(value, JsValue::Undefined) {
+                    runtime.release_jsvalue(value)?;
+                    match runtime.internal_is_array_jsvalue(self.0.realm, &self.0.element)? {
                         NativeConversion::Value(value) => value,
                         NativeConversion::Throw(value) => {
                             return Ok(ConcatStep::Complete(Completion::Throw(value)));
                         }
                     }
                 } else {
-                    runtime.value_to_boolean(&value)?
+                    let spread = runtime.value_to_boolean_jsvalue(&value);
+                    runtime.release_jsvalue(value)?;
+                    spread?
                 };
                 if spread {
                     self.0.phase = Phase::Length;
@@ -171,7 +208,10 @@ impl ConcatResume {
                 Ok(ConcatStep::request_number(value, self))
             }
             Phase::Read => self.define(runtime, value, true),
-            _ => Err(RuntimeError::Invariant("Array concat value phase mismatch")),
+            _ => {
+                runtime.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant("Array concat value phase mismatch"))
+            }
         }
     }
     fn next(mut self, runtime: &Runtime) -> Result<ConcatStep, RuntimeError> {
@@ -180,14 +220,15 @@ impl ConcatResume {
             return Ok(ConcatStep::request_set(
                 self.result()?,
                 runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Length)?,
-                Value::number(self.0.next_index as f64),
+                crate::engine::value::number::operations::Number::compact(self.0.next_index as f64)
+                    .into(),
                 self,
             ));
         };
-        self.0.element = element;
+        runtime.release_jsvalue(std::mem::replace(&mut self.0.element, element))?;
         self.0.index = 0;
-        if let Value::Object(object) = &self.0.element {
-            let object = object.clone();
+        if let JsValue::Object(id) = &self.0.element {
+            let object = ObjectRef::from_borrowed_handle(runtime.clone(), *id)?;
             self.0.phase = Phase::Spread;
             Ok(ConcatStep::request_read(
                 object,
@@ -202,7 +243,7 @@ impl ConcatResume {
         if self.0.next_index >= (1_u64 << 53) - 1 {
             return self.too_long(runtime);
         }
-        let value = self.0.element.clone();
+        let value = runtime.dup_jsvalue(&self.0.element)?;
         self.define(runtime, value, false)
     }
     pub(crate) fn number(
@@ -211,6 +252,9 @@ impl ConcatResume {
         result: NativeConversion<f64>,
     ) -> Result<ConcatStep, RuntimeError> {
         if !matches!(self.0.phase, Phase::Number) {
+            if let NativeConversion::Throw(value) = result {
+                let _ = runtime.release_jsvalue(value);
+            }
             return Err(RuntimeError::Invariant(
                 "Array concat number phase mismatch",
             ));
@@ -243,6 +287,9 @@ impl ConcatResume {
         result: NativeConversion<bool>,
     ) -> Result<ConcatStep, RuntimeError> {
         if !matches!(self.0.phase, Phase::Has) {
+            if let NativeConversion::Throw(value) = result {
+                let _ = runtime.release_jsvalue(value);
+            }
             return Err(RuntimeError::Invariant(
                 "Array concat boolean phase mismatch",
             ));
@@ -269,20 +316,19 @@ impl ConcatResume {
     fn define(
         mut self,
         runtime: &Runtime,
-        value: Value,
+        value: JsValue,
         indexed: bool,
     ) -> Result<ConcatStep, RuntimeError> {
+        let mut descriptor = OwnedPropertyDescriptor::new(runtime);
+        descriptor.value = DescriptorField::Present(value);
+        descriptor.writable = DescriptorField::Present(true);
+        descriptor.enumerable = DescriptorField::Present(true);
+        descriptor.configurable = DescriptorField::Present(true);
         self.0.phase = Phase::Define(indexed);
         Ok(ConcatStep::request_define(
             self.result()?,
             runtime.property_key_for_index(self.0.next_index)?,
-            OrdinaryPropertyDescriptor {
-                value: DescriptorField::Present(value),
-                writable: DescriptorField::Present(true),
-                enumerable: DescriptorField::Present(true),
-                configurable: DescriptorField::Present(true),
-                ..OrdinaryPropertyDescriptor::new()
-            },
+            descriptor,
             self,
         ))
     }
@@ -292,6 +338,9 @@ impl ConcatResume {
         result: NativeConversion<InternalDefineResult>,
     ) -> Result<ConcatStep, RuntimeError> {
         let Phase::Define(indexed) = self.0.phase else {
+            if let NativeConversion::Throw(value) = result {
+                let _ = runtime.release_jsvalue(value);
+            }
             return Err(RuntimeError::Invariant(
                 "Array concat define phase mismatch",
             ));
@@ -316,13 +365,16 @@ impl ConcatResume {
         result: NativeConversion<InternalSetResult>,
     ) -> Result<ConcatStep, RuntimeError> {
         if !matches!(self.0.phase, Phase::Set) {
+            if let NativeConversion::Throw(value) = result {
+                let _ = runtime.release_jsvalue(value);
+            }
             return Err(RuntimeError::Invariant("Array concat set phase mismatch"));
         }
         if let Some(value) = runtime.finish_set_property_or_throw(self.0.realm, &key, result)? {
             return Ok(ConcatStep::Complete(Completion::Throw(value)));
         }
-        Ok(ConcatStep::Complete(Completion::Return(Value::Object(
-            self.result()?,
+        Ok(ConcatStep::Complete(Completion::Return(JsValue::Object(
+            self.result()?.into_handle(),
         ))))
     }
 }
@@ -355,7 +407,7 @@ pub(crate) fn finish(
             }
             ConcatStep::Number { mut resume } => {
                 let value = resume.take_number_value();
-                resume.number(runtime, runtime.native_to_number(realm, &value)?)?
+                resume.number(runtime, runtime.native_to_number_jsvalue(realm, value)?)?
             }
             ConcatStep::Has { mut resume } => {
                 let object = resume.take_has_object();
@@ -371,7 +423,7 @@ pub(crate) fn finish(
                 let descriptor = resume.take_define_descriptor();
                 resume.defined(
                     runtime,
-                    runtime.internal_define_own_property(realm, &object, &key, &descriptor)?,
+                    runtime.internal_define_owned_property(realm, &object, &key, descriptor)?,
                 )?
             }
             ConcatStep::Set { mut resume } => {
@@ -379,12 +431,12 @@ pub(crate) fn finish(
                 let key = resume.take_set_key();
                 let value = resume.take_set_value();
                 {
-                    let result = runtime.internal_set(
+                    let result = runtime.internal_set_jsvalue(
                         realm,
                         &object,
                         &key,
                         value,
-                        Value::Object(object.clone()),
+                        JsValue::Object(object.clone().into_handle()),
                     )?;
                     resume.set(runtime, key, result)?
                 }
@@ -398,15 +450,15 @@ struct ConcatStepPending {
     species_source: Option<ObjectRef>,
     read_object: Option<ObjectRef>,
     read_key: Option<PropertyKey>,
-    number_value: Option<Value>,
+    number_value: Option<JsValue>,
     has_object: Option<ObjectRef>,
     has_key: Option<PropertyKey>,
     define_object: Option<ObjectRef>,
     define_key: Option<PropertyKey>,
-    define_descriptor: Option<OrdinaryPropertyDescriptor>,
+    define_descriptor: Option<OwnedPropertyDescriptor>,
     set_object: Option<ObjectRef>,
     set_key: Option<PropertyKey>,
-    set_value: Option<Value>,
+    set_value: Option<JsValue>,
 }
 impl ConcatStep {
     pub(crate) fn request_species(source: ObjectRef, mut resume: ConcatResume) -> Self {
@@ -422,7 +474,7 @@ impl ConcatStep {
         resume.0.pending_effect.read_key = Some(key);
         Self::Read { resume }
     }
-    pub(crate) fn request_number(value: Value, mut resume: ConcatResume) -> Self {
+    pub(crate) fn request_number(value: JsValue, mut resume: ConcatResume) -> Self {
         resume.0.pending_effect.number_value = Some(value);
         Self::Number { resume }
     }
@@ -438,7 +490,7 @@ impl ConcatStep {
     pub(crate) fn request_define(
         object: ObjectRef,
         key: PropertyKey,
-        descriptor: OrdinaryPropertyDescriptor,
+        descriptor: OwnedPropertyDescriptor,
         mut resume: ConcatResume,
     ) -> Self {
         resume.0.pending_effect.define_object = Some(object);
@@ -449,7 +501,7 @@ impl ConcatStep {
     pub(crate) fn request_set(
         object: ObjectRef,
         key: PropertyKey,
-        value: Value,
+        value: JsValue,
         mut resume: ConcatResume,
     ) -> Self {
         resume.0.pending_effect.set_object = Some(object);
@@ -480,7 +532,7 @@ impl ConcatResume {
             .take()
             .expect("ConcatStep Read key")
     }
-    pub(crate) fn take_number_value(&mut self) -> Value {
+    pub(crate) fn take_number_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .number_value
@@ -515,7 +567,7 @@ impl ConcatResume {
             .take()
             .expect("ConcatStep Define key")
     }
-    pub(crate) fn take_define_descriptor(&mut self) -> OrdinaryPropertyDescriptor {
+    pub(crate) fn take_define_descriptor(&mut self) -> OwnedPropertyDescriptor {
         self.0
             .pending_effect
             .define_descriptor
@@ -536,7 +588,7 @@ impl ConcatResume {
             .take()
             .expect("ConcatStep Set key")
     }
-    pub(crate) fn take_set_value(&mut self) -> Value {
+    pub(crate) fn take_set_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .set_value

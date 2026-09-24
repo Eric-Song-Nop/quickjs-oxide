@@ -19,7 +19,7 @@ use crate::engine::object::{
     WellKnownSymbol,
 };
 use crate::engine::value::conversion::NativeConversion;
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation, NativeInvokeOutcome};
 
@@ -99,22 +99,26 @@ impl Runtime {
         let values_key =
             self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Values)?;
         let values = match self.get_property_in_realm(realm, &set_prototype, &values_key)? {
-            Completion::Return(value @ Value::Object(_)) => value,
-            Completion::Return(_) => {
+            Completion::Return(JsValue::Object(id)) => {
+                ObjectRef::from_owned_handle(self.clone(), id)
+            }
+            Completion::Return(value) => {
+                self.release_jsvalue(value)?;
                 return Err(RuntimeError::Invariant(
                     "Set.prototype.values was not callable during bootstrap",
                 ));
             }
-            Completion::Throw(_) => {
+            Completion::Throw(value) => {
+                self.release_jsvalue(value)?;
                 return Err(RuntimeError::Invariant(
                     "Set.prototype.values initialization threw during bootstrap",
                 ));
             }
         };
         let keys_key = self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Keys)?;
-        self.define_set_alias(&set_prototype, &keys_key, values.clone())?;
+        self.define_set_alias(&set_prototype, &keys_key, &values)?;
         let iterator_key = PropertyKey::from(self.well_known_symbol(WellKnownSymbol::Iterator));
-        self.define_set_alias(&set_prototype, &iterator_key, values)?;
+        self.define_set_alias(&set_prototype, &iterator_key, &values)?;
         self.define_native_builtin_auto_init(
             &set_prototype,
             realm,
@@ -198,17 +202,17 @@ impl Runtime {
         &self,
         object: &ObjectRef,
         key: &PropertyKey,
-        value: Value,
+        value: &ObjectRef,
     ) -> Result<(), RuntimeError> {
-        if !self.define_own_property(
+        if !self.define_raw_property(
             object,
             key,
-            &OrdinaryPropertyDescriptor {
-                value: DescriptorField::Present(value),
-                writable: DescriptorField::Present(true),
-                enumerable: DescriptorField::Present(false),
-                configurable: DescriptorField::Present(true),
-                ..OrdinaryPropertyDescriptor::new()
+            &crate::engine::object::property::PropertyDescriptor {
+                value: Some(crate::engine::heap::RawValue::Object(value.object_id())),
+                writable: Some(true),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
             },
         )? {
             return Err(RuntimeError::Invariant(
@@ -295,7 +299,9 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        self.call_set_native_borrowed(realm, kind, &invocation, arguments)
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            self.call_set_native_borrowed(realm, kind, invocation, arguments)
+        })
     }
     pub(crate) fn call_set_native_borrowed(
         &self,
@@ -341,7 +347,7 @@ impl Runtime {
                 "Set species did not receive a getter invocation",
             ));
         };
-        Ok(Completion::Return(this_value.clone()))
+        Ok(Completion::Return(self.dup_jsvalue(this_value)?))
     }
 
     fn call_set_constructor(
@@ -363,12 +369,26 @@ impl Runtime {
         )
     }
 
-    fn set_receiver<'a>(
+    fn set_receiver(
         &self,
         realm: ContextId,
-        invocation: &'a NativeInvocation,
+        invocation: &NativeInvocation,
         getter: bool,
-    ) -> Result<NativeConversion<&'a ObjectRef>, RuntimeError> {
+    ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
+        match self.set_receiver_id(realm, invocation, getter)? {
+            NativeConversion::Value(id) => Ok(NativeConversion::Value(
+                ObjectRef::from_borrowed_handle(self.clone(), id)?,
+            )),
+            NativeConversion::Throw(value) => Ok(NativeConversion::Throw(value)),
+        }
+    }
+
+    fn set_receiver_id(
+        &self,
+        realm: ContextId,
+        invocation: &NativeInvocation,
+        getter: bool,
+    ) -> Result<NativeConversion<crate::engine::heap::ObjectId>, RuntimeError> {
         let this_value = match (getter, invocation) {
             (false, NativeInvocation::Call { this_value })
             | (true, NativeInvocation::Getter { this_value }) => this_value,
@@ -378,62 +398,76 @@ impl Runtime {
                 ));
             }
         };
-        let Value::Object(object) = this_value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        let JsValue::Object(id) = this_value else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "Set object expected",
             )?));
         };
-        if !object.belongs_to(self) {
-            return Err(RuntimeError::WrongRuntime("Set receiver"));
-        }
         let is_set = matches!(
-            self.0
-                .state
-                .borrow()
-                .heap
-                .object(object.object_id())?
-                .payload,
+            self.0.state.borrow().heap.object(*id)?.payload,
             ObjectPayload::Set { .. }
         );
         if !is_set {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "Set object expected",
             )?));
         }
-        Ok(NativeConversion::Value(object))
+        Ok(NativeConversion::Value(*id))
     }
 
-    fn normalized_set_key(value: Value) -> Value {
+    fn normalized_set_key(value: JsValue) -> JsValue {
         match value {
-            Value::Float(0.0) => Value::Int(0),
+            JsValue::Float(0.0) => JsValue::Int(0),
             value => value,
         }
     }
 
-    fn find_set_record(&self, set: &ObjectRef, key: &Value) -> Result<Option<usize>, RuntimeError> {
-        let raw_key = self.raw_property_value(key)?;
-        Ok(self
-            .0
-            .state
-            .borrow()
-            .heap
-            .set_find_record(set.object_id(), &raw_key)?)
+    fn find_set_record(
+        &self,
+        set: &ObjectRef,
+        key: &JsValue,
+    ) -> Result<Option<usize>, RuntimeError> {
+        self.find_set_record_id(set.object_id(), key)
+    }
+    fn find_set_record_id(
+        &self,
+        set: crate::engine::heap::ObjectId,
+        key: &JsValue,
+    ) -> Result<Option<usize>, RuntimeError> {
+        let raw_key = match key {
+            JsValue::Float(0.0) => crate::engine::heap::RawValue::Int(0),
+            _ => key.as_raw(),
+        };
+        Ok(self.0.state.borrow().heap.set_find_record(set, &raw_key)?)
     }
 
-    fn insert_set_record(&self, set: &ObjectRef, key: Value) -> Result<bool, RuntimeError> {
-        self.validate_value_domain(&key, "Set value")?;
-        let key = Self::normalized_set_key(key);
-        if self.find_set_record(set, &key)?.is_some() {
+    fn insert_set_record(&self, set: &ObjectRef, key: JsValue) -> Result<bool, RuntimeError> {
+        let result = self.insert_set_record_borrowed(set.object_id(), &key);
+        let released = self.release_jsvalue(key);
+        let result = result?;
+        released?;
+        Ok(result)
+    }
+    // The native invocation/argv keeps receiver and key alive until commit.
+    pub(in crate::engine::builtins) fn insert_set_record_borrowed(
+        &self,
+        set: crate::engine::heap::ObjectId,
+        key: &JsValue,
+    ) -> Result<bool, RuntimeError> {
+        let raw_key = match key {
+            JsValue::Float(0.0) => crate::engine::heap::RawValue::Int(0),
+            _ => key.as_raw(),
+        };
+        let mut state = self.0.state.borrow_mut();
+        if state.heap.set_find_record(set, &raw_key)?.is_some() {
             return Ok(false);
         }
-        let raw_key = self.raw_property_value(&key)?;
-        let mut state = self.0.state.borrow_mut();
         let retained = state.retain_raw_value_atoms([&raw_key])?;
-        let cleanup = match state.heap.set_insert_record(set.object_id(), raw_key) {
+        let cleanup = match state.heap.set_insert_record(set, raw_key) {
             Ok(cleanup) => cleanup,
             Err(error) => {
                 state.release_atoms(retained)?;
@@ -441,18 +475,29 @@ impl Runtime {
             }
         };
         state.apply_cleanup(cleanup)?;
-        drop(state);
-        drop(key);
         Ok(true)
     }
-
-    fn delete_set_record(&self, set: &ObjectRef, key: &Value) -> Result<bool, RuntimeError> {
-        let key = Self::normalized_set_key(key.clone());
-        let Some(index) = self.find_set_record(set, &key)? else {
-            return Ok(false);
+    fn delete_set_record(&self, set: &ObjectRef, key: JsValue) -> Result<bool, RuntimeError> {
+        let result = self.delete_set_record_borrowed(set.object_id(), &key);
+        let released = self.release_jsvalue(key);
+        let result = result?;
+        released?;
+        Ok(result)
+    }
+    pub(in crate::engine::builtins) fn delete_set_record_borrowed(
+        &self,
+        set: crate::engine::heap::ObjectId,
+        key: &JsValue,
+    ) -> Result<bool, RuntimeError> {
+        let raw_key = match key {
+            JsValue::Float(0.0) => crate::engine::heap::RawValue::Int(0),
+            _ => key.as_raw(),
         };
         let mut state = self.0.state.borrow_mut();
-        let cleanup = state.heap.set_delete_record(set.object_id(), index)?;
+        let Some(index) = state.heap.set_find_record(set, &raw_key)? else {
+            return Ok(false);
+        };
+        let cleanup = state.heap.set_delete_record(set, index)?;
         state.apply_cleanup(cleanup)?;
         Ok(true)
     }
@@ -465,13 +510,22 @@ impl Runtime {
         &self,
         set: &ObjectRef,
         index: &mut usize,
-    ) -> Result<Option<(usize, Value)>, RuntimeError> {
+    ) -> Result<Option<(usize, JsValue)>, RuntimeError> {
+        self.next_live_set_record_id(set.object_id(), index)
+    }
+
+    // The caller's resident owner keeps `set` alive across this borrowed read.
+    pub(in crate::engine::builtins) fn next_live_set_record_id(
+        &self,
+        set: crate::engine::heap::ObjectId,
+        index: &mut usize,
+    ) -> Result<Option<(usize, JsValue)>, RuntimeError> {
         let record = self
             .0
             .state
             .borrow()
             .heap
-            .set_records(set.object_id())?
+            .set_records(set)?
             .next_at_or_after(*index)
             .map(|(id, record)| (id, record.key.clone()));
         let Some((record_index, key)) = record else {
@@ -480,14 +534,17 @@ impl Runtime {
         *index = record_index
             .checked_add(1)
             .ok_or(RuntimeError::Invariant("Set record index overflowed"))?;
-        Ok(Some((record_index, self.root_raw_value(&key)?)))
+        Ok(Some((
+            record_index,
+            self.retain_collection_stored_value(key)?,
+        )))
     }
 
     fn next_live_set_value(
         &self,
         set: &ObjectRef,
         index: &mut usize,
-    ) -> Result<Option<Value>, RuntimeError> {
+    ) -> Result<Option<JsValue>, RuntimeError> {
         Ok(self
             .next_live_set_record(set, index)?
             .map(|(_, value)| value))
@@ -499,19 +556,22 @@ impl Runtime {
         invocation: &NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let set = match self.set_receiver(realm, invocation, false)? {
+        let set = match self.set_receiver_id(realm, invocation, false)? {
             NativeConversion::Value(set) => set,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        let value = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "Set.prototype.add value argv was not padded",
-            ))?;
-        self.insert_set_record(set, value)?;
-        Ok(Completion::Return(Value::Object(set.clone())))
+        let value = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "Set.prototype.add value argv was not padded",
+        ))?;
+        self.insert_set_record_borrowed(set, value)?;
+        // Return the receiver without routing the already-validated object id
+        // through the generic `dup_jsvalue` value round trip. The receiver argv
+        // edge keeps the set live for the whole call, so the trusted retain
+        // skips the redundant slot identity revalidation.
+        self.retain_live_object_handle(set)?;
+        Ok(Completion::Return(JsValue::Object(set)))
     }
 
     fn call_set_has(
@@ -520,16 +580,17 @@ impl Runtime {
         invocation: &NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let set = match self.set_receiver(realm, invocation, false)? {
+        let set = match self.set_receiver_id(realm, invocation, false)? {
             NativeConversion::Value(set) => set,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        let value = Self::normalized_set_key(arguments.readable.first().cloned().ok_or(
-            RuntimeError::Invariant("Set.prototype.has value argv was not padded"),
-        )?);
-        Ok(Completion::Return(Value::Bool(
-            self.find_set_record(set, &value)?.is_some(),
-        )))
+        let value = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "Set.prototype.has value argv was not padded",
+        ))?;
+        let has = self.find_set_record_id(set, value)?.is_some();
+        Ok(Completion::Return(JsValue::Bool(has)))
     }
 
     fn call_set_delete(
@@ -538,19 +599,17 @@ impl Runtime {
         invocation: &NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let set = match self.set_receiver(realm, invocation, false)? {
+        let set = match self.set_receiver_id(realm, invocation, false)? {
             NativeConversion::Value(set) => set,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        let value = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "Set.prototype.delete value argv was not padded",
-            ))?;
-        Ok(Completion::Return(Value::Bool(
-            self.delete_set_record(set, &value)?,
+        let value = arguments.readable.first().ok_or(RuntimeError::Invariant(
+            "Set.prototype.delete value argv was not padded",
+        ))?;
+        Ok(Completion::Return(JsValue::Bool(
+            self.delete_set_record_borrowed(set, value)?,
         )))
     }
 
@@ -559,14 +618,17 @@ impl Runtime {
         realm: ContextId,
         invocation: &NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        let set = match self.set_receiver(realm, invocation, false)? {
+        let set = match self.set_receiver_id(realm, invocation, false)? {
             NativeConversion::Value(set) => set,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
+
         let mut state = self.0.state.borrow_mut();
-        let cleanup = state.heap.set_clear(set.object_id())?;
+        let cleanup = state.heap.set_clear(set)?;
         state.apply_cleanup(cleanup)?;
-        Ok(Completion::Return(Value::Undefined))
+        Ok(Completion::Return(JsValue::Undefined))
     }
 
     fn call_set_size(
@@ -574,12 +636,15 @@ impl Runtime {
         realm: ContextId,
         invocation: &NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        let set = match self.set_receiver(realm, invocation, true)? {
+        let set = match self.set_receiver_id(realm, invocation, true)? {
             NativeConversion::Value(set) => set,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        Ok(Completion::Return(Value::number(
-            self.set_size_value(set)? as f64
+
+        Ok(Completion::Return(JsValue::Int(
+            self.0.state.borrow().heap.set_size(set)? as i32,
         )))
     }
 
@@ -633,11 +698,13 @@ impl Runtime {
     ) -> Result<Completion, RuntimeError> {
         let set = match self.set_receiver(realm, invocation, false)? {
             NativeConversion::Value(set) => set,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        Ok(Completion::Return(Value::Object(
-            self.new_set_iterator(realm, set, kind)?,
-        )))
+        Ok(Completion::Return(self.into_jsvalue(Value::Object(
+            self.new_set_iterator(realm, &set, kind)?,
+        ))?))
     }
 
     pub(crate) fn call_set_iterator_next(
@@ -647,9 +714,11 @@ impl Runtime {
     ) -> Result<Completion, RuntimeError> {
         match self.call_set_iterator_next_raw(realm, invocation)? {
             NativeInvokeOutcome::Completion(completion) => Ok(completion),
-            NativeInvokeOutcome::IteratorNextRaw { value, done } => Ok(Completion::Return(
-                Value::Object(self.new_iterator_result(realm, value, done)?),
-            )),
+            NativeInvokeOutcome::IteratorNextRaw { value, done } => {
+                Ok(Completion::Return(self.into_jsvalue(Value::Object(
+                    self.new_iterator_result_jsvalue(realm, value, done)?,
+                ))?))
+            }
         }
     }
 
@@ -663,26 +732,29 @@ impl Runtime {
                 "Set Iterator next did not receive an iterator-next invocation",
             ));
         };
-        let Value::Object(iterator) = this_value else {
+        let JsValue::Object(iterator) = this_value else {
+            self.release_jsvalue(this_value)?;
             return Ok(NativeInvokeOutcome::Completion(Completion::Throw(
-                self.new_native_error(
+                self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "Set Iterator object expected",
                 )?,
             )));
         };
+        let iterator = ObjectRef::from_owned_handle(self.clone(), iterator);
+        let iterator_id = iterator.object_id();
         let state = self
             .0
             .state
             .borrow_mut()
             .heap
-            .begin_set_iterator_next(iterator.object_id());
+            .begin_set_iterator_next(iterator_id);
         let (set, mut index, kind) = match state {
             Ok(state) => state,
             Err(HeapError::Invariant(_)) => {
                 return Ok(NativeInvokeOutcome::Completion(Completion::Throw(
-                    self.new_native_error(
+                    self.new_native_error_jsvalue(
                         realm,
                         NativeErrorKind::Type,
                         "Set Iterator object expected",
@@ -693,7 +765,7 @@ impl Runtime {
         };
         let Some(set_id) = set else {
             return Ok(NativeInvokeOutcome::IteratorNextRaw {
-                value: Value::Undefined,
+                value: JsValue::Undefined,
                 done: true,
             });
         };
@@ -707,10 +779,10 @@ impl Runtime {
             .map(|(id, record)| (id, record.key.clone()));
         let Some((record_index, key)) = record else {
             let mut state = self.0.state.borrow_mut();
-            let cleanup = state.heap.finish_set_iterator(iterator.object_id())?;
+            let cleanup = state.heap.finish_set_iterator(iterator_id)?;
             state.apply_cleanup(cleanup)?;
             return Ok(NativeInvokeOutcome::IteratorNextRaw {
-                value: Value::Undefined,
+                value: JsValue::Undefined,
                 done: true,
             });
         };
@@ -721,17 +793,28 @@ impl Runtime {
             .state
             .borrow_mut()
             .heap
-            .set_set_iterator_index(iterator.object_id(), index)?;
+            .set_set_iterator_index(iterator_id, index)?;
         self.0
             .state
             .borrow_mut()
             .heap
-            .set_set_iterator_current(iterator.object_id(), record_index)?;
-        let value = self.root_raw_value(&key)?;
+            .set_set_iterator_current(iterator_id, record_index)?;
+        let value = self.retain_collection_stored_value(key)?;
         let value = match kind {
             SetIteratorKind::Value => value,
             SetIteratorKind::KeyAndValue => {
-                Value::Object(self.new_array_from_values(realm, vec![value.clone(), value])?)
+                let key = value;
+                let second = match self.dup_jsvalue(&key) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = self.release_jsvalue(key);
+                        return Err(error);
+                    }
+                };
+                JsValue::Object(
+                    self.new_array_from_values_jsvalue(realm, vec![key, second])?
+                        .into_handle(),
+                )
             }
         };
         Ok(NativeInvokeOutcome::IteratorNextRaw { value, done: false })
@@ -910,14 +993,18 @@ mod tests {
         };
         let function = runtime.as_callable(&function).unwrap().unwrap();
 
-        context
-            .call(&function, Value::Undefined, &[])
-            .expect("warm Set Symbol ownership probe");
-        let baseline = runtime.test_atom_count();
-        for _ in 0..3 {
+        drop(
             context
                 .call(&function, Value::Undefined, &[])
-                .expect("repeat Set Symbol ownership probe");
+                .expect("warm Set Symbol ownership probe"),
+        );
+        let baseline = runtime.test_atom_count();
+        for _ in 0..3 {
+            drop(
+                context
+                    .call(&function, Value::Undefined, &[])
+                    .expect("repeat Set Symbol ownership probe"),
+            );
             assert_eq!(runtime.test_atom_count(), baseline);
         }
     }

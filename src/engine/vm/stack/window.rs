@@ -1,5 +1,5 @@
 //! One authenticated continuous execution borrow. No arena mutation API escapes.
-use super::{Error, FrameBinding, FrameWindow, Runtime, SlotStore, Value};
+use super::{Error, FrameBinding, FrameWindow, JsValue, Runtime, SlotStore};
 
 pub(in crate::engine::vm) enum LinkedReadCompletion {
     Completed,
@@ -20,7 +20,7 @@ pub(in crate::engine::vm) struct FrameTransaction<'a> {
     window: &'a mut FrameWindow,
 }
 impl FrameTransaction<'_> {
-    pub(in crate::engine::vm) fn peek(&self, offset: usize) -> Result<&Value, Error> {
+    pub(in crate::engine::vm) fn peek(&self, offset: usize) -> Result<&JsValue, Error> {
         self.store.peek_current(self.window, offset)
     }
     pub(in crate::engine::vm) fn validate_call_value_domains(
@@ -36,14 +36,15 @@ impl FrameTransaction<'_> {
     }
     pub(in crate::engine::vm) fn take_native_call_operands(
         &mut self,
+        runtime: &Runtime,
         logical_active_depth: usize,
         count: usize,
         method: bool,
-    ) -> Result<(Vec<Value>, Value), Error> {
+    ) -> Result<(Vec<JsValue>, JsValue), Error> {
         self.store
             .reserve_native_argument_depth(logical_active_depth.saturating_add(1))?;
         self.store
-            .take_native_call_operands_current(self.window, count, method)
+            .take_native_call_operands_current(runtime, self.window, count, method)
     }
 
     /// The callback may allocate primitive storage and commit a unique String
@@ -54,7 +55,7 @@ impl FrameTransaction<'_> {
         &mut self,
         left: u16,
         right: u16,
-        consume: impl FnOnce(&mut Value, &Value) -> T,
+        consume: impl FnOnce(&mut JsValue, &JsValue) -> T,
     ) -> Result<Option<T>, Error> {
         let (left, right) = (usize::from(left), usize::from(right));
         let locals = &mut self.store.slots[self.window.locals()];
@@ -71,8 +72,11 @@ impl FrameTransaction<'_> {
             if !local_add_values(value, value) {
                 return Ok(None);
             }
-            let right = value.clone();
-            return Ok(Some(consume(value, &right)));
+            // Aliased locals cannot expose `&mut` and `&` views of the same
+            // owner to the append callback at once; decline to the canonical
+            // path until the fused append accepts a single-view callback.
+            let _ = consume;
+            return Ok(None);
         }
         let (left, right) = if left < right {
             let (before, after) = locals.split_at_mut(right);
@@ -101,8 +105,8 @@ impl FrameTransaction<'_> {
     pub(in crate::engine::vm) fn with_local_add_constant<T>(
         &mut self,
         left: u16,
-        right: &Value,
-        consume: impl FnOnce(&mut Value, &Value) -> T,
+        right: &JsValue,
+        consume: impl FnOnce(&mut JsValue, &JsValue) -> T,
     ) -> Result<Option<T>, Error> {
         let local = self.store.slots[self.window.locals()]
             .get_mut(usize::from(left))
@@ -123,8 +127,8 @@ impl FrameTransaction<'_> {
     pub(in crate::engine::vm) fn with_local_add_constant_left<T>(
         &mut self,
         local: u16,
-        constant: Value,
-        consume: impl FnOnce(&mut Value, &Value) -> T,
+        constant: &mut JsValue,
+        consume: impl FnOnce(&mut JsValue, &JsValue) -> T,
     ) -> Result<Option<T>, Error> {
         let local = self.store.slots[self.window.locals()]
             .get(usize::from(local))
@@ -134,11 +138,10 @@ impl FrameTransaction<'_> {
         let FrameBinding::Direct(local) = local else {
             return Ok(None);
         };
-        if !local_add_values(&constant, local) {
+        if !local_add_values(constant, local) {
             return Ok(None);
         }
-        let mut constant = constant;
-        Ok(Some(consume(&mut constant, local)))
+        Ok(Some(consume(constant, local)))
     }
     pub(in crate::engine::vm) fn slots(&mut self) -> RunSlots<'_> {
         RunSlots {
@@ -172,7 +175,7 @@ impl SlotStore {
         runtime: &Runtime,
         executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
         index: u32,
-        complete: impl FnOnce(&mut RunSlots<'_>, &mut Option<Value>) -> Result<(), Error>,
+        complete: impl FnOnce(&mut RunSlots<'_>, &mut Option<JsValue>) -> Result<(), Error>,
     ) -> Result<LinkedReadCompletion, Error> {
         self.with_linked_own_read_selected(window, runtime, executable, index, None, complete)
     }
@@ -183,7 +186,7 @@ impl SlotStore {
         executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
         index: u32,
         native: Option<&mut Option<crate::engine::object::LinkedNativeSelection>>,
-        complete: impl FnOnce(&mut RunSlots<'_>, &mut Option<Value>) -> Result<(), Error>,
+        complete: impl FnOnce(&mut RunSlots<'_>, &mut Option<JsValue>) -> Result<(), Error>,
     ) -> Result<LinkedReadCompletion, Error> {
         use crate::engine::object::OrdinaryRead;
         self.check_current(window)?;
@@ -210,7 +213,7 @@ impl SlotStore {
         match selected {
             Some(OrdinaryRead::Complete(value)) => {
                 // This owner stays outside the output window even on failure.
-                let mut value = Some(value.unwrap_or(Value::Undefined));
+                let mut value = Some(value.unwrap_or(JsValue::Undefined));
                 {
                     let mut slots = RunSlots {
                         store: self,
@@ -280,18 +283,18 @@ impl RunSlots<'_> {
     pub(in crate::engine::vm) fn depth(&self) -> usize {
         self.window.depth
     }
-    pub(in crate::engine::vm) fn peek(&self, from_top: usize) -> Result<&Value, Error> {
+    pub(in crate::engine::vm) fn peek(&self, from_top: usize) -> Result<&JsValue, Error> {
         self.store.peek_current(self.window, from_top)
     }
 
-    pub(in crate::engine::vm) fn push(&mut self, value: Value) -> Result<(), Error> {
+    pub(in crate::engine::vm) fn push(&mut self, value: JsValue) -> Result<(), Error> {
         self.store.push_current(self.window, value)
     }
 
     /// On failure the caller keeps its owner until this borrow has ended.
     pub(in crate::engine::vm) fn push_pending(
         &mut self,
-        value: &mut Option<Value>,
+        value: &mut Option<JsValue>,
     ) -> Result<(), Error> {
         self.store.push_pending_current(self.window, value)
     }
@@ -305,7 +308,9 @@ impl RunSlots<'_> {
             .replace_local_pending_current(self.window, index, value)
     }
 
-    pub(in crate::engine::vm) fn pop(&mut self) -> Result<Value, Error> {
+    // Preserve the direct SlotStore call at numeric operand consumers.
+    #[inline]
+    pub(in crate::engine::vm) fn pop(&mut self) -> Result<JsValue, Error> {
         self.store.pop_current(self.window)
     }
 
@@ -325,10 +330,8 @@ impl RunSlots<'_> {
         let FrameBinding::Direct(left) = self.local(left)? else {
             return Ok(false);
         };
-        Ok(!matches!(left, Value::Object(_))
-            && runtime
-                .validate_value_domain(left, "local addition operand")
-                .is_ok())
+        let _ = runtime;
+        Ok(!matches!(left, JsValue::Object(_)))
     }
     pub(in crate::engine::vm) fn local_add_supported(
         &self,
@@ -344,6 +347,11 @@ impl RunSlots<'_> {
         {
             return Ok(false);
         }
+        // Aliased locals cannot expose `&mut` and `&` views of the same owner
+        // to the fused append; the canonical local-add sequence handles them.
+        if left == right {
+            return Ok(false);
+        }
         let FrameBinding::Direct(left) = self.local(left)? else {
             return Ok(false);
         };
@@ -352,13 +360,8 @@ impl RunSlots<'_> {
         let Ok(FrameBinding::Direct(right)) = self.local(right) else {
             return Ok(false);
         };
-        let left_valid = runtime
-            .validate_value_domain(left, "conversion operand")
-            .is_ok();
-        let right_valid = runtime
-            .validate_value_domain(right, "conversion operand")
-            .is_ok();
-        Ok(left_valid && right_valid && local_add_values(left, right))
+        let _ = runtime;
+        Ok(local_add_values(left, right))
     }
 
     pub(in crate::engine::vm) fn local(&self, index: u16) -> Result<&FrameBinding, Error> {
@@ -398,15 +401,21 @@ impl RunSlots<'_> {
 
     pub(in crate::engine::vm) fn insert_copy(
         &mut self,
+        runtime: &Runtime,
         source_from_top: usize,
         destination_from_top: usize,
     ) -> Result<(), Error> {
         self.store
-            .insert_copy_current(self.window, source_from_top, destination_from_top)
+            .insert_copy_current(runtime, self.window, source_from_top, destination_from_top)
     }
 
-    pub(in crate::engine::vm) fn duplicate_operands(&mut self, count: usize) -> Result<(), Error> {
-        self.store.duplicate_operands_current(self.window, count)
+    pub(in crate::engine::vm) fn duplicate_operands(
+        &mut self,
+        runtime: &Runtime,
+        count: usize,
+    ) -> Result<(), Error> {
+        self.store
+            .duplicate_operands_current(runtime, self.window, count)
     }
 
     pub(in crate::engine::vm) fn release_operand(
@@ -432,9 +441,19 @@ impl RunSlots<'_> {
         keep_key: bool,
     ) -> Result<bool, Error> {
         let index = match self.peek(0)? {
-            Value::Int(index) if *index >= 0 => *index as u32,
-            Value::String(key) if keep_key || key.release_keeps_storage_alive() => {
-                let Some(index) = crate::engine::atom::AtomTable::canonical_array_index(key) else {
+            JsValue::Int(index) if *index >= 0 => *index as u32,
+            JsValue::String(id) => {
+                if !keep_key
+                    && !matches!(
+                        runtime.slot_value_release_readiness_jsvalue(self.peek(0)?),
+                        Ok(crate::engine::heap::SlotReleaseReadiness::Ready)
+                    )
+                {
+                    return Ok(false);
+                }
+                let text = runtime.0.state.borrow().heap.string_fast(*id).clone();
+                let Some(index) = crate::engine::atom::AtomTable::canonical_array_index(&text)
+                else {
                     return Ok(false);
                 };
                 index
@@ -445,7 +464,9 @@ impl RunSlots<'_> {
             return Ok(false);
         };
         if !keep_key {
-            self.pop()?;
+            runtime
+                .release_jsvalue(self.pop()?)
+                .map_err(crate::engine::vm::exception::runtime_error_to_vm_error)?;
         }
         self.push(value)?;
         Ok(true)
@@ -488,7 +509,7 @@ impl RunSlots<'_> {
         operation: impl FnOnce(
             crate::engine::value::number::operations::Number,
             crate::engine::value::number::operations::Number,
-        ) -> Value,
+        ) -> JsValue,
     ) -> Result<bool, Error> {
         self.store.binary_number_current(self.window, operation)
     }
@@ -518,17 +539,23 @@ impl RunSlots<'_> {
     }
 }
 
-fn local_add_values(left: &Value, right: &Value) -> bool {
-    !matches!(left, Value::Object(_))
-        && !matches!(right, Value::Object(_))
-        && (matches!(left, Value::String(_) | Value::BigInt(_))
-            || matches!(right, Value::String(_) | Value::BigInt(_)))
+fn local_add_values(left: &JsValue, right: &JsValue) -> bool {
+    !matches!(left, JsValue::Object(_))
+        && !matches!(right, JsValue::Object(_))
+        && (matches!(
+            left,
+            JsValue::String(_) | JsValue::BigInt(_) | JsValue::ShortBigInt(_)
+        ) || matches!(
+            right,
+            JsValue::String(_) | JsValue::BigInt(_) | JsValue::ShortBigInt(_)
+        ))
 }
 
 #[cfg(test)]
 mod primitive_transaction_tests {
     use super::*;
     use crate::engine::code::runtime::PublishedFunctionSnapshot;
+    use crate::engine::value::Value;
     use crate::engine::vm::stack::FrameStorage;
 
     fn linked_executable(
@@ -573,11 +600,14 @@ mod primitive_transaction_tests {
         let mut store = SlotStore::new(8);
         let mut window = store
             .push_frame(
+                &runtime,
                 &layout.frame_layout(),
                 FrameStorage {
                     original_arguments: vec![],
                     parameters: vec![],
-                    locals: vec![FrameBinding::Direct(left.clone())],
+                    locals: vec![FrameBinding::Direct(
+                        runtime.into_jsvalue(left.clone()).unwrap(),
+                    )],
                     operands: vec![],
                 },
             )
@@ -589,12 +619,14 @@ mod primitive_transaction_tests {
             let FrameBinding::Direct(value) = slots.local(0).unwrap() else {
                 panic!("left")
             };
-            let value = value.clone();
+            let value = runtime.dup_jsvalue(value).unwrap();
             slots.push(value).unwrap();
             assert!(slots.local(u16::MAX).is_err());
             assert_eq!(slots.window.depth, 1);
-            assert_eq!(slots.peek(0).unwrap(), &left);
+            assert_eq!(runtime.root_value(slots.peek(0).unwrap()).unwrap(), left);
         }
+        let storage = store.take_frame(&runtime, window).unwrap();
+        crate::engine::vm::stack::release_frame_storage(&runtime, storage);
     }
 
     #[test]
@@ -606,6 +638,7 @@ mod primitive_transaction_tests {
         let mut store = SlotStore::new(8);
         let mut window = store
             .push_frame(
+                &runtime,
                 &layout.frame_layout(),
                 FrameStorage {
                     original_arguments: vec![],
@@ -616,7 +649,12 @@ mod primitive_transaction_tests {
             )
             .unwrap();
         store
-            .push(&mut window, context.eval("({tag:42})").unwrap())
+            .push(
+                &mut window,
+                runtime
+                    .into_jsvalue(context.eval("({tag:42})").unwrap())
+                    .unwrap(),
+            )
             .unwrap();
         let mut owner;
         {
@@ -625,19 +663,21 @@ mod primitive_transaction_tests {
             // No RunSlots is live during collection. The moved owner roots
             // the object independently of the exclusive frame transaction.
             runtime.run_gc().unwrap();
-            transaction.slots().push(Value::Int(7)).unwrap();
+            transaction.slots().push(JsValue::Int(7)).unwrap();
             assert!(transaction.slots().push_pending(&mut owner).is_err());
             assert!(
                 owner.is_some(),
                 "failed output keeps its owner outside the borrow"
             );
-            assert_eq!(transaction.slots().pop().unwrap(), Value::Int(7));
+            assert_eq!(transaction.slots().pop().unwrap(), JsValue::Int(7));
             transaction.slots().push_pending(&mut owner).unwrap();
         }
         assert!(owner.is_none());
-        let Value::Object(object) = store.pop(&mut window).unwrap() else {
+        let popped = store.pop(&mut window).unwrap();
+        let Value::Object(object) = runtime.root_value(&popped).unwrap() else {
             panic!("object")
         };
+        runtime.release_jsvalue(popped).unwrap();
         assert_eq!(
             context
                 .get_property(&object, &runtime.intern_property_key("tag").unwrap())
@@ -656,6 +696,7 @@ mod primitive_transaction_tests {
         layout.metadata.max_stack = 1;
         let mut window = store
             .push_frame(
+                &runtime,
                 &layout.frame_layout(),
                 FrameStorage {
                     original_arguments: vec![],
@@ -666,7 +707,9 @@ mod primitive_transaction_tests {
             )
             .unwrap();
         let base = context.eval("({x:{tag:42}})").unwrap();
-        store.push(&mut window, base).unwrap();
+        store
+            .push(&mut window, runtime.into_jsvalue(base).unwrap())
+            .unwrap();
         let mut old_base = None;
         #[cfg(feature = "profiling")]
         let profile = crate::engine::api::profiling::CostProfile::start();
@@ -691,11 +734,15 @@ mod primitive_transaction_tests {
             );
             drop(profile);
         }
-        drop(old_base);
+        if let Some(value) = old_base.take() {
+            runtime.release_jsvalue(value).unwrap();
+        }
         runtime.run_gc().unwrap();
-        let Value::Object(result) = store.pop(&mut window).unwrap() else {
+        let popped = store.pop(&mut window).unwrap();
+        let Value::Object(result) = runtime.root_value(&popped).unwrap() else {
             panic!("result");
         };
+        runtime.release_jsvalue(popped).unwrap();
         assert_eq!(
             context
                 .get_property(&result, &runtime.intern_property_key("tag").unwrap())
@@ -714,6 +761,7 @@ mod primitive_transaction_tests {
         let mut store = SlotStore::new(8);
         let mut window = store
             .push_frame(
+                &runtime,
                 &layout.frame_layout(),
                 FrameStorage {
                     original_arguments: vec![],
@@ -730,17 +778,21 @@ mod primitive_transaction_tests {
         assert!(
             matches!(result, Err(ref error) if error.message()=="owned operand stack underflow")
         );
-        let foreign = Runtime::new();
+        // A reclaimed base handle forces the lookup path to report a lookup
+        // error instead of committing the operand.
+        let blocked = runtime.new_object(None).unwrap();
+        let stale_handle = blocked.into_handle();
+        runtime
+            .release_jsvalue(JsValue::Object(stale_handle))
+            .unwrap();
+        runtime.run_gc().unwrap();
         store
-            .push(
-                &mut window,
-                Value::Object(foreign.new_object(None).unwrap()),
-            )
+            .push(&mut window, JsValue::Object(stale_handle))
             .unwrap();
         assert!(matches!(
             store
                 .with_linked_own_read(&mut window, &runtime, &executable, index, |_, _| panic!(
-                    "foreign input committed"
+                    "stale input committed"
                 ))
                 .unwrap(),
             LinkedReadCompletion::LookupError(_)
@@ -758,6 +810,7 @@ mod primitive_transaction_tests {
         let mut store = SlotStore::new(8);
         let mut window = store
             .push_frame(
+                &runtime,
                 &layout.frame_layout(),
                 FrameStorage {
                     original_arguments: vec![],
@@ -768,7 +821,9 @@ mod primitive_transaction_tests {
             )
             .unwrap();
         let base = context.eval("globalThis.linkedCalls=0;globalThis.linkedBase={get x(){linkedCalls++;return 42}};linkedBase").unwrap();
-        store.push(&mut window, base).unwrap();
+        store
+            .push(&mut window, runtime.into_jsvalue(base).unwrap())
+            .unwrap();
         let LinkedReadCompletion::Pending(read) = store
             .with_linked_own_read(&mut window, &runtime, &executable, index, |_, _| {
                 panic!("pending getter committed operands")
@@ -778,9 +833,11 @@ mod primitive_transaction_tests {
             panic!("pending getter");
         };
         assert_eq!(store.depth(&window), 1);
-        context
-            .eval("Object.defineProperty(linkedBase,'x',{get(){throw 99}})")
-            .unwrap();
+        drop(
+            context
+                .eval("Object.defineProperty(linkedBase,'x',{get(){throw 99}})")
+                .unwrap(),
+        );
         let result = runtime
             .finish_prepared_read(
                 context.realm,
@@ -793,6 +850,8 @@ mod primitive_transaction_tests {
             crate::engine::value::conversion::NativeConversion::Value(Some(Value::Int(42)))
         ));
         assert_eq!(context.eval("linkedCalls").unwrap(), Value::Int(1));
+        let base = store.pop(&mut window).unwrap();
+        runtime.release_jsvalue(base).unwrap();
     }
 
     #[test]
@@ -804,6 +863,7 @@ mod primitive_transaction_tests {
         let mut store = SlotStore::new(1);
         let mut window = store
             .push_frame(
+                &runtime,
                 &owner.frame_layout(),
                 FrameStorage {
                     original_arguments: vec![],
@@ -813,10 +873,10 @@ mod primitive_transaction_tests {
                 },
             )
             .unwrap();
-        store.push(&mut window, Value::Int(7)).unwrap();
+        store.push(&mut window, JsValue::Int(7)).unwrap();
         let object = runtime.new_object(None).unwrap();
         let object_id = object.object_id();
-        let mut pending = Some(Value::Object(object));
+        let mut pending = Some(JsValue::Object(object.into_handle()));
         {
             let mut slots = store.run_window(&mut window).unwrap();
             assert!(slots.push_pending(&mut pending).is_err());
@@ -824,7 +884,7 @@ mod primitive_transaction_tests {
                 pending.is_some(),
                 "failure may not release the final owner inside RunSlots"
             );
-            assert_eq!(slots.peek(0).unwrap(), &Value::Int(7));
+            assert_eq!(slots.peek(0).unwrap(), &JsValue::Int(7));
         }
         assert!(runtime.0.state.borrow().heap.object(object_id).is_ok());
         let mut binding = Some(FrameBinding::Direct(pending.take().unwrap()));
@@ -833,7 +893,9 @@ mod primitive_transaction_tests {
             assert!(slots.replace_local_pending(0, &mut binding).is_err());
             assert!(binding.is_some());
         }
-        drop(binding);
+        if let Some(FrameBinding::Direct(value)) = binding.take() {
+            runtime.release_jsvalue(value).unwrap();
+        }
         runtime.run_gc().unwrap();
         assert!(runtime.0.state.borrow().heap.object(object_id).is_err());
     }

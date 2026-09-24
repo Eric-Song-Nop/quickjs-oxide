@@ -4,7 +4,7 @@ use crate::engine::{
     builtins::native::ArrayIteratorKind,
     heap::{ContextId, HeapError},
     object::{ObjectRef, PropertyKey},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeInvocation, NativeInvokeOutcome},
@@ -40,9 +40,19 @@ pub(crate) struct ArrayNextResumeState {
     phase: Phase,
     requested_object: Option<ObjectRef>,
     requested_key: Option<PropertyKey>,
-    requested_value: Option<Value>,
+    requested_value: Option<JsValue>,
 
     requested_read: Option<crate::engine::object::OrdinaryRead>,
+}
+impl Drop for ArrayNextResumeState {
+    fn drop(&mut self) {
+        if let Some(read) = self.requested_read.take() {
+            read.release(self.iterator.runtime());
+        }
+        if let Some(value) = self.requested_value.take() {
+            let _ = self.iterator.runtime().release_jsvalue(value);
+        }
+    }
 }
 enum Phase {
     Length,
@@ -60,9 +70,10 @@ impl ArrayNextStep {
                 "Array Iterator next did not receive an iterator-next invocation",
             ));
         };
-        let Value::Object(iterator) = this_value else {
+        let JsValue::Object(iterator_id) = this_value else {
             return Self::wrong_receiver(runtime, realm);
         };
+        let iterator = ObjectRef::from_borrowed_handle(runtime.clone(), *iterator_id)?;
         let state = runtime
             .0
             .state
@@ -76,12 +87,12 @@ impl ArrayNextStep {
         };
         let Some(source) = source else {
             return Ok(Self::Complete(NativeInvokeOutcome::IteratorNextRaw {
-                value: Value::Undefined,
+                value: JsValue::Undefined,
                 done: true,
             }));
         };
 
-        if let Some(value) = Self::dense_immediate_next(runtime, iterator, source, index, kind)? {
+        if let Some(value) = Self::dense_immediate_next(runtime, &iterator, source, index, kind)? {
             #[cfg(feature = "profiling")]
             crate::engine::api::profiling::record_owned_execution_event(
                 "array_next_dense_immediate_leaf",
@@ -119,7 +130,7 @@ impl ArrayNextStep {
     }
     fn wrong_receiver(runtime: &Runtime, realm: ContextId) -> Result<Self, RuntimeError> {
         Ok(Self::Complete(NativeInvokeOutcome::Completion(
-            Completion::Throw(runtime.new_native_error(
+            Completion::Throw(runtime.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "Array Iterator object expected",
@@ -130,7 +141,7 @@ impl ArrayNextStep {
 enum NextAction {
     Complete(NativeInvokeOutcome),
     Read(PropertyKey),
-    Number(Value),
+    Number(JsValue),
 }
 
 impl ArrayNextResume {
@@ -154,10 +165,20 @@ impl ArrayNextResume {
             }
             Phase::Value => {
                 let value = if self.0.kind == ArrayIteratorKind::KeyAndValue {
-                    Value::Object(runtime.new_array_from_values(
-                        self.0.realm,
-                        vec![Runtime::array_length_value(self.0.index), value],
-                    )?)
+                    JsValue::Object(
+                        runtime
+                            .new_array_from_values_jsvalue(
+                                self.0.realm,
+                                vec![
+                                    crate::engine::value::number::operations::Number::compact(
+                                        self.0.index as f64,
+                                    )
+                                    .into(),
+                                    value,
+                                ],
+                            )?
+                            .into_handle(),
+                    )
                 } else {
                     value
                 };
@@ -166,9 +187,12 @@ impl ArrayNextResume {
                     done: false,
                 }))
             }
-            Phase::Number => Err(RuntimeError::Invariant(
-                "Array Iterator number phase received completion",
-            )),
+            Phase::Number => {
+                runtime.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant(
+                    "Array Iterator number phase received completion",
+                ))
+            }
         }
     }
     fn number_once(
@@ -177,6 +201,9 @@ impl ArrayNextResume {
         reply: NativeConversion<f64>,
     ) -> Result<NextAction, RuntimeError> {
         if !matches!(self.0.phase, Phase::Number) {
+            if let NativeConversion::Throw(value) = reply {
+                runtime.release_jsvalue(value)?;
+            }
             return Err(RuntimeError::Invariant(
                 "Array Iterator numeric reply has wrong phase",
             ));
@@ -198,7 +225,7 @@ impl ArrayNextResume {
                 .finish_array_iterator(self.0.iterator.object_id())?;
             state.apply_cleanup(cleanup)?;
             return Ok(NextAction::Complete(NativeInvokeOutcome::IteratorNextRaw {
-                value: Value::Undefined,
+                value: JsValue::Undefined,
                 done: true,
             }));
         };
@@ -210,7 +237,7 @@ impl ArrayNextResume {
             .set_array_iterator_index(self.0.iterator.object_id(), next_index)?;
         if self.0.kind == ArrayIteratorKind::Key {
             return Ok(NextAction::Complete(NativeInvokeOutcome::IteratorNextRaw {
-                value: Runtime::array_length_value(self.0.index),
+                value: runtime.into_jsvalue(Runtime::array_length_value(self.0.index))?,
                 done: false,
             }));
         }
@@ -256,16 +283,16 @@ impl ArrayNextResume {
                         )? {
                             OrdinaryRead::Complete(value) => self.resume_once(
                                 runtime,
-                                Completion::Return(value.unwrap_or(Value::Undefined)),
+                                Completion::Return(value.unwrap_or(JsValue::Undefined)),
                             )?,
                             read => {
                                 return Ok(self.prepared(read, key));
                             }
                         }
                     }
-                    NextAction::Number(value) if !matches!(value, Value::Object(_)) => {
+                    NextAction::Number(value) if !matches!(value, JsValue::Object(_)) => {
                         let NumberStep::Complete(reply) =
-                            NumberStep::start(runtime, self.0.realm, value)?
+                            NumberStep::start_jsvalue(runtime, self.0.realm, value)?
                         else {
                             return Err(RuntimeError::Invariant(
                                 "primitive iterator number suspended",
@@ -273,7 +300,7 @@ impl ArrayNextResume {
                         };
                         self.number_once(runtime, reply)?
                     }
-                    action => return Ok(self.wait(action)),
+                    action => return self.wait(runtime, action),
                 };
                 #[cfg(feature = "profiling")]
                 crate::engine::api::profiling::record_owned_execution_event(
@@ -308,20 +335,24 @@ impl ArrayNextResume {
             self.requested_key.take().expect("array next key"),
         )
     }
-    pub(crate) fn take_number(&mut self) -> Value {
+    pub(crate) fn take_number(&mut self) -> JsValue {
         self.requested_value.take().expect("array next number")
     }
-    fn wait(mut self, action: NextAction) -> ArrayNextStep {
+    fn wait(
+        mut self,
+        _runtime: &Runtime,
+        action: NextAction,
+    ) -> Result<ArrayNextStep, RuntimeError> {
         match action {
-            NextAction::Complete(result) => ArrayNextStep::Complete(result),
+            NextAction::Complete(result) => Ok(ArrayNextStep::Complete(result)),
             NextAction::Read(key) => {
                 self.requested_object = Some(self.source.clone());
                 self.requested_key = Some(key);
-                ArrayNextStep::Read { resume: self }
+                Ok(ArrayNextStep::Read { resume: self })
             }
             NextAction::Number(value) => {
                 self.requested_value = Some(value);
-                ArrayNextStep::Number { resume: self }
+                Ok(ArrayNextStep::Number { resume: self })
             }
         }
     }
@@ -347,7 +378,7 @@ pub(crate) fn finish(
                 let key = resume.take_key();
                 let completion = match runtime.finish_prepared_read(realm, &key, read)? {
                     NativeConversion::Value(value) => {
-                        Completion::Return(value.unwrap_or(Value::Undefined))
+                        Completion::Return(runtime.into_jsvalue(value.unwrap_or(Value::Undefined))?)
                     }
                     NativeConversion::Throw(value) => Completion::Throw(value),
                 };
@@ -362,7 +393,7 @@ pub(crate) fn finish(
             }
             ArrayNextStep::Number { mut resume } => {
                 let value = resume.take_number();
-                resume.number(runtime, runtime.native_to_number(realm, &value)?)?
+                resume.number(runtime, runtime.native_to_number_jsvalue(realm, value)?)?
             }
         };
     }

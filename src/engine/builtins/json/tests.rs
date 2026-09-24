@@ -1,5 +1,6 @@
+use crate::engine::atom::AtomIdx;
 use crate::engine::builtins::native::NativeCProto;
-use crate::engine::value::conversion::NativeConversion;
+use crate::engine::value::{JsValue, conversion::NativeConversion};
 
 use super::*;
 
@@ -32,7 +33,8 @@ fn global_json_is_realm_aware_lazy_and_reserves_the_pinned_table_order() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(global.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot = usize::try_from(shape.find(key.atom()).unwrap()).unwrap();
+        let slot =
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap();
         assert_eq!(
             shape.entries()[slot].flags,
             PropertyFlags::data(true, false, true),
@@ -63,7 +65,8 @@ fn global_json_is_realm_aware_lazy_and_reserves_the_pinned_table_order() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(json.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot = usize::try_from(shape.find(method.atom()).unwrap()).unwrap();
+        let slot =
+            usize::try_from(shape.find(AtomIdx::from_raw(method.atom().raw())).unwrap()).unwrap();
         assert_eq!(
             shape.entries()[slot].flags,
             PropertyFlags::data(true, false, true),
@@ -121,12 +124,13 @@ fn json_module_parser_returns_the_strict_json_value() {
     let mut context = runtime.new_context();
     let source = JsString::from_static("{\"answer\":42}");
     let filename = JsString::from_static("answer.json");
-    let NativeConversion::Value(Value::Object(value)) = runtime
+    let NativeConversion::Value(crate::engine::value::JsValue::Object(value)) = runtime
         .parse_json_module_text(context.realm, &source, &filename)
         .unwrap()
     else {
         panic!("strict JSON module text did not return its object value");
     };
+    let value = crate::engine::object::ObjectRef::from_owned_handle(runtime.clone(), value);
     let answer = runtime
         .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Answer)
         .unwrap();
@@ -159,12 +163,13 @@ fn quickjs_extended_json_module_parser_is_host_selected_and_keeps_strict_json_st
     )
     .unwrap();
     let filename = JsString::from_static("fixtures/value.data");
-    let NativeConversion::Value(Value::Object(value)) = runtime
+    let NativeConversion::Value(crate::engine::value::JsValue::Object(value)) = runtime
         .parse_json5_module_text(context.realm, &source, &filename)
         .unwrap()
     else {
         panic!("QuickJS extended JSON did not return its object value");
     };
+    let value = crate::engine::object::ObjectRef::from_owned_handle(runtime.clone(), value);
     let global = context.global_object().unwrap();
     let key = runtime
         .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Json5Value)
@@ -193,12 +198,13 @@ fn quickjs_extended_json_module_parser_is_host_selected_and_keeps_strict_json_st
         Value::Bool(true)
     );
 
-    let NativeConversion::Throw(Value::Object(error)) = runtime
+    let NativeConversion::Throw(JsValue::Object(error)) = runtime
         .parse_json_module_text(context.realm, &source, &filename)
         .unwrap()
     else {
         panic!("strict JSON unexpectedly accepted QuickJS extended JSON");
     };
+    let error = ObjectRef::from_owned_handle(runtime.clone(), error);
     let message = runtime
         .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Message)
         .unwrap();
@@ -208,12 +214,13 @@ fn quickjs_extended_json_module_parser_is_host_selected_and_keeps_strict_json_st
     );
 
     let line_separator = JsString::try_from_utf8("// comment\u{2028}{answer: 42}").unwrap();
-    let NativeConversion::Value(Value::Object(value)) = runtime
+    let NativeConversion::Value(crate::engine::value::JsValue::Object(value)) = runtime
         .parse_json5_module_text(context.realm, &line_separator, &filename)
         .unwrap()
     else {
         panic!("extended JSON line comment did not consume its Unicode terminator");
     };
+    let value = crate::engine::object::ObjectRef::from_owned_handle(runtime.clone(), value);
     let answer = runtime
         .pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Answer)
         .unwrap();
@@ -392,9 +399,10 @@ fn assert_json_module_syntax_location_with_mode(
     } else {
         runtime.parse_json_module_text(context.realm, &source, &filename)
     };
-    let NativeConversion::Throw(Value::Object(error)) = parsed.unwrap() else {
+    let NativeConversion::Throw(JsValue::Object(error)) = parsed.unwrap() else {
         panic!("invalid JSON module text did not throw a SyntaxError");
     };
+    let error = ObjectRef::from_owned_handle(runtime.clone(), error);
 
     for (name, expected) in [
         (

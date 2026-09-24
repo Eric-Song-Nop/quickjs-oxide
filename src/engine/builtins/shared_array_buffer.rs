@@ -21,7 +21,7 @@ use crate::engine::object::{
     WellKnownSymbol,
 };
 use crate::engine::value::conversion::NativeConversion;
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
 
@@ -212,7 +212,7 @@ impl Runtime {
         max_byte_length: Option<u64>,
     ) -> Result<Completion, RuntimeError> {
         if length > u64::from(MAX_SHARED_ARRAY_BUFFER_BYTE_LENGTH) {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "invalid array buffer length",
@@ -221,7 +221,7 @@ impl Runtime {
         if max_byte_length
             .is_some_and(|maximum| maximum > u64::from(MAX_SHARED_ARRAY_BUFFER_BYTE_LENGTH))
         {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "invalid max array buffer length",
@@ -240,7 +240,7 @@ impl Runtime {
         let handle = match SharedBufferHandle::new(length, max_byte_length) {
             Ok(handle) => handle,
             Err(SharedMemoryError::Allocation) => {
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Internal,
                     "out of memory",
@@ -249,7 +249,7 @@ impl Runtime {
             Err(error) => return Err(shared_memory_runtime_error(error)),
         };
         let object = self.new_shared_array_buffer_from_handle(&prototype, handle)?;
-        Ok(Completion::Return(Value::Object(object)))
+        Ok(Completion::Return(JsValue::Object(object.into_handle())))
     }
 
     pub(in crate::engine::builtins) fn call_shared_array_buffer_species(
@@ -261,7 +261,7 @@ impl Runtime {
                 "SharedArrayBuffer species did not receive a getter invocation",
             ));
         };
-        Ok(Completion::Return(this_value.clone()))
+        Ok(Completion::Return(self.dup_jsvalue(this_value)?))
     }
 
     pub(in crate::engine::builtins) fn call_shared_array_buffer_getter(
@@ -275,22 +275,24 @@ impl Runtime {
                 "SharedArrayBuffer prototype getter received a non-getter invocation",
             ));
         };
-        let object = match self.require_shared_array_buffer_borrowed(realm, this_value)? {
+        let object = match self.require_shared_array_buffer_jsvalue(realm, this_value)? {
             NativeConversion::Value(object) => object,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
-        let snapshot = self.shared_array_buffer_snapshot(object)?;
+        let snapshot = self.shared_array_buffer_snapshot(&object)?;
         let value = match kind {
-            SharedArrayBufferNativeKind::ByteLength => Value::Int(
+            SharedArrayBufferNativeKind::ByteLength => JsValue::Int(
                 i32::try_from(snapshot.byte_length)
                     .expect("SharedArrayBuffer length is bounded by i32::MAX"),
             ),
-            SharedArrayBufferNativeKind::MaxByteLength => Value::Int(
+            SharedArrayBufferNativeKind::MaxByteLength => JsValue::Int(
                 i32::try_from(snapshot.max_byte_length.unwrap_or(snapshot.byte_length))
                     .expect("SharedArrayBuffer maximum is bounded by i32::MAX"),
             ),
             SharedArrayBufferNativeKind::Growable => {
-                Value::Bool(snapshot.max_byte_length.is_some())
+                JsValue::Bool(snapshot.max_byte_length.is_some())
             }
             SharedArrayBufferNativeKind::Constructor
             | SharedArrayBufferNativeKind::Species
@@ -329,7 +331,7 @@ impl Runtime {
     ) -> Result<Completion, RuntimeError> {
         let current = self.shared_array_buffer_snapshot(&object)?;
         let Some(maximum) = current.max_byte_length else {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "array buffer is not resizable",
@@ -339,7 +341,7 @@ impl Runtime {
             || new_length > i64::from(maximum)
             || new_length < i64::from(current.byte_length)
         {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Range,
                 "invalid array buffer length",
@@ -353,7 +355,7 @@ impl Runtime {
             .borrow_mut()
             .heap
             .grow_shared_array_buffer(object.object_id(), new_length)?;
-        Ok(Completion::Return(Value::Undefined))
+        Ok(Completion::Return(JsValue::Undefined))
     }
 
     fn call_shared_array_buffer_slice(
@@ -378,12 +380,26 @@ impl Runtime {
     pub(in crate::engine::builtins) fn shared_array_buffer_slice_source(
         &self,
         realm: ContextId,
-        value: Value,
+        value: &JsValue,
     ) -> Result<NativeConversion<(ObjectRef, i64)>, RuntimeError> {
-        let source = match self.require_shared_array_buffer(realm, value)? {
-            NativeConversion::Value(source) => source,
-            NativeConversion::Throw(value) => return Ok(NativeConversion::Throw(value)),
+        let JsValue::Object(id) = value else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+                realm,
+                NativeErrorKind::Type,
+                "SharedArrayBuffer object expected",
+            )?));
         };
+        let source = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
+        if self
+            .shared_array_buffer_snapshot_if_branded(&source)?
+            .is_none()
+        {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+                realm,
+                NativeErrorKind::Type,
+                "SharedArrayBuffer object expected",
+            )?));
+        }
         let initial = self.shared_array_buffer_snapshot(&source)?;
         Ok(NativeConversion::Value((
             source,
@@ -399,7 +415,7 @@ impl Runtime {
         let handle = match SharedBufferHandle::new(new_length, None) {
             Ok(handle) => handle,
             Err(SharedMemoryError::Allocation) => {
-                return Ok(NativeConversion::Throw(self.new_native_error(
+                return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Internal,
                     "out of memory",
@@ -421,7 +437,7 @@ impl Runtime {
         new_length: u32,
     ) -> Result<Completion, RuntimeError> {
         if target.object_id() == source.object_id() {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "cannot use identical ArrayBuffer",
@@ -430,7 +446,7 @@ impl Runtime {
         let target_snapshot = match self.shared_array_buffer_snapshot_if_branded(&target)? {
             Some(snapshot) => snapshot,
             None => {
-                return Ok(Completion::Throw(self.new_native_error(
+                return Ok(Completion::Throw(self.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "SharedArrayBuffer object expected",
@@ -438,7 +454,7 @@ impl Runtime {
             }
         };
         if target_snapshot.byte_length < new_length {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "new ArrayBuffer is too small",
@@ -456,7 +472,7 @@ impl Runtime {
             ));
         };
         if end > source_snapshot.byte_length {
-            return Ok(Completion::Throw(self.new_native_error(
+            return Ok(Completion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "ArrayBuffer is detached",
@@ -477,7 +493,7 @@ impl Runtime {
         target_handle
             .copy_range_from(&source_handle, start, 0, new_length)
             .map_err(shared_memory_runtime_error)?;
-        Ok(Completion::Return(Value::Object(target)))
+        Ok(Completion::Return(JsValue::Object(target.into_handle())))
     }
 
     pub(in crate::engine::builtins) fn shared_array_buffer_default_prototype(
@@ -498,37 +514,24 @@ impl Runtime {
         Ok(ObjectRef::from_borrowed_handle(self.clone(), prototype)?)
     }
 
-    pub(in crate::engine::builtins) fn require_shared_array_buffer(
+    pub(in crate::engine::builtins) fn require_shared_array_buffer_jsvalue(
         &self,
         realm: ContextId,
-        value: Value,
+        value: &JsValue,
     ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
-        self.require_shared_array_buffer_borrowed(realm, &value)
-            .map(|result| match result {
-                NativeConversion::Value(object) => NativeConversion::Value(object.clone()),
-                NativeConversion::Throw(value) => NativeConversion::Throw(value),
-            })
-    }
-    pub(in crate::engine::builtins) fn require_shared_array_buffer_borrowed<'a>(
-        &self,
-        realm: ContextId,
-        value: &'a Value,
-    ) -> Result<NativeConversion<&'a ObjectRef>, RuntimeError> {
-        let Value::Object(object) = value else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        let JsValue::Object(id) = value else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "SharedArrayBuffer object expected",
             )?));
         };
-        if !object.belongs_to(self) {
-            return Err(RuntimeError::WrongRuntime("SharedArrayBuffer"));
-        }
+        let object = ObjectRef::from_borrowed_handle(self.clone(), *id)?;
         if self
-            .shared_array_buffer_snapshot_if_branded(object)?
+            .shared_array_buffer_snapshot_if_branded(&object)?
             .is_none()
         {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "SharedArrayBuffer object expected",
@@ -875,7 +878,7 @@ mod tests {
                 )
                 .unwrap()
         );
-        second_context.eval("__imported.grow(4)").unwrap();
+        drop(second_context.eval("__imported.grow(4)").unwrap());
         let imported_grown = second_context
             .export_shared_array_buffer(&imported)
             .unwrap();
@@ -886,7 +889,7 @@ mod tests {
         imported_grown.write_range(0, &[33, 44]).unwrap();
         assert_eq!(exported.read_range(0, 2).unwrap(), [33, 44]);
 
-        second_context.eval("delete globalThis.__imported").unwrap();
+        drop(second_context.eval("delete globalThis.__imported").unwrap());
         drop(imported);
         second_runtime.run_gc().unwrap();
         assert_eq!(imported_grown.read_range(0, 4).unwrap(), [33, 44, 0, 0]);

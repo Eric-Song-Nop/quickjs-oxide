@@ -4,15 +4,15 @@ use crate::engine::{
     atom::PropertyKeyKind,
     heap::{ContextId, ForInCandidate, ForInProperty},
     object::{ObjectRef, PropertyKey},
-    value::{JsString, Value, conversion::NativeConversion},
+    value::{JsString, JsValue, Value, conversion::NativeConversion},
 };
 
 pub(in crate::engine::vm) enum ForInStep {
     Complete {
-        value: Value,
+        value: JsValue,
         done: Option<bool>,
     },
-    Throw(Value),
+    Throw(JsValue),
     Keys {
         object: ObjectRef,
         resume: ForInResume,
@@ -140,7 +140,7 @@ impl ForInStep {
     pub(in crate::engine::vm) fn start(
         runtime: &Runtime,
         realm: ContextId,
-        value: Value,
+        value: JsValue,
     ) -> Result<Self, RuntimeError> {
         let object = runtime.for_in_object(realm, value)?;
         let fast = object
@@ -151,11 +151,11 @@ impl ForInStep {
         match object {
             Some(object) if fast.is_none() => snapshot(realm, object, AfterSnapshot::Start),
             object => Ok(ForInStep::Complete {
-                value: Value::Object(runtime.allocate_for_in_iterator(
-                    object.as_ref(),
-                    fast,
-                    Vec::new(),
-                )?),
+                value: JsValue::Object(
+                    runtime
+                        .allocate_for_in_iterator(object.as_ref(), fast, Vec::new())?
+                        .into_handle(),
+                ),
                 done: None,
             }),
         }
@@ -187,7 +187,7 @@ fn snapshot(
 }
 fn done() -> ForInStep {
     ForInStep::Complete {
-        value: Value::Undefined,
+        value: JsValue::Undefined,
         done: Some(true),
     }
 }
@@ -247,7 +247,7 @@ fn advance(
                 if dense_present {
                     record_local_step();
                     return Ok(ForInStep::Complete {
-                        value: Value::String(name),
+                        value: runtime.unroot_value(&Value::String(name))?,
                         done: Some(false),
                     });
                 }
@@ -286,12 +286,14 @@ fn advance(
         match reply {
             NativeConversion::Value(true) => {
                 return Ok(ForInStep::Complete {
-                    value: Value::String(name),
+                    value: runtime.unroot_value(&Value::String(name))?,
                     done: Some(false),
                 });
             }
             NativeConversion::Value(false) => {}
-            NativeConversion::Throw(value) => return Ok(ForInStep::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(ForInStep::Throw(value));
+            }
         }
     }
 }
@@ -309,7 +311,9 @@ impl ForInResume {
     ) -> Result<ForInStep, RuntimeError> {
         let keys = match reply {
             NativeConversion::Value(keys) => keys,
-            NativeConversion::Throw(value) => return Ok(ForInStep::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(ForInStep::Throw(value));
+            }
         };
         match self.0.phase {
             Phase::SnapshotKeys { object, after } => snapshot_next(
@@ -335,7 +339,9 @@ impl ForInResume {
     ) -> Result<ForInStep, RuntimeError> {
         let value = match reply {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(ForInStep::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(ForInStep::Throw(value));
+            }
         };
         match self.0.phase {
             Phase::SnapshotEnumerable { mut snapshot, name } => {
@@ -363,7 +369,7 @@ impl ForInResume {
             Phase::Candidate { iterator, name } => {
                 if value {
                     Ok(ForInStep::Complete {
-                        value: Value::String(name),
+                        value: runtime.unroot_value(&Value::String(name))?,
                         done: Some(false),
                     })
                 } else {
@@ -382,7 +388,9 @@ impl ForInResume {
     ) -> Result<ForInStep, RuntimeError> {
         let prototype = match reply {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(ForInStep::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(ForInStep::Throw(value));
+            }
         };
         match self.0.phase {
             Phase::ProbePrototype(probe) => {
@@ -437,7 +445,9 @@ fn snapshot_next(
                 &key,
             )? {
                 NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(ForInStep::Throw(value)),
+                NativeConversion::Throw(value) => {
+                    return Ok(ForInStep::Throw(value));
+                }
             };
             pending
                 .properties
@@ -461,11 +471,11 @@ fn snapshot_next(
     }
     match pending.after {
         AfterSnapshot::Start => Ok(ForInStep::Complete {
-            value: Value::Object(runtime.allocate_for_in_iterator(
-                Some(&pending.object),
-                None,
-                pending.properties,
-            )?),
+            value: JsValue::Object(
+                runtime
+                    .allocate_for_in_iterator(Some(&pending.object), None, pending.properties)?
+                    .into_handle(),
+            ),
             done: None,
         }),
         AfterSnapshot::Refresh { iterator } => {
@@ -516,7 +526,9 @@ fn probe_keys(
                 .internal_snapshot_own_property_is_enumerable(realm, &prototype, &key)?
             {
                 NativeConversion::Value(value) => value,
-                NativeConversion::Throw(value) => return Ok(ForInStep::Throw(value)),
+                NativeConversion::Throw(value) => {
+                    return Ok(ForInStep::Throw(value));
+                }
             };
             record_local_step();
             if enumerable {
@@ -577,6 +589,122 @@ fn enter_prototypes(
     }
 }
 
+#[cfg(all(test, feature = "profiling"))]
+mod tests {
+    use crate::engine::{
+        api::{profiling::CostProfile, runtime::Runtime},
+        value::Value,
+        vm::Completion,
+    };
+
+    #[test]
+    fn for_in_local_steps_keep_order_shadowing_deletion_and_accessor_silence() {
+        for source in [
+            "(function(){var calls=0,p={z:1,a:2},o=Object.create(p);o[2]=2;o[1]=1;Object.defineProperty(o,'a',{value:3,enumerable:false});Object.defineProperty(o,'b',{get(){calls++;throw 0},enumerable:true});o[Symbol('s')]=4;return function(){var names='';for(var k in o)names+=k+',';return names==='1,2,b,z,'&&calls===0?42:0}})()",
+            "(function(){var o=[1,2,3];Object.setPrototypeOf(o,{p:4});return function(){var names='';for(var k in o){names+=k;if(k==='0')delete o[1]}return names==='02p'?42:0}})()",
+            "(function(){var o=Object.create(null);o.a=1;o.b=2;return function(){var names='';for(var k in o){names+=k;if(k==='a'){delete o.b;o.c=3}}return names==='a'?42:0}})()",
+        ] {
+            let runtime = Runtime::new();
+            let mut context = runtime.new_context();
+            let callable = runtime
+                .callable_from_value(context.eval(source).unwrap())
+                .unwrap();
+            let profile = CostProfile::start();
+            let result = runtime
+                .call_internal(context.realm, &callable, Value::Undefined, &[])
+                .unwrap();
+            let costs = profile.snapshot();
+            assert!(
+                matches!(
+                    result,
+                    Completion::Return(crate::engine::value::JsValue::Int(42))
+                ),
+                "{source}: {result:?}"
+            );
+            assert!(
+                costs
+                    .owned_execution_events
+                    .get("for_in_local_step")
+                    .copied()
+                    .unwrap_or(0)
+                    > 0,
+                "{source}: {costs:?}"
+            );
+            assert!(
+                costs
+                    .owned_execution_events
+                    .get("for_in_completed_without_query")
+                    .copied()
+                    .unwrap_or(0)
+                    > 0,
+                "{source}: {costs:?}"
+            );
+            assert!(runtime.0.state.borrow().active_frames.is_empty());
+        }
+    }
+
+    #[test]
+    fn for_in_local_progress_leaves_proxy_admission_and_trap_untouched() {
+        use super::ForInStep;
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        let value = context.eval("globalThis.forInTrapCalls=0;new Proxy({a:1},{ownKeys(){forInTrapCalls++;throw 42}})").unwrap();
+        let ForInStep::Keys { object, resume } = ForInStep::start(
+            &runtime,
+            context.realm,
+            runtime.into_jsvalue(value).unwrap(),
+        )
+        .unwrap() else {
+            panic!("expected selected Proxy ownKeys step");
+        };
+        let id = object.object_id();
+        let step = ForInStep::Keys { object, resume }
+            .advance_without_callback(&runtime)
+            .unwrap();
+        let ForInStep::Keys { object, .. } = step else {
+            panic!("Proxy step must remain selected for budgeted dispatch");
+        };
+        assert_eq!(object.object_id(), id);
+        assert!(matches!(
+            context.eval("forInTrapCalls").unwrap(),
+            Value::Int(0)
+        ));
+    }
+
+    #[test]
+    fn for_in_proxy_snapshots_and_double_prototype_probe_are_owned_without_replay() {
+        for source in [
+            "(function(){var baseProto=0,protoKeys=0;var proto=new Proxy({b:2},{ownKeys(t){protoKeys++;return Reflect.ownKeys(t)},getOwnPropertyDescriptor(t,k){return Reflect.getOwnPropertyDescriptor(t,k)},getPrototypeOf(){return null}});var base=new Proxy({a:1},{ownKeys(t){return Reflect.ownKeys(t)},getOwnPropertyDescriptor(t,k){return Reflect.getOwnPropertyDescriptor(t,k)},getPrototypeOf(){baseProto++;return proto}});return function(){var names='';for(var key in base)names+=key;return names==='ab'&&baseProto===2&&protoKeys===2?42:0}})()",
+            "(function(){var n=0;var base=new Proxy({a:1},{ownKeys(){return ['a']},getOwnPropertyDescriptor(){n++;return {value:1,writable:true,enumerable:n===1,configurable:true}},getPrototypeOf(){return null}});return function(){var names='';for(var key in base)names+=key;return names==='a'&&n===2?42:0}})()",
+            "(function(){var marker={},calls=0,base=new Proxy({}, {ownKeys(){calls++;throw marker}});return function(){try{for(var key in base){}}catch(e){return calls===1&&e===marker?42:0}return 0}})()",
+            "(function(){var marker={},calls=0,proto=new Proxy({p:2},{ownKeys(){calls++;throw marker}}),base=Object.create(proto);base.a=1;return function(){try{for(var key in base){}}catch(e){return calls===1&&e===marker?42:0}return 0}})()",
+            "(function(){var base=[1,2],proto={p:3};Object.setPrototypeOf(base,proto);return function(){var names='';for(var key in base){names+=key;if(key==='0')delete base[1]}return names==='0p'?42:0}})()",
+        ] {
+            let runtime = Runtime::new();
+            let mut context = runtime.new_context();
+            let callable = runtime
+                .callable_from_value(context.eval(source).unwrap())
+                .unwrap();
+            let profile = CostProfile::start();
+            let result = runtime
+                .call_internal(context.realm, &callable, Value::Undefined, &[])
+                .unwrap();
+            let _costs = profile.snapshot();
+            assert!(
+                matches!(
+                    result,
+                    Completion::Return(crate::engine::value::JsValue::Int(42))
+                ),
+                "{source}: {result:?}"
+            );
+            assert!(runtime.0.state.borrow().active_frames.is_empty());
+        }
+    }
+}
+
+// S11 all-domain protocol bound; inline completion stays allocation-free.
+const _: () = assert!(std::mem::size_of::<ForInStep>() <= 64);
+
 #[cfg(test)]
 mod resident_tests {
     use crate::engine::api::{Runtime, Value};
@@ -625,110 +753,3 @@ mod resident_tests {
         })()"#).unwrap(), Value::Bool(true));
     }
 }
-
-#[cfg(all(test, feature = "profiling"))]
-mod tests {
-    use crate::engine::{
-        api::{profiling::CostProfile, runtime::Runtime},
-        value::Value,
-        vm::Completion,
-    };
-
-    #[test]
-    fn for_in_local_steps_keep_order_shadowing_deletion_and_accessor_silence() {
-        for source in [
-            "(function(){var calls=0,p={z:1,a:2},o=Object.create(p);o[2]=2;o[1]=1;Object.defineProperty(o,'a',{value:3,enumerable:false});Object.defineProperty(o,'b',{get(){calls++;throw 0},enumerable:true});o[Symbol('s')]=4;return function(){var names='';for(var k in o)names+=k+',';return names==='1,2,b,z,'&&calls===0?42:0}})()",
-            "(function(){var o=[1,2,3];Object.setPrototypeOf(o,{p:4});return function(){var names='';for(var k in o){names+=k;if(k==='0')delete o[1]}return names==='02p'?42:0}})()",
-            "(function(){var o=Object.create(null);o.a=1;o.b=2;return function(){var names='';for(var k in o){names+=k;if(k==='a'){delete o.b;o.c=3}}return names==='a'?42:0}})()",
-        ] {
-            let runtime = Runtime::new();
-            let mut context = runtime.new_context();
-            let callable = runtime
-                .callable_from_value(context.eval(source).unwrap())
-                .unwrap();
-            let profile = CostProfile::start();
-            let result = runtime
-                .call_internal(context.realm, &callable, Value::Undefined, &[])
-                .unwrap();
-            let costs = profile.snapshot();
-            assert!(
-                matches!(result, Completion::Return(Value::Int(42))),
-                "{source}: {result:?}"
-            );
-            assert!(
-                costs
-                    .owned_execution_events
-                    .get("for_in_local_step")
-                    .copied()
-                    .unwrap_or(0)
-                    > 0,
-                "{source}: {costs:?}"
-            );
-            assert!(
-                costs
-                    .owned_execution_events
-                    .get("for_in_completed_without_query")
-                    .copied()
-                    .unwrap_or(0)
-                    > 0,
-                "{source}: {costs:?}"
-            );
-            assert!(runtime.0.state.borrow().active_frames.is_empty());
-        }
-    }
-
-    #[test]
-    fn for_in_local_progress_leaves_proxy_admission_and_trap_untouched() {
-        use super::ForInStep;
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context();
-        let value = context.eval("globalThis.forInTrapCalls=0;new Proxy({a:1},{ownKeys(){forInTrapCalls++;throw 42}})").unwrap();
-        let ForInStep::Keys { object, resume } =
-            ForInStep::start(&runtime, context.realm, value).unwrap()
-        else {
-            panic!("expected selected Proxy ownKeys step");
-        };
-        let id = object.object_id();
-        let step = ForInStep::Keys { object, resume }
-            .advance_without_callback(&runtime)
-            .unwrap();
-        let ForInStep::Keys { object, .. } = step else {
-            panic!("Proxy step must remain selected for budgeted dispatch");
-        };
-        assert_eq!(object.object_id(), id);
-        assert!(matches!(
-            context.eval("forInTrapCalls").unwrap(),
-            Value::Int(0)
-        ));
-    }
-
-    #[test]
-    fn for_in_proxy_snapshots_and_double_prototype_probe_are_owned_without_replay() {
-        for source in [
-            "(function(){var baseProto=0,protoKeys=0;var proto=new Proxy({b:2},{ownKeys(t){protoKeys++;return Reflect.ownKeys(t)},getOwnPropertyDescriptor(t,k){return Reflect.getOwnPropertyDescriptor(t,k)},getPrototypeOf(){return null}});var base=new Proxy({a:1},{ownKeys(t){return Reflect.ownKeys(t)},getOwnPropertyDescriptor(t,k){return Reflect.getOwnPropertyDescriptor(t,k)},getPrototypeOf(){baseProto++;return proto}});return function(){var names='';for(var key in base)names+=key;return names==='ab'&&baseProto===2&&protoKeys===2?42:0}})()",
-            "(function(){var n=0;var base=new Proxy({a:1},{ownKeys(){return ['a']},getOwnPropertyDescriptor(){n++;return {value:1,writable:true,enumerable:n===1,configurable:true}},getPrototypeOf(){return null}});return function(){var names='';for(var key in base)names+=key;return names==='a'&&n===2?42:0}})()",
-            "(function(){var marker={},calls=0,base=new Proxy({}, {ownKeys(){calls++;throw marker}});return function(){try{for(var key in base){}}catch(e){return calls===1&&e===marker?42:0}return 0}})()",
-            "(function(){var marker={},calls=0,proto=new Proxy({p:2},{ownKeys(){calls++;throw marker}}),base=Object.create(proto);base.a=1;return function(){try{for(var key in base){}}catch(e){return calls===1&&e===marker?42:0}return 0}})()",
-            "(function(){var base=[1,2],proto={p:3};Object.setPrototypeOf(base,proto);return function(){var names='';for(var key in base){names+=key;if(key==='0')delete base[1]}return names==='0p'?42:0}})()",
-        ] {
-            let runtime = Runtime::new();
-            let mut context = runtime.new_context();
-            let callable = runtime
-                .callable_from_value(context.eval(source).unwrap())
-                .unwrap();
-            let profile = CostProfile::start();
-            let result = runtime
-                .call_internal(context.realm, &callable, Value::Undefined, &[])
-                .unwrap();
-            let _costs = profile.snapshot();
-            assert!(
-                matches!(result, Completion::Return(Value::Int(42))),
-                "{source}: {result:?}"
-            );
-            assert!(runtime.0.state.borrow().active_frames.is_empty());
-        }
-    }
-}
-
-// S11 all-domain protocol bound; inline completion stays allocation-free.
-const _: () = assert!(std::mem::size_of::<ForInStep>() <= 64);

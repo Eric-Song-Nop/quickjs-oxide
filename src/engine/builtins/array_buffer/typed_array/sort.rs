@@ -22,13 +22,15 @@ use crate::engine::{
     builtins::native::TypedArrayElementKind,
     heap::ContextId,
     object::{CallableRef, ObjectRef},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
     },
 };
 
+#[cfg(test)]
+use crate::engine::value::Value;
 #[cfg(test)]
 mod tests;
 
@@ -392,11 +394,11 @@ pub(crate) enum TypedSortStep {
     Complete(Completion),
     Call {
         callable: CallableRef,
-        arguments: Vec<Value>,
+        arguments: Vec<JsValue>,
         resume: TypedSortResume,
     },
     Number {
-        value: Value,
+        value: JsValue,
         resume: TypedSortResume,
     },
 }
@@ -453,9 +455,11 @@ impl TypedSortStep {
                 "TypedArray sort requires generic invocation",
             ));
         };
-        let source = match runtime.require_typed_array(realm, this_value.clone())? {
+        let source = match runtime.require_typed_array_jsvalue(realm, this_value)? {
             NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
+            NativeConversion::Throw(value) => {
+                return Ok(Self::Complete(Completion::Throw(value)));
+            }
         };
         let (target, length, comparator) = if copying {
             let source_state = runtime.typed_array_state(&source)?;
@@ -488,11 +492,15 @@ impl TypedSortStep {
             (source, length, comparator)
         };
         if length < 2 {
-            return Ok(Self::Complete(Completion::Return(Value::Object(target))));
+            return Ok(Self::Complete(Completion::Return(JsValue::Object(
+                target.into_handle(),
+            ))));
         }
         let Some(comparator) = comparator else {
             runtime.sort_typed_array_words_default(&target, length)?;
-            return Ok(Self::Complete(Completion::Return(Value::Object(target))));
+            return Ok(Self::Complete(Completion::Return(JsValue::Object(
+                target.into_handle(),
+            ))));
         };
         let initial = runtime.typed_array_state(&target)?;
         if initial.out_of_bounds || initial.length < length {
@@ -533,9 +541,9 @@ impl TypedSortResume {
                         &self.0.indices,
                         self.0.width,
                     )?;
-                    return Ok(TypedSortStep::Complete(Completion::Return(Value::Object(
-                        self.0.target,
-                    ))));
+                    return Ok(TypedSortStep::Complete(Completion::Return(
+                        JsValue::Object(self.0.target.into_handle()),
+                    )));
                 }
                 SortAction::Swap(left, right) => self.0.indices.swap(left, right),
                 SortAction::Compare(left, right) => {
@@ -564,7 +572,10 @@ impl TypedSortResume {
                     self.0.phase = TypedSortPhase::Call;
                     return Ok(TypedSortStep::Call {
                         callable: self.0.comparator.clone(),
-                        arguments: vec![left_value, right_value],
+                        arguments: vec![
+                            runtime.into_jsvalue(left_value)?,
+                            runtime.into_jsvalue(right_value)?,
+                        ],
                         resume: self,
                     });
                 }
@@ -587,7 +598,7 @@ impl TypedSortResume {
                 return Ok(TypedSortStep::Complete(Completion::Throw(value)));
             }
         };
-        if let Value::Int(value) = value {
+        if let JsValue::Int(value) = value {
             return self.compared(runtime, f64::from(value));
         }
         self.0.phase = TypedSortPhase::Number;
@@ -639,10 +650,10 @@ pub(crate) fn finish(
                 resume,
             } => resume.resume(
                 runtime,
-                runtime.call_internal(realm, &callable, Value::Undefined, &arguments)?,
+                runtime.call_internal_jsvalue(realm, &callable, JsValue::Undefined, arguments)?,
             )?,
             TypedSortStep::Number { value, resume } => {
-                resume.number(runtime, runtime.native_to_number(realm, &value)?)?
+                resume.number(runtime, runtime.native_to_number_jsvalue(realm, value)?)?
             }
         };
     }

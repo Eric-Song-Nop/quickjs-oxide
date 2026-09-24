@@ -13,11 +13,22 @@ use crate::engine::builtins::native::NativeFunctionId;
 
 use crate::engine::heap::{ContextId, InternalCallableData, ObjectData, ObjectPayload};
 use crate::engine::object::{DescriptorField, ObjectRef, OrdinaryPropertyDescriptor};
-use crate::engine::value::Value;
 use crate::engine::value::conversion::NativeConversion;
+use crate::engine::value::{JsValue, Value};
 use crate::engine::vm::Completion;
 
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
+
+fn runtime_value_at<'a>(
+    arguments: &'a NativeArguments,
+    index: usize,
+    message: &'static str,
+) -> Result<&'a JsValue, RuntimeError> {
+    arguments
+        .readable
+        .get(index)
+        .ok_or(RuntimeError::Invariant(message))
+}
 
 impl Runtime {
     /// Publish `%Proxy%` with QuickJS's exact initial own-property surface.
@@ -61,14 +72,15 @@ impl Runtime {
     /// QuickJS uses a null physical prototype for `JS_CLASS_PROXY`; every
     /// observable prototype operation is therefore handled by the exotic
     /// internal-method dispatcher rather than this shape.
+    #[cfg(test)]
     pub(crate) fn new_proxy(
         &self,
         realm: ContextId,
         target: Value,
         handler: Value,
     ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
-        let (Value::Object(target), Value::Object(handler)) = (target, handler) else {
-            return Ok(NativeConversion::Throw(self.new_native_error(
+        let (Value::Object(target), Value::Object(handler)) = (&target, &handler) else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
                 realm,
                 NativeErrorKind::Type,
                 "not an object",
@@ -77,10 +89,30 @@ impl Runtime {
         if !target.belongs_to(self) || !handler.belongs_to(self) {
             return Err(RuntimeError::WrongRuntime("Proxy target or handler"));
         }
+        self.new_proxy_jsvalue(
+            realm,
+            &JsValue::Object(target.object_id()),
+            &JsValue::Object(handler.object_id()),
+        )
+    }
+
+    fn new_proxy_jsvalue(
+        &self,
+        realm: ContextId,
+        target: &JsValue,
+        handler: &JsValue,
+    ) -> Result<NativeConversion<ObjectRef>, RuntimeError> {
+        let (JsValue::Object(target), JsValue::Object(handler)) = (target, handler) else {
+            return Ok(NativeConversion::Throw(self.new_native_error_jsvalue(
+                realm,
+                NativeErrorKind::Type,
+                "not an object",
+            )?));
+        };
 
         let (is_callable, is_constructor) = {
             let state = self.0.state.borrow();
-            let target_data = state.heap.object(target.object_id())?;
+            let target_data = state.heap.object(*target)?;
             let is_callable = matches!(
                 &target_data.payload,
                 ObjectPayload::NativeFunction { .. }
@@ -99,8 +131,8 @@ impl Runtime {
         let object = match state.heap.allocate_object(ObjectData::proxy(
             shape,
             Vec::new(),
-            target.object_id(),
-            handler.object_id(),
+            *target,
+            *handler,
             is_callable,
             is_constructor,
         )) {
@@ -128,23 +160,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Construct { .. } = invocation else {
+        let NativeInvocation::Construct { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Proxy constructor did not receive a constructor invocation",
             ));
         };
-        let target = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant("Proxy target argv was not padded"))?;
-        let handler = arguments
-            .readable
-            .get(1)
-            .cloned()
-            .ok_or(RuntimeError::Invariant("Proxy handler argv was not padded"))?;
-        match self.new_proxy(realm, target, handler)? {
-            NativeConversion::Value(proxy) => Ok(Completion::Return(Value::Object(proxy))),
+        invocation.release(self)?;
+        let target = runtime_value_at(arguments, 0, "Proxy target argv was not padded")?;
+        let handler = runtime_value_at(arguments, 1, "Proxy handler argv was not padded")?;
+        match self.new_proxy_jsvalue(realm, target, handler)? {
+            NativeConversion::Value(proxy) => {
+                Ok(Completion::Return(JsValue::Object(proxy.into_handle())))
+            }
             NativeConversion::Throw(value) => Ok(Completion::Throw(value)),
         }
     }
@@ -156,28 +184,21 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Proxy.revocable did not receive a call invocation",
             ));
         };
-        let target = arguments
-            .readable
-            .first()
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "Proxy.revocable target argv was not padded",
-            ))?;
-        let handler = arguments
-            .readable
-            .get(1)
-            .cloned()
-            .ok_or(RuntimeError::Invariant(
-                "Proxy.revocable handler argv was not padded",
-            ))?;
-        let proxy = match self.new_proxy(realm, target, handler)? {
+        invocation.release(self)?;
+        let target = runtime_value_at(arguments, 0, "Proxy.revocable target argv was not padded")?;
+        let handler =
+            runtime_value_at(arguments, 1, "Proxy.revocable handler argv was not padded")?;
+        let proxy = match self.new_proxy_jsvalue(realm, target, handler)? {
             NativeConversion::Value(proxy) => proxy,
-            NativeConversion::Throw(value) => return Ok(Completion::Throw(value)),
+            NativeConversion::Throw(value) => {
+                return Ok(Completion::Throw(value));
+            }
         };
         let revoke = self.new_internal_promise_function(
             realm,
@@ -213,7 +234,7 @@ impl Runtime {
                 ));
             }
         }
-        Ok(Completion::Return(Value::Object(result)))
+        Ok(Completion::Return(JsValue::Object(result.into_handle())))
     }
 
     /// Consume a revocation closure's capture exactly once.
@@ -221,15 +242,17 @@ impl Runtime {
         &self,
         invocation: NativeInvocation,
     ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Call { .. } = invocation else {
+        let NativeInvocation::Call { .. } = &invocation else {
+            let _ = invocation.release(self);
             return Err(RuntimeError::Invariant(
                 "Proxy revoke function did not receive a call invocation",
             ));
         };
+        invocation.release(self)?;
         let active = self.active_function()?;
         let mut state = self.0.state.borrow_mut();
         let (_, cleanup) = state.heap.revoke_proxy_from_callable(active.object_id())?;
         state.apply_cleanup(cleanup)?;
-        Ok(Completion::Return(Value::Undefined))
+        Ok(Completion::Return(JsValue::Undefined))
     }
 }

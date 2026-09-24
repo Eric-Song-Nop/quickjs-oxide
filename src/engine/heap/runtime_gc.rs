@@ -5,7 +5,7 @@ use crate::engine::heap::runtime::RuntimeState;
 use crate::engine::heap::{GcStats, HeapCounts, WeakSymbolGcEvent};
 use crate::engine::jobs;
 #[cfg(feature = "test262-host")]
-use crate::engine::value::Value;
+use crate::engine::value::JsValue;
 #[cfg(feature = "test262-host")]
 use crate::engine::vm::Completion;
 #[cfg(feature = "test262-host")]
@@ -28,9 +28,9 @@ impl Runtime {
             heap.run_gc_with_finalization_sink(
                 |event| {
                     Ok(match event {
-                        WeakSymbolGcEvent::IsLive(atom) => atoms.is_live(atom),
-                        WeakSymbolGcEvent::Release(atom) => {
-                            if let Err(error) = atoms.release(atom) {
+                        WeakSymbolGcEvent::IsLive(index) => atoms.is_live_index(index),
+                        WeakSymbolGcEvent::Release(index) => {
+                            if let Err(error) = atoms.release_index(index) {
                                 // A detached weak value owned this atom, so this
                                 // can fail only after an ownership invariant has
                                 // already been violated. Latch the exact error but
@@ -47,9 +47,9 @@ impl Runtime {
         if let Some(error) = atom_error {
             return Err(error.into());
         }
-        let atoms = std::mem::take(&mut stats.cleanup.atoms);
+        let atom_indices = std::mem::take(&mut stats.cleanup.atoms);
         state.unlink_finalized_shapes(stats.cleanup.finalized_shape_ids.iter().copied());
-        state.release_atoms(atoms)?;
+        state.release_atom_indices(atom_indices)?;
         state.atoms.sweep_released_strings();
         Ok(stats)
     }
@@ -71,7 +71,7 @@ impl Runtime {
             ));
         };
         self.run_gc()?;
-        Ok(Completion::Return(Value::Undefined))
+        Ok(Completion::Return(JsValue::Undefined))
     }
 
     /// Runtime heap population for diagnostics and lifecycle tests.

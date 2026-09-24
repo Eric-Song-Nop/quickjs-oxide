@@ -9,8 +9,8 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     builtins::native::StringReplaceKind,
     heap::ContextId,
-    object::{PropertyKey, WellKnownSymbol},
-    value::{JsString, Value, conversion::NativeConversion},
+    object::{ObjectRef, PropertyKey, WellKnownSymbol},
+    value::{JsString, JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
@@ -37,15 +37,18 @@ impl std::ops::DerefMut for StringReplaceResume {
 }
 const _: () = assert!(std::mem::size_of::<StringReplaceResume>() <= 8);
 pub(crate) struct StringReplaceResumeState {
+    runtime: Runtime,
     step_pending: StringReplaceStepPending,
     realm: ContextId,
     selector: StringReplaceKind,
-    receiver: Value,
-    search_value: Value,
-    replace_value: Value,
+    receiver: JsValue,
+    search_value: JsValue,
+    replace_value: JsValue,
     phase: Phase,
     output: Option<ReplacementStringBuffer>,
     source: Option<JsString>,
+    source_value: JsValue,
+    search_text: JsValue,
     cursor: Option<ReplaceLoop>,
 }
 #[derive(Clone, Copy)]
@@ -60,6 +63,38 @@ enum Phase {
     Replacement,
     Callback { position: usize },
     CallbackString { position: usize },
+}
+impl Drop for StringReplaceResumeState {
+    /// Release the internal edges the pending effect still owns when the
+    /// request is abandoned. Consumption goes through `Option::take`, so a
+    /// drained field is `None` here; releases are defer-safe and nothrow.
+    fn drop(&mut self) {
+        for value in [
+            &mut self.receiver,
+            &mut self.search_value,
+            &mut self.replace_value,
+            &mut self.source_value,
+            &mut self.search_text,
+        ] {
+            let _ = self
+                .runtime
+                .release_jsvalue(std::mem::replace(value, JsValue::Undefined));
+        }
+        if let Some(read) = self.step_pending.read.take() {
+            read.release(&self.runtime);
+        }
+        if let Some(value) = self.step_pending.value.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.step_pending.receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(values) = self.step_pending.arguments.take() {
+            for value in values {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+    }
 }
 struct ReplaceLoop {
     output: ReplacementStringBuffer,
@@ -79,11 +114,11 @@ enum StringReplaceAction {
         read: crate::engine::object::OrdinaryRead,
         key: PropertyKey,
     },
-    Primitive(Value),
+    Primitive(JsValue),
     Call {
         target: DirectCallTarget,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
     },
 }
 impl StringReplaceStep {
@@ -99,42 +134,38 @@ impl StringReplaceStep {
                 "String replace family did not receive a generic-magic invocation",
             ));
         };
-        if matches!(this_value, Value::Undefined | Value::Null) {
+        if matches!(this_value, JsValue::Undefined | JsValue::Null) {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(
+                runtime.new_native_error_jsvalue(
                     realm,
                     NativeErrorKind::Type,
                     "cannot convert to object",
                 )?,
             )));
         }
-        let search_value = arguments
-            .readable
-            .first()
-            .ok_or(RuntimeError::Invariant(
-                "String replace search argv was not padded",
-            ))?
-            .clone();
-        let replace_value = arguments
-            .readable
-            .get(1)
-            .ok_or(RuntimeError::Invariant(
-                "String replace replacement argv was not padded",
-            ))?
-            .clone();
         let mut resume = StringReplaceResumeState {
+            runtime: runtime.clone(),
             step_pending: StringReplaceStepPending::default(),
             realm,
             selector,
-            receiver: this_value.clone(),
-            search_value,
-            replace_value,
+            receiver: JsValue::Undefined,
+            search_value: JsValue::Undefined,
+            replace_value: JsValue::Undefined,
             phase: Phase::Method,
             output: None,
             source: None,
+            source_value: JsValue::Undefined,
+            search_text: JsValue::Undefined,
             cursor: None,
         };
-        let action = if matches!(resume.search_value, Value::Object(_)) {
+        resume.receiver = runtime.dup_jsvalue(this_value)?;
+        resume.search_value = runtime.dup_jsvalue(arguments.readable.first().ok_or(
+            RuntimeError::Invariant("String replace search argv was not padded"),
+        )?)?;
+        resume.replace_value = runtime.dup_jsvalue(arguments.readable.get(1).ok_or(
+            RuntimeError::Invariant("String replace replacement argv was not padded"),
+        )?)?;
+        let action = if matches!(resume.search_value, JsValue::Object(_)) {
             if matches!(selector, StringReplaceKind::ReplaceAll) {
                 resume.phase = Phase::Match;
                 StringReplaceAction::Read(PropertyKey::from(
@@ -144,7 +175,7 @@ impl StringReplaceStep {
                 resume.method(runtime)?
             }
         } else {
-            resume.source()
+            resume.source()?
         };
         let action = resume.advance_local(runtime, action)?;
         if let StringReplaceAction::Complete(result) = action {
@@ -154,7 +185,7 @@ impl StringReplaceStep {
         crate::engine::api::profiling::record_owned_execution_event(
             "stringreplace_resident_allocated",
         );
-        StringReplaceResume(Box::new(resume)).publish(action)
+        StringReplaceResume(Box::new(resume)).publish(runtime, action)
     }
 }
 impl StringReplaceResume {
@@ -171,9 +202,13 @@ impl StringReplaceResume {
     ) -> Result<StringReplaceStep, RuntimeError> {
         let action = self.0.advance(runtime, completion)?;
         let action = self.0.advance_local(runtime, action)?;
-        self.publish(action)
+        self.publish(runtime, action)
     }
-    fn publish(self, action: StringReplaceAction) -> Result<StringReplaceStep, RuntimeError> {
+    fn publish(
+        self,
+        _runtime: &Runtime,
+        action: StringReplaceAction,
+    ) -> Result<StringReplaceStep, RuntimeError> {
         Ok(match action {
             StringReplaceAction::Complete(result) => StringReplaceStep::Complete(result),
             StringReplaceAction::PreparedRead { read, key } => {
@@ -195,7 +230,7 @@ impl StringReplaceResume {
 }
 impl StringReplaceResumeState {
     fn method(&mut self, runtime: &Runtime) -> Result<StringReplaceAction, RuntimeError> {
-        if !matches!(self.search_value, Value::Object(_)) {
+        if !matches!(self.search_value, JsValue::Object(_)) {
             return Err(RuntimeError::Invariant(
                 "replacement protocol lost its object",
             ));
@@ -205,11 +240,13 @@ impl StringReplaceResumeState {
             runtime.well_known_symbol(WellKnownSymbol::Replace),
         )))
     }
-    fn source(&mut self) -> StringReplaceAction {
+    fn source(&mut self) -> Result<StringReplaceAction, RuntimeError> {
         // Latch buffer allocation failure before observable fallback coercions.
         self.output = Some(ReplacementStringBuffer::new(0));
         self.phase = Phase::Source;
-        StringReplaceAction::Primitive(self.receiver.clone())
+        Ok(StringReplaceAction::Primitive(
+            self.runtime.dup_jsvalue(&self.receiver)?,
+        ))
     }
     fn advance_local(
         &mut self,
@@ -222,13 +259,15 @@ impl StringReplaceResumeState {
                     return Ok(StringReplaceAction::Complete(result));
                 }
                 StringReplaceAction::Read(key) => {
-                    let Value::Object(object) = &self.search_value else {
+                    let JsValue::Object(id) = &self.search_value else {
                         return Err(RuntimeError::Invariant("replacement read lost its object"));
                     };
-                    match runtime.prepare_ordinary_read_borrowed(
-                        object,
+                    let object = ObjectRef::from_borrowed_handle(runtime.clone(), *id)?;
+                    match runtime.prepare_ordinary_read_selected(
+                        &object,
                         &key,
                         &self.search_value,
+                        None,
                     )? {
                         crate::engine::object::OrdinaryRead::Complete(value) => {
                             #[cfg(feature = "profiling")]
@@ -237,7 +276,7 @@ impl StringReplaceResumeState {
                             );
                             self.advance(
                                 runtime,
-                                Completion::Return(value.unwrap_or(Value::Undefined)),
+                                Completion::Return(value.unwrap_or(JsValue::Undefined)),
                             )?
                         }
                         read => {
@@ -245,7 +284,7 @@ impl StringReplaceResumeState {
                         }
                     }
                 }
-                StringReplaceAction::Primitive(value) if !matches!(value, Value::Object(_)) => {
+                StringReplaceAction::Primitive(value) if !matches!(value, JsValue::Object(_)) => {
                     #[cfg(feature = "profiling")]
                     crate::engine::api::profiling::record_owned_execution_event(
                         "stringreplace_primitive_local",
@@ -272,12 +311,21 @@ impl StringReplaceResumeState {
         let realm = self.realm;
         match self.phase {
             Phase::Match => {
-                let Value::Object(object) = &self.search_value else {
+                let JsValue::Object(id) = &self.search_value else {
+                    runtime.release_jsvalue(value)?;
                     return Err(RuntimeError::Invariant(
                         "replacement regexp check lost its object",
                     ));
                 };
-                if runtime.is_regexp_from_match(object, &value)? {
+                let regexp = if matches!(value, JsValue::Undefined) {
+                    ObjectRef::from_borrowed_handle(runtime.clone(), *id)
+                        .map_err(RuntimeError::from)
+                        .and_then(|object| runtime.native_object_has_regexp_brand(&object))
+                } else {
+                    runtime.value_to_boolean_jsvalue(&value)
+                };
+                runtime.release_jsvalue(value)?;
+                if regexp? {
                     self.phase = Phase::Flags;
                     Ok(StringReplaceAction::Read(runtime.pinned_property_key(
                         crate::engine::atom::pinned::PinnedAtom::Flags,
@@ -287,9 +335,9 @@ impl StringReplaceResumeState {
                 }
             }
             Phase::Flags => {
-                if matches!(value, Value::Undefined | Value::Null) {
+                if matches!(value, JsValue::Undefined | JsValue::Null) {
                     return Ok(StringReplaceAction::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             realm,
                             NativeErrorKind::Type,
                             "cannot convert to object",
@@ -308,7 +356,7 @@ impl StringReplaceResumeState {
                 };
                 if !flags.utf16_units().any(|unit| unit == u16::from(b'g')) {
                     return Ok(StringReplaceAction::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             realm,
                             NativeErrorKind::Type,
                             "regexp must have the 'g' flag",
@@ -318,57 +366,92 @@ impl StringReplaceResumeState {
                 self.method(runtime)
             }
             Phase::Method => {
-                if matches!(value, Value::Undefined | Value::Null) {
-                    return Ok(self.source());
+                if matches!(value, JsValue::Undefined | JsValue::Null) {
+                    return self.source();
                 }
                 let callable = match value {
-                    Value::Object(object) => runtime.as_callable(&object)?,
-                    _ => None,
+                    JsValue::Object(id) => {
+                        runtime.as_callable(&ObjectRef::from_owned_handle(runtime.clone(), id))?
+                    }
+                    value => {
+                        runtime.release_jsvalue(value)?;
+                        None
+                    }
                 };
                 let Some(callable) = callable else {
                     return Ok(StringReplaceAction::Complete(Completion::Throw(
-                        runtime.new_native_error(realm, NativeErrorKind::Type, "not a function")?,
+                        runtime.new_native_error_jsvalue(
+                            realm,
+                            NativeErrorKind::Type,
+                            "not a function",
+                        )?,
                     )));
                 };
                 let mut arguments = Vec::new();
                 if arguments.try_reserve_exact(2).is_err() {
                     return Ok(StringReplaceAction::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             realm,
                             NativeErrorKind::Internal,
                             "out of memory",
                         )?,
                     )));
                 }
-                arguments.push(self.receiver.clone());
-                arguments.push(self.replace_value.clone());
+                self.step_pending.arguments = Some(arguments);
+                self.step_pending
+                    .arguments
+                    .as_mut()
+                    .expect("protocol arguments")
+                    .push(runtime.dup_jsvalue(&self.receiver)?);
+                self.step_pending
+                    .arguments
+                    .as_mut()
+                    .expect("protocol arguments")
+                    .push(runtime.dup_jsvalue(&self.replace_value)?);
+                let receiver = runtime.dup_jsvalue(&self.search_value)?;
+                let arguments = self
+                    .step_pending
+                    .arguments
+                    .take()
+                    .expect("protocol arguments");
                 self.phase = Phase::ProtocolResult;
                 Ok(StringReplaceAction::Call {
                     target: DirectCallTarget::Callable(callable),
-                    receiver: self.search_value.clone(),
+                    receiver,
                     arguments,
                 })
             }
             Phase::ProtocolResult => Ok(StringReplaceAction::Complete(Completion::Return(value))),
             Phase::Source => {
-                self.source = Some(match primitive_string(runtime, realm, value)? {
-                    NativeConversion::Value(value) => value,
+                self.source = Some(match primitive_string_owned(runtime, realm, value)? {
+                    NativeConversion::Value((text, handle)) => {
+                        runtime
+                            .release_jsvalue(std::mem::replace(&mut self.source_value, handle))?;
+                        text
+                    }
                     NativeConversion::Throw(value) => {
                         return Ok(StringReplaceAction::Complete(Completion::Throw(value)));
                     }
                 });
                 self.phase = Phase::Search;
-                Ok(StringReplaceAction::Primitive(self.search_value.clone()))
+                Ok(StringReplaceAction::Primitive(
+                    runtime.dup_jsvalue(&self.search_value)?,
+                ))
             }
             Phase::Search => {
-                let search = match primitive_string(runtime, realm, value)? {
-                    NativeConversion::Value(value) => value,
+                let search = match primitive_string_owned(runtime, realm, value)? {
+                    NativeConversion::Value((text, handle)) => {
+                        runtime
+                            .release_jsvalue(std::mem::replace(&mut self.search_text, handle))?;
+                        text
+                    }
                     NativeConversion::Throw(value) => {
                         return Ok(StringReplaceAction::Complete(Completion::Throw(value)));
                     }
                 };
                 let functional = match &self.replace_value {
-                    Value::Object(object) => runtime.as_callable(object)?,
+                    JsValue::Object(id) => runtime
+                        .as_callable(&ObjectRef::from_borrowed_handle(runtime.clone(), *id)?)?,
                     _ => None,
                 };
                 self.cursor = Some(ReplaceLoop {
@@ -392,7 +475,9 @@ impl StringReplaceResumeState {
                     .is_some_and(|state| state.functional.is_none())
                 {
                     self.phase = Phase::Replacement;
-                    Ok(StringReplaceAction::Primitive(self.replace_value.clone()))
+                    Ok(StringReplaceAction::Primitive(
+                        runtime.dup_jsvalue(&self.replace_value)?,
+                    ))
                 } else {
                     self.next(runtime)
                 }
@@ -474,12 +559,11 @@ impl StringReplaceResumeState {
             };
             let Some(position) = position else {
                 if state.first {
-                    let state = self
-                        .cursor
+                    self.cursor
                         .take()
                         .ok_or(RuntimeError::Invariant("replacement cursor disappeared"))?;
                     return Ok(StringReplaceAction::Complete(Completion::Return(
-                        Value::String(state.source),
+                        std::mem::replace(&mut self.source_value, JsValue::Undefined),
                     )));
                 }
                 return self.finish_buffer(runtime);
@@ -488,26 +572,44 @@ impl StringReplaceResumeState {
                 .output
                 .append_range(&state.source, state.end, position);
             if let Some(callable) = &state.functional {
-                let position_value = Value::Int(i32::try_from(position).map_err(|_| {
+                let position_value = JsValue::Int(i32::try_from(position).map_err(|_| {
                     RuntimeError::Invariant("String replace position exceeded signed range")
                 })?);
                 let mut arguments = Vec::new();
                 if arguments.try_reserve_exact(3).is_err() {
                     return Ok(StringReplaceAction::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.realm,
                             NativeErrorKind::Internal,
                             "out of memory",
                         )?,
                     )));
                 }
-                arguments.push(Value::String(state.search.clone()));
-                arguments.push(position_value);
-                arguments.push(Value::String(state.source.clone()));
+                self.step_pending.arguments = Some(arguments);
+                self.step_pending
+                    .arguments
+                    .as_mut()
+                    .expect("replacement arguments")
+                    .push(runtime.dup_jsvalue(&self.search_text)?);
+                self.step_pending
+                    .arguments
+                    .as_mut()
+                    .expect("replacement arguments")
+                    .push(position_value);
+                self.step_pending
+                    .arguments
+                    .as_mut()
+                    .expect("replacement arguments")
+                    .push(runtime.dup_jsvalue(&self.source_value)?);
+                let arguments = self
+                    .step_pending
+                    .arguments
+                    .take()
+                    .expect("replacement arguments");
                 self.phase = Phase::Callback { position };
                 return Ok(StringReplaceAction::Call {
                     target: DirectCallTarget::Callable(callable.clone()),
-                    receiver: Value::Undefined,
+                    receiver: JsValue::Undefined,
                     arguments,
                 });
             }
@@ -542,7 +644,9 @@ impl StringReplaceResumeState {
                         }
                     };
                 }
-                Err(value) => return Ok(StringReplaceAction::Complete(Completion::Throw(value))),
+                Err(value) => {
+                    return Ok(StringReplaceAction::Complete(Completion::Throw(value)));
+                }
             }
             state.end = position + state.search.len();
             state.first = false;
@@ -561,7 +665,9 @@ impl StringReplaceResumeState {
             .append_range(&state.source, state.end, state.source.len());
         Ok(StringReplaceAction::Complete(
             match runtime.finish_replacement_buffer(self.realm, state.output)? {
-                NativeConversion::Value(value) => Completion::Return(Value::String(value)),
+                NativeConversion::Value(value) => {
+                    Completion::Return(runtime.into_jsvalue(Value::String(value))?)
+                }
                 NativeConversion::Throw(value) => Completion::Throw(value),
             },
         ))
@@ -570,14 +676,36 @@ impl StringReplaceResumeState {
 fn primitive_string(
     runtime: &Runtime,
     realm: ContextId,
-    value: Value,
+    value: JsValue,
 ) -> Result<NativeConversion<JsString>, RuntimeError> {
-    if matches!(value, Value::Object(_)) {
-        return Err(RuntimeError::Invariant(
-            "String replacement conversion received an object",
-        ));
+    let result = runtime.string_from_primitive_jsvalue(realm, &value);
+    runtime.release_jsvalue(value)?;
+    result
+}
+fn primitive_string_owned(
+    runtime: &Runtime,
+    realm: ContextId,
+    value: JsValue,
+) -> Result<NativeConversion<(JsString, JsValue)>, RuntimeError> {
+    let converted = runtime.string_from_primitive_jsvalue(realm, &value);
+    match converted {
+        Ok(NativeConversion::Value(text)) => {
+            if matches!(value, JsValue::String(_)) {
+                return Ok(NativeConversion::Value((text, value)));
+            }
+            runtime.release_jsvalue(value)?;
+            let handle = runtime.into_jsvalue(Value::String(text.clone()))?;
+            Ok(NativeConversion::Value((text, handle)))
+        }
+        Ok(NativeConversion::Throw(error)) => {
+            runtime.release_jsvalue(value)?;
+            Ok(NativeConversion::Throw(error))
+        }
+        Err(error) => {
+            runtime.release_jsvalue(value)?;
+            Err(error)
+        }
     }
-    runtime.native_to_js_string(realm, &value)
 }
 impl Runtime {
     pub(crate) fn call_string_prototype_replace(
@@ -587,52 +715,59 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        let mut step = StringReplaceStep::start(self, realm, selector, &invocation, arguments)?;
-        loop {
-            step = match step {
-                StringReplaceStep::Complete(result) => return Ok(result),
-                StringReplaceStep::PreparedRead { mut resume } => {
-                    let read = resume.take_preparedread_read();
-                    let key = resume.take_preparedread_key();
-                    {
-                        let result = match self.finish_prepared_read(realm, &key, read)? {
-                            NativeConversion::Value(value) => {
-                                Completion::Return(value.unwrap_or(Value::Undefined))
-                            }
-                            NativeConversion::Throw(value) => Completion::Throw(value),
-                        };
-                        resume.resume(self, result)?
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            let mut step = StringReplaceStep::start(self, realm, selector, invocation, arguments)?;
+            loop {
+                step = match step {
+                    StringReplaceStep::Complete(result) => return Ok(result),
+                    StringReplaceStep::PreparedRead { mut resume } => {
+                        let read = resume.take_preparedread_read();
+                        let key = resume.take_preparedread_key();
+                        {
+                            let result =
+                                match self.finish_prepared_read_jsvalue(realm, &key, read)? {
+                                    NativeConversion::Value(value) => {
+                                        Completion::Return(value.unwrap_or(JsValue::Undefined))
+                                    }
+                                    NativeConversion::Throw(value) => Completion::Throw(value),
+                                };
+                            resume.resume(self, result)?
+                        }
                     }
-                }
-                StringReplaceStep::Primitive { mut resume } => {
-                    let value = resume.take_primitive_value();
-                    {
-                        let result = if matches!(value, Value::Object(_)) {
-                            self.to_primitive(realm, value, ToPrimitiveHint::String)?
-                        } else {
-                            Completion::Return(value)
-                        };
-                        resume.resume(self, result)?
+                    StringReplaceStep::Primitive { mut resume } => {
+                        let value = resume.take_primitive_value();
+                        {
+                            let result = if matches!(value, JsValue::Object(_)) {
+                                self.to_primitive_jsvalue(realm, value, ToPrimitiveHint::String)?
+                            } else {
+                                Completion::Return(value)
+                            };
+                            resume.resume(self, result)?
+                        }
                     }
-                }
-                StringReplaceStep::Call { mut resume } => {
-                    let target = resume.take_call_target();
-                    let receiver = resume.take_call_receiver();
-                    let arguments = resume.take_call_arguments();
-                    {
-                        let DirectCallTarget::Callable(callable) = target else {
-                            return Err(RuntimeError::Invariant(
-                                "String replacement requested an invalid call target",
-                            ));
-                        };
-                        resume.resume(
-                            self,
-                            self.call_internal(realm, &callable, receiver, &arguments)?,
-                        )?
+                    StringReplaceStep::Call { mut resume } => {
+                        let target = resume.take_call_target();
+                        let receiver = resume.take_call_receiver();
+                        let arguments = resume.take_call_arguments();
+                        {
+                            let DirectCallTarget::Callable(callable) = target else {
+                                self.release_jsvalue(receiver)?;
+                                for value in arguments {
+                                    self.release_jsvalue(value)?;
+                                }
+                                return Err(RuntimeError::Invariant(
+                                    "String replacement requested an invalid call target",
+                                ));
+                            };
+                            resume.resume(
+                                self,
+                                self.call_internal_jsvalue(realm, &callable, receiver, arguments)?,
+                            )?
+                        }
                     }
-                }
-            };
-        }
+                };
+            }
+        })
     }
 }
 
@@ -645,13 +780,19 @@ mod tests {
         let runtime = Runtime::new();
         let context = runtime.new_context();
         let invocation = NativeInvocation::Call {
-            this_value: Value::String(JsString::from_static("aba")),
+            this_value: runtime
+                .into_jsvalue(Value::String(JsString::from_static("aba")))
+                .unwrap(),
         };
         let arguments = NativeArguments {
             actual_arg_count: 2,
             readable: vec![
-                Value::String(JsString::from_static("a")),
-                Value::String(JsString::from_static("$&x")),
+                runtime
+                    .into_jsvalue(Value::String(JsString::from_static("a")))
+                    .unwrap(),
+                runtime
+                    .into_jsvalue(Value::String(JsString::from_static("$&x")))
+                    .unwrap(),
             ],
         };
         let profile = crate::engine::api::profiling::CostProfile::start();
@@ -665,7 +806,10 @@ mod tests {
         .unwrap() else {
             panic!("primitive replace must complete locally")
         };
-        assert_eq!(value, Value::String(JsString::from_static("axbax")));
+        assert_eq!(
+            runtime.root_and_release_jsvalue(value).unwrap(),
+            Value::String(JsString::from_static("axbax"))
+        );
         assert_eq!(
             profile
                 .snapshot()
@@ -675,6 +819,10 @@ mod tests {
                 .unwrap_or(0),
             0
         );
+        invocation.release(&runtime).unwrap();
+        for value in arguments.readable {
+            runtime.release_jsvalue(value).unwrap();
+        }
     }
 
     #[test]
@@ -690,11 +838,16 @@ mod tests {
         };
         let callback_id = function.object_id();
         let invocation = NativeInvocation::Call {
-            this_value: Value::Object(receiver),
+            this_value: runtime.into_jsvalue(Value::Object(receiver)).unwrap(),
         };
         let arguments = NativeArguments {
             actual_arg_count: 2,
-            readable: vec![Value::String(JsString::from_static("a")), callback],
+            readable: vec![
+                runtime
+                    .into_jsvalue(Value::String(JsString::from_static("a")))
+                    .unwrap(),
+                runtime.into_jsvalue(callback).unwrap(),
+            ],
         };
         let StringReplaceStep::Primitive { mut resume } = StringReplaceStep::start(
             &runtime,
@@ -706,24 +859,41 @@ mod tests {
         .unwrap() else {
             panic!("expected source conversion")
         };
-        drop(resume.take_primitive_value());
+        runtime
+            .release_jsvalue(resume.take_primitive_value())
+            .unwrap();
         let address = (&*resume.0) as *const StringReplaceResumeState;
-        drop(invocation);
-        drop(arguments);
+        {
+            let NativeInvocation::Call { this_value } = invocation else {
+                unreachable!()
+            };
+            runtime.release_jsvalue(this_value).unwrap();
+            for value in arguments.readable {
+                runtime.release_jsvalue(value).unwrap();
+            }
+        }
         // Source is a real Object conversion wait. Its primitive reply now
         // advances search conversion locally to the actual replacer callback.
         let StringReplaceStep::Call { mut resume } = resume
             .resume(
                 &runtime,
-                Completion::Return(Value::String(JsString::from_static("aa"))),
+                Completion::Return(
+                    runtime
+                        .into_jsvalue(Value::String(JsString::from_static("aa")))
+                        .unwrap(),
+                ),
             )
             .unwrap()
         else {
             panic!("expected replacer call")
         };
         drop(resume.take_call_target());
-        drop(resume.take_call_receiver());
-        drop(resume.take_call_arguments());
+        runtime
+            .release_jsvalue(resume.take_call_receiver())
+            .unwrap();
+        for value in resume.take_call_arguments() {
+            runtime.release_jsvalue(value).unwrap();
+        }
         assert_eq!((&*resume.0) as *const StringReplaceResumeState, address);
         runtime.run_gc().unwrap();
         for id in [receiver_id, callback_id] {
@@ -775,10 +945,10 @@ mod local_replace_tests {
 pub(crate) struct StringReplaceStepPending {
     read: Option<crate::engine::object::OrdinaryRead>,
     key: Option<PropertyKey>,
-    value: Option<Value>,
+    value: Option<JsValue>,
     target: Option<DirectCallTarget>,
-    receiver: Option<Value>,
-    arguments: Option<Vec<Value>>,
+    receiver: Option<JsValue>,
+    arguments: Option<Vec<JsValue>>,
 }
 impl StringReplaceStep {
     pub(crate) fn make_preparedread(
@@ -790,14 +960,14 @@ impl StringReplaceStep {
         resume.0.step_pending.key = Some(key);
         Self::PreparedRead { resume }
     }
-    pub(crate) fn make_primitive(value: Value, mut resume: StringReplaceResume) -> Self {
+    pub(crate) fn make_primitive(value: JsValue, mut resume: StringReplaceResume) -> Self {
         resume.0.step_pending.value = Some(value);
         Self::Primitive { resume }
     }
     pub(crate) fn make_call(
         target: DirectCallTarget,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: StringReplaceResume,
     ) -> Self {
         resume.0.step_pending.target = Some(target);
@@ -822,7 +992,7 @@ impl StringReplaceResume {
             .expect("StringReplaceStep::PreparedRead lost key")
     }
 
-    pub(crate) fn take_primitive_value(&mut self) -> Value {
+    pub(crate) fn take_primitive_value(&mut self) -> JsValue {
         self.0
             .step_pending
             .value
@@ -837,14 +1007,14 @@ impl StringReplaceResume {
             .take()
             .expect("StringReplaceStep::Call lost target")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .step_pending
             .receiver
             .take()
             .expect("StringReplaceStep::Call lost receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .step_pending
             .arguments

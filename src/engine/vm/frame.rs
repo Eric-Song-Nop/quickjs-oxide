@@ -9,7 +9,7 @@ use crate::engine::api::error::Error;
 use crate::engine::code::runtime::PublishedFunctionSnapshot;
 use crate::engine::heap::ContextId;
 use crate::engine::object::ObjectRef;
-use crate::engine::value::Value;
+use crate::engine::value::JsValue;
 use crate::engine::vm::CallInput;
 use crate::engine::vm::frames::{ActiveFrameGuard, ActiveFrameToken};
 use crate::engine::vm::stack::FrameStorage;
@@ -59,19 +59,19 @@ pub(super) enum OperationTarget {
 }
 
 pub(super) enum ConstructorReturn {
-    Base(crate::engine::value::Value),
+    Base(JsValue),
     Derived,
 }
 
 #[derive(Default)]
 pub(super) struct FrameRare {
     pub property_keys: std::collections::HashMap<u32, crate::engine::object::PropertyKey>,
-    pub normalized_this: Option<Value>,
+    pub normalized_this: Option<JsValue>,
     property_wait: Option<Box<super::proxy_get_driver::PendingProxyGet>>,
     pub iterator_wait: Option<crate::engine::vm::iterator_driver::PendingIterator>,
-    pub resume_throw: Option<Value>,
+    pub resume_throw: Option<JsValue>,
     pub regions: Vec<crate::engine::vm::VmUnwindRegion>,
-    pub eval_arguments: Option<Vec<crate::engine::value::Value>>,
+    pub eval_arguments: Option<Vec<crate::engine::value::JsValue>>,
     pub constructor_return: Option<ConstructorReturn>,
     pub conversion: Option<crate::engine::vm::conversion_driver::ConversionWait>,
 }
@@ -365,7 +365,58 @@ impl Drop for FrameStore {
     }
 }
 
+impl Drop for FrameCold {
+    fn drop(&mut self) {
+        self.release_normalized_this();
+        self.release_eval_arguments();
+        self.release_resume_throw();
+        self.release_constructor_return();
+    }
+}
+
 impl FrameCold {
+    pub(super) fn release_resume_throw(&mut self) {
+        if let Some(value) = self
+            .rare
+            .get_mut()
+            .and_then(|rare| rare.resume_throw.take())
+        {
+            let _ = self.function.runtime().release_jsvalue(value);
+        }
+    }
+
+    pub(super) fn release_constructor_return(&mut self) {
+        if let Some(ConstructorReturn::Base(value)) = self
+            .rare
+            .get_mut()
+            .and_then(|rare| rare.constructor_return.take())
+        {
+            let _ = self.function.runtime().release_jsvalue(value);
+        }
+    }
+
+    pub(super) fn release_eval_arguments(&mut self) {
+        if let Some(values) = self
+            .rare
+            .get_mut()
+            .and_then(|rare| rare.eval_arguments.take())
+        {
+            for value in values {
+                let _ = self.function.runtime().release_jsvalue(value);
+            }
+        }
+    }
+
+    pub(super) fn release_normalized_this(&mut self) {
+        if let Some(value) = self
+            .rare
+            .get_mut()
+            .and_then(|rare| rare.normalized_this.take())
+        {
+            let _ = self.function.runtime().release_jsvalue(value);
+        }
+    }
+
     pub(super) fn has_pending_query(&self) -> bool {
         self.rare
             .get()
@@ -418,7 +469,7 @@ impl std::ops::DerefMut for FrameCold {
 mod tests {
     use super::*;
     use crate::engine::api::Runtime;
-    use crate::engine::value::Value;
+    use crate::engine::value::JsValue;
     use crate::engine::vm::stack::{FrameStorage, SlotStore};
 
     fn assert_wait_depth_matches_scan(frames: &FrameStore) {
@@ -546,13 +597,17 @@ mod tests {
         let (mut first, mut first_slots) = frame(&runtime, context.realm);
         first.cold.reusable_captured_locals = vec![true; 23];
         let address = &*first.cold as *const FrameBody;
-        first_slots.clear_frame(first.window.take()).unwrap();
+        first_slots
+            .clear_frame(&runtime, first.window.take())
+            .unwrap();
         cache.recycle(first.cold);
         let (flags, grown) = cache.capture_flags(23).unwrap();
         assert_eq!(grown, 0);
         assert_eq!(flags, vec![false; 23]);
         let (mut second, mut second_slots) = frame(&runtime, context.realm);
-        second_slots.clear_frame(second.window.take()).unwrap();
+        second_slots
+            .clear_frame(&runtime, second.window.take())
+            .unwrap();
         let mut contents = second.cold.into_inner();
         contents.reusable_captured_locals = flags;
         let (cold, allocated) = cache.install(contents);
@@ -569,6 +624,7 @@ mod tests {
         let mut slots = SlotStore::new(0);
         let window = slots
             .push_frame(
+                runtime,
                 &executable.frame_layout(),
                 FrameStorage {
                     original_arguments: Vec::new(),
@@ -583,11 +639,12 @@ mod tests {
             rare: std::cell::OnceCell::new(),
             return_to: None,
             entry_guard: None,
-            input: (CallInput {
-                this_value: Value::Undefined,
-                new_target: Value::Undefined,
-                callee_global: Some(function.clone()),
-            })
+            input: (CallInput::new(
+                runtime,
+                JsValue::Undefined,
+                JsValue::Undefined,
+                Some(function.clone()),
+            ))
             .into(),
             function: (function).into(),
             closure_slots: Default::default(),
@@ -706,11 +763,13 @@ mod tests {
             }
             let mut child = entry(&runtime, context.realm);
             let child_object = child.cold.function.object_id();
-            child.storage.original_arguments.push(Value::Int(42));
+            child.storage.original_arguments.push(JsValue::Int(42));
             child
                 .storage
                 .parameters
-                .push(super::super::bindings::FrameBinding::Direct(Value::Int(42)));
+                .push(super::super::bindings::FrameBinding::Direct(JsValue::Int(
+                    42,
+                )));
             let error = push_frame(&mut execution, child).unwrap_err();
             assert!(error.to_string().contains(if exhausted_identity {
                 "identity exhausted"
@@ -728,7 +787,10 @@ mod tests {
             execution.frames.next_generation = generation;
             let replacement = push_frame(&mut execution, entry(&runtime, context.realm)).unwrap();
             let mut frame = execution.frames.pop(replacement).unwrap();
-            execution.slots.clear_frame(frame.window.take()).unwrap();
+            execution
+                .slots
+                .clear_frame(&runtime, frame.window.take())
+                .unwrap();
             let parent = execution.frames.current_mut(parent).unwrap();
             assert_eq!(
                 execution.slots.binding_counts(&parent.window).unwrap(),
@@ -792,18 +854,21 @@ mod tests {
         {
             let runtime = tracked_runtime("child", &events);
             let context = runtime.new_context();
-            let captured_runtime = tracked_runtime("child-slot", &events);
-            let capture = captured_runtime.new_object(None).unwrap();
+            // Internal frame slots hold raw handles without a runtime owner;
+            // the child frame's cold function root keeps the child runtime
+            // alive until the frame is abandoned. The slot value belongs to
+            // the abandoning execution's runtime so its release is valid.
+            let capture = parent_runtime.new_object(None).unwrap();
             let mut child = entry(&runtime, context.realm);
             child
                 .storage
                 .original_arguments
-                .push(Value::Object(capture));
+                .push(JsValue::Object(capture.into_handle()));
             child
                 .storage
                 .parameters
                 .push(super::super::bindings::FrameBinding::Direct(
-                    Value::Undefined,
+                    JsValue::Undefined,
                 ));
             push_frame(&mut execution, child).unwrap();
         }
@@ -811,6 +876,6 @@ mod tests {
         drop(parent_runtime);
         assert!(events.borrow().is_empty());
         drop(execution);
-        assert_eq!(*events.borrow(), ["child-slot", "child", "parent"]);
+        assert_eq!(*events.borrow(), ["child", "parent"]);
     }
 }

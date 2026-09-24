@@ -6,7 +6,7 @@ use super::{
 use crate::engine::api::{runtime::Runtime, runtime_error::RuntimeError};
 use crate::engine::heap::ContextId;
 use crate::engine::object::{ObjectRef, PropertyKey};
-use crate::engine::value::{Value, conversion::NativeConversion};
+use crate::engine::value::{JsValue, Value, conversion::NativeConversion};
 use crate::engine::vm::{Completion, call::DirectCallTarget};
 
 pub(crate) enum ProxyPrototypeKind {
@@ -91,13 +91,13 @@ impl ProxyPrototypeStep {
     }
 }
 fn method(
-    _runtime: &Runtime,
+    runtime: &Runtime,
     realm: ContextId,
     kind: ProxyPrototypeKind,
     step: MethodStep,
 ) -> Result<ProxyPrototypeStep, RuntimeError> {
     Ok(match step {
-        MethodStep::Throw(value) => ProxyPrototypeStep::Complete(Completion::Throw(value)),
+        MethodStep::Throw(value) => ProxyPrototypeStep::Complete(Completion::Throw(value.take())),
         MethodStep::Read { mut resume } => {
             let object = resume.take_read_object();
             let key = resume.take_read_key();
@@ -107,7 +107,7 @@ fn method(
                 key,
                 receiver,
                 ProxyPrototypeResume(Box::new(ProxyPrototypeResumeState {
-                    pending_effect: ProxyPrototypeStepPending::default(),
+                    pending_effect: ProxyPrototypeStepPending::new(runtime.clone()),
                     realm,
                     phase: Phase::Method { resume, kind },
                 })),
@@ -125,7 +125,7 @@ fn method(
                         _ => None,
                     };
                     let resume = ProxyPrototypeResume(Box::new(ProxyPrototypeResumeState {
-                        pending_effect: ProxyPrototypeStepPending::default(),
+                        pending_effect: ProxyPrototypeStepPending::new(runtime.clone()),
                         realm,
                         phase: Phase::Forward {
                             _rooted: rooted,
@@ -144,12 +144,17 @@ fn method(
                     if let ProxyPrototypeKind::Set(prototype) = &kind {
                         arguments.push(prototype.clone().map_or(Value::Null, Value::Object));
                     }
+                    let receiver = runtime.into_jsvalue(Value::Object(rooted.handler.clone()))?;
+                    let arguments = arguments
+                        .into_iter()
+                        .map(|value| runtime.into_jsvalue(value))
+                        .collect::<Result<Vec<_>, _>>()?;
                     ProxyPrototypeStep::request_call(
                         target,
-                        Value::Object(rooted.handler.clone()),
+                        receiver,
                         arguments,
                         ProxyPrototypeResume(Box::new(ProxyPrototypeResumeState {
-                            pending_effect: ProxyPrototypeStepPending::default(),
+                            pending_effect: ProxyPrototypeStepPending::new(runtime.clone()),
                             realm,
                             phase: Phase::Trap { rooted, kind },
                         })),
@@ -161,9 +166,11 @@ fn method(
 }
 fn completed(prototype: Option<ObjectRef>, setting: bool) -> ProxyPrototypeStep {
     ProxyPrototypeStep::Complete(Completion::Return(if setting {
-        Value::Bool(true)
+        JsValue::Bool(true)
     } else {
-        prototype.map_or(Value::Null, Value::Object)
+        prototype.map_or(JsValue::Null, |object| {
+            JsValue::Object(object.into_handle())
+        })
     }))
 }
 fn inconsistent(runtime: &Runtime, realm: ContextId) -> Result<ProxyPrototypeStep, RuntimeError> {
@@ -201,16 +208,23 @@ impl ProxyPrototypeResume {
                 let (prototype, setting) = match kind {
                     ProxyPrototypeKind::Get => (
                         match value {
-                            Value::Object(object) => Some(object),
-                            Value::Null => None,
-                            _ => return inconsistent(runtime, self.0.realm),
+                            JsValue::Object(object) => {
+                                Some(ObjectRef::from_owned_handle(runtime.clone(), object))
+                            }
+                            JsValue::Null => None,
+                            other => {
+                                runtime.release_jsvalue(other)?;
+                                return inconsistent(runtime, self.0.realm);
+                            }
                         },
                         false,
                     ),
                     ProxyPrototypeKind::Set(prototype) => {
-                        if !runtime.value_to_boolean(&value)? {
+                        let accepted = runtime.value_to_boolean_jsvalue(&value)?;
+                        runtime.release_jsvalue(value)?;
+                        if !accepted {
                             return Ok(ProxyPrototypeStep::Complete(Completion::Return(
-                                Value::Bool(false),
+                                JsValue::Bool(false),
                             )));
                         }
                         (prototype, true)
@@ -219,7 +233,7 @@ impl ProxyPrototypeResume {
                 Ok(ProxyPrototypeStep::request_extensible(
                     rooted.target.clone(),
                     Self(Box::new(ProxyPrototypeResumeState {
-                        pending_effect: ProxyPrototypeStepPending::default(),
+                        pending_effect: ProxyPrototypeStepPending::new(runtime.clone()),
                         realm: self.0.realm,
                         phase: Phase::Extensible {
                             rooted,
@@ -236,7 +250,7 @@ impl ProxyPrototypeResume {
     }
     pub(crate) fn boolean(
         self,
-        _runtime: &Runtime,
+        runtime: &Runtime,
         result: NativeConversion<bool>,
     ) -> Result<ProxyPrototypeStep, RuntimeError> {
         let value = match result {
@@ -250,7 +264,7 @@ impl ProxyPrototypeResume {
                 kind: ProxyPrototypeKind::Set(_),
                 ..
             } => Ok(ProxyPrototypeStep::Complete(Completion::Return(
-                Value::Bool(value),
+                JsValue::Bool(value),
             ))),
             Phase::Extensible {
                 rooted,
@@ -263,7 +277,7 @@ impl ProxyPrototypeResume {
                 Ok(ProxyPrototypeStep::request_get(
                     rooted.target.clone(),
                     Self(Box::new(ProxyPrototypeResumeState {
-                        pending_effect: ProxyPrototypeStepPending::default(),
+                        pending_effect: ProxyPrototypeStepPending::new(runtime.clone()),
                         realm: self.0.realm,
                         phase: Phase::Compare {
                             _rooted: rooted,
@@ -324,7 +338,7 @@ pub(super) fn finish(
                 let receiver = resume.take_read_receiver();
                 resume.resume(
                     runtime,
-                    runtime.internal_get(realm, &object, &key, receiver)?,
+                    runtime.internal_get_jsvalue(realm, &object, &key, receiver)?,
                 )?
             }
             ProxyPrototypeStep::Call { mut resume } => {
@@ -334,10 +348,10 @@ pub(super) fn finish(
                 {
                     let result = match target {
                         DirectCallTarget::Callable(callable) => {
-                            runtime.call_internal(realm, &callable, receiver, &arguments)?
+                            runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?
                         }
                         DirectCallTarget::NonCallableProxy(object) => {
-                            runtime.call_proxy(realm, &object, receiver, &arguments)?
+                            runtime.call_proxy_jsvalue(realm, &object, receiver, arguments)?
                         }
                     };
                     resume.resume(runtime, result)?
@@ -362,6 +376,172 @@ pub(super) fn finish(
         }
     }
 }
+
+struct ProxyPrototypeStepPending {
+    runtime: Runtime,
+    read_object: Option<ObjectRef>,
+    read_key: Option<PropertyKey>,
+    read_receiver: Option<JsValue>,
+    call_target: Option<DirectCallTarget>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
+    get_object: Option<ObjectRef>,
+    set_object: Option<ObjectRef>,
+    set_prototype: Option<Option<ObjectRef>>,
+    extensible_object: Option<ObjectRef>,
+}
+impl ProxyPrototypeStepPending {
+    fn new(runtime: Runtime) -> Self {
+        Self {
+            runtime,
+            read_object: None,
+            read_key: None,
+            read_receiver: None,
+            call_target: None,
+            call_receiver: None,
+            call_arguments: None,
+            get_object: None,
+            set_object: None,
+            set_prototype: None,
+            extensible_object: None,
+        }
+    }
+}
+impl Drop for ProxyPrototypeStepPending {
+    /// Release the internal edges still held when the request is abandoned.
+    /// Consumption goes through `Option::take`; releases are defer-safe and
+    /// nothrow, and never run JavaScript.
+    fn drop(&mut self) {
+        if let Some(value) = self.read_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.call_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(values) = self.call_arguments.take() {
+            for value in values {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+    }
+}
+impl ProxyPrototypeStep {
+    pub(crate) fn request_read(
+        object: ObjectRef,
+        key: PropertyKey,
+        receiver: JsValue,
+        mut resume: ProxyPrototypeResume,
+    ) -> Self {
+        resume.0.pending_effect.read_object = Some(object);
+        resume.0.pending_effect.read_key = Some(key);
+        resume.0.pending_effect.read_receiver = Some(receiver);
+        Self::Read { resume }
+    }
+    pub(crate) fn request_call(
+        target: DirectCallTarget,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
+        mut resume: ProxyPrototypeResume,
+    ) -> Self {
+        resume.0.pending_effect.call_target = Some(target);
+        resume.0.pending_effect.call_receiver = Some(receiver);
+        resume.0.pending_effect.call_arguments = Some(arguments);
+        Self::Call { resume }
+    }
+    pub(crate) fn request_get(object: ObjectRef, mut resume: ProxyPrototypeResume) -> Self {
+        resume.0.pending_effect.get_object = Some(object);
+        Self::Get { resume }
+    }
+    pub(crate) fn request_set(
+        object: ObjectRef,
+        prototype: Option<ObjectRef>,
+        mut resume: ProxyPrototypeResume,
+    ) -> Self {
+        resume.0.pending_effect.set_object = Some(object);
+        resume.0.pending_effect.set_prototype = Some(prototype);
+        Self::Set { resume }
+    }
+    pub(crate) fn request_extensible(object: ObjectRef, mut resume: ProxyPrototypeResume) -> Self {
+        resume.0.pending_effect.extensible_object = Some(object);
+        Self::Extensible { resume }
+    }
+}
+impl ProxyPrototypeResume {
+    pub(crate) fn take_read_object(&mut self) -> ObjectRef {
+        self.0
+            .pending_effect
+            .read_object
+            .take()
+            .expect("ProxyPrototypeStep Read object")
+    }
+    pub(crate) fn take_read_key(&mut self) -> PropertyKey {
+        self.0
+            .pending_effect
+            .read_key
+            .take()
+            .expect("ProxyPrototypeStep Read key")
+    }
+    pub(crate) fn take_read_receiver(&mut self) -> JsValue {
+        self.0
+            .pending_effect
+            .read_receiver
+            .take()
+            .expect("ProxyPrototypeStep Read receiver")
+    }
+    pub(crate) fn take_call_target(&mut self) -> DirectCallTarget {
+        self.0
+            .pending_effect
+            .call_target
+            .take()
+            .expect("ProxyPrototypeStep Call target")
+    }
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
+        self.0
+            .pending_effect
+            .call_receiver
+            .take()
+            .expect("ProxyPrototypeStep Call receiver")
+    }
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
+        self.0
+            .pending_effect
+            .call_arguments
+            .take()
+            .expect("ProxyPrototypeStep Call arguments")
+    }
+    pub(crate) fn take_get_object(&mut self) -> ObjectRef {
+        self.0
+            .pending_effect
+            .get_object
+            .take()
+            .expect("ProxyPrototypeStep Get object")
+    }
+    pub(crate) fn take_set_object(&mut self) -> ObjectRef {
+        self.0
+            .pending_effect
+            .set_object
+            .take()
+            .expect("ProxyPrototypeStep Set object")
+    }
+    pub(crate) fn take_set_prototype(&mut self) -> Option<ObjectRef> {
+        self.0
+            .pending_effect
+            .set_prototype
+            .take()
+            .expect("ProxyPrototypeStep Set prototype")
+    }
+    pub(crate) fn take_extensible_object(&mut self) -> ObjectRef {
+        self.0
+            .pending_effect
+            .extensible_object
+            .take()
+            .expect("ProxyPrototypeStep Extensible object")
+    }
+}
+const _: () = assert!(std::mem::size_of::<ProxyPrototypeStep>() <= 64);
+
+// S11 all-domain protocol bound; inline completion stays allocation-free.
+const _: () = assert!(std::mem::size_of::<ProxyPrototypeStep>() <= 64);
 
 #[cfg(test)]
 mod tests {
@@ -415,7 +595,10 @@ mod tests {
                 );
                 let resume = take_call(
                     resume
-                        .resume(&runtime, Completion::Return(callable))
+                        .resume(
+                            &runtime,
+                            Completion::Return(runtime.into_jsvalue(callable).unwrap()),
+                        )
                         .unwrap(),
                 );
                 let reply = if setting {
@@ -424,8 +607,14 @@ mod tests {
                 } else {
                     Value::Object(prototype)
                 };
-                let mut resume =
-                    take_extensible(resume.resume(&runtime, Completion::Return(reply)).unwrap());
+                let mut resume = take_extensible(
+                    resume
+                        .resume(
+                            &runtime,
+                            Completion::Return(runtime.into_jsvalue(reply).unwrap()),
+                        )
+                        .unwrap(),
+                );
                 if compare {
                     resume = take_get(
                         resume
@@ -450,134 +639,3 @@ mod tests {
         }
     }
 }
-
-#[derive(Default)]
-struct ProxyPrototypeStepPending {
-    read_object: Option<ObjectRef>,
-    read_key: Option<PropertyKey>,
-    read_receiver: Option<Value>,
-    call_target: Option<DirectCallTarget>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
-    get_object: Option<ObjectRef>,
-    set_object: Option<ObjectRef>,
-    set_prototype: Option<Option<ObjectRef>>,
-    extensible_object: Option<ObjectRef>,
-}
-impl ProxyPrototypeStep {
-    pub(crate) fn request_read(
-        object: ObjectRef,
-        key: PropertyKey,
-        receiver: Value,
-        mut resume: ProxyPrototypeResume,
-    ) -> Self {
-        resume.0.pending_effect.read_object = Some(object);
-        resume.0.pending_effect.read_key = Some(key);
-        resume.0.pending_effect.read_receiver = Some(receiver);
-        Self::Read { resume }
-    }
-    pub(crate) fn request_call(
-        target: DirectCallTarget,
-        receiver: Value,
-        arguments: Vec<Value>,
-        mut resume: ProxyPrototypeResume,
-    ) -> Self {
-        resume.0.pending_effect.call_target = Some(target);
-        resume.0.pending_effect.call_receiver = Some(receiver);
-        resume.0.pending_effect.call_arguments = Some(arguments);
-        Self::Call { resume }
-    }
-    pub(crate) fn request_get(object: ObjectRef, mut resume: ProxyPrototypeResume) -> Self {
-        resume.0.pending_effect.get_object = Some(object);
-        Self::Get { resume }
-    }
-    pub(crate) fn request_set(
-        object: ObjectRef,
-        prototype: Option<ObjectRef>,
-        mut resume: ProxyPrototypeResume,
-    ) -> Self {
-        resume.0.pending_effect.set_object = Some(object);
-        resume.0.pending_effect.set_prototype = Some(prototype);
-        Self::Set { resume }
-    }
-    pub(crate) fn request_extensible(object: ObjectRef, mut resume: ProxyPrototypeResume) -> Self {
-        resume.0.pending_effect.extensible_object = Some(object);
-        Self::Extensible { resume }
-    }
-}
-impl ProxyPrototypeResume {
-    pub(crate) fn take_read_object(&mut self) -> ObjectRef {
-        self.0
-            .pending_effect
-            .read_object
-            .take()
-            .expect("ProxyPrototypeStep Read object")
-    }
-    pub(crate) fn take_read_key(&mut self) -> PropertyKey {
-        self.0
-            .pending_effect
-            .read_key
-            .take()
-            .expect("ProxyPrototypeStep Read key")
-    }
-    pub(crate) fn take_read_receiver(&mut self) -> Value {
-        self.0
-            .pending_effect
-            .read_receiver
-            .take()
-            .expect("ProxyPrototypeStep Read receiver")
-    }
-    pub(crate) fn take_call_target(&mut self) -> DirectCallTarget {
-        self.0
-            .pending_effect
-            .call_target
-            .take()
-            .expect("ProxyPrototypeStep Call target")
-    }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
-        self.0
-            .pending_effect
-            .call_receiver
-            .take()
-            .expect("ProxyPrototypeStep Call receiver")
-    }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
-        self.0
-            .pending_effect
-            .call_arguments
-            .take()
-            .expect("ProxyPrototypeStep Call arguments")
-    }
-    pub(crate) fn take_get_object(&mut self) -> ObjectRef {
-        self.0
-            .pending_effect
-            .get_object
-            .take()
-            .expect("ProxyPrototypeStep Get object")
-    }
-    pub(crate) fn take_set_object(&mut self) -> ObjectRef {
-        self.0
-            .pending_effect
-            .set_object
-            .take()
-            .expect("ProxyPrototypeStep Set object")
-    }
-    pub(crate) fn take_set_prototype(&mut self) -> Option<ObjectRef> {
-        self.0
-            .pending_effect
-            .set_prototype
-            .take()
-            .expect("ProxyPrototypeStep Set prototype")
-    }
-    pub(crate) fn take_extensible_object(&mut self) -> ObjectRef {
-        self.0
-            .pending_effect
-            .extensible_object
-            .take()
-            .expect("ProxyPrototypeStep Extensible object")
-    }
-}
-const _: () = assert!(std::mem::size_of::<ProxyPrototypeStep>() <= 64);
-
-// S11 all-domain protocol bound; inline completion stays allocation-free.
-const _: () = assert!(std::mem::size_of::<ProxyPrototypeStep>() <= 64);

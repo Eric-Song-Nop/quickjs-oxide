@@ -3,7 +3,7 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
     object::{CallableRef, ObjectRef},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion,
         call::{NativeArguments, NativeInvocation},
@@ -28,12 +28,30 @@ impl std::ops::DerefMut for EachResume {
 }
 const _: () = assert!(std::mem::size_of::<EachResume>() <= 8);
 pub(crate) struct EachResumeState {
+    runtime: Runtime,
     pending_effect: EachStepPending,
     record: Option<ActiveCollectionRecordGuard>,
     set: ObjectRef,
     callback: CallableRef,
-    receiver: Value,
+    receiver: JsValue,
     index: usize,
+}
+impl Drop for EachResumeState {
+    /// Release the internal edges the pending effect and resident receiver
+    /// still own when the request is abandoned. Consumption goes through
+    /// `Option::take`; releases are defer-safe and nothrow.
+    fn drop(&mut self) {
+        if let Some(value) = self.pending_effect.call_receiver.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(values) = self.pending_effect.call_arguments.take() {
+            for value in values {
+                let _ = self.runtime.release_jsvalue(value);
+            }
+        }
+        let receiver = std::mem::replace(&mut self.receiver, JsValue::Undefined);
+        let _ = self.runtime.release_jsvalue(receiver);
+    }
 }
 impl EachStep {
     pub(crate) fn start(
@@ -44,29 +62,31 @@ impl EachStep {
     ) -> Result<Self, RuntimeError> {
         let set = match runtime.set_receiver(realm, invocation, false)? {
             NativeConversion::Value(set) => set,
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
+            NativeConversion::Throw(value) => {
+                return Ok(Self::Complete(Completion::Throw(value)));
+            }
         };
         let value = arguments.readable.first().ok_or(RuntimeError::Invariant(
             "Set.prototype.forEach callback argv was not padded",
         ))?;
         let callback = match value {
-            Value::Object(object) => runtime.as_callable(object)?,
+            JsValue::Object(id) => runtime.as_callable_object(*id)?,
             _ => None,
         };
         let Some(callback) = callback else {
             return Ok(Self::Complete(Completion::Throw(
-                runtime.new_native_error(realm, NativeErrorKind::Type, "not a function")?,
+                runtime.new_native_error_jsvalue(realm, NativeErrorKind::Type, "not a function")?,
             )));
         };
         EachResume(Box::new(EachResumeState {
+            runtime: runtime.clone(),
             pending_effect: EachStepPending::default(),
             set: set.clone(),
             callback,
-            receiver: arguments
-                .readable
-                .get(1)
-                .cloned()
-                .unwrap_or(Value::Undefined),
+            receiver: match arguments.readable.get(1) {
+                Some(value) => runtime.dup_jsvalue(value)?,
+                None => JsValue::Undefined,
+            },
             index: 0,
             record: None,
         }))
@@ -78,7 +98,7 @@ impl EachResume {
         let Some((record_index, value)) =
             runtime.next_live_set_record(&self.0.set, &mut self.0.index)?
         else {
-            return Ok(EachStep::Complete(Completion::Return(Value::Undefined)));
+            return Ok(EachStep::Complete(Completion::Return(JsValue::Undefined)));
         };
         self.0.record = Some(
             runtime.push_active_collection_record(ActiveCollectionRecord::Set {
@@ -88,8 +108,12 @@ impl EachResume {
         );
         Ok(EachStep::request_call(
             self.0.callback.clone(),
-            self.0.receiver.clone(),
-            vec![value.clone(), value, Value::Object(self.0.set.clone())],
+            runtime.dup_jsvalue(&self.0.receiver)?,
+            vec![
+                runtime.dup_jsvalue(&value)?,
+                value,
+                runtime.into_jsvalue(Value::Object(self.0.set.clone()))?,
+            ],
             self,
         ))
     }
@@ -103,7 +127,10 @@ impl EachResume {
         }
         match reply {
             Completion::Throw(value) => Ok(EachStep::Complete(Completion::Throw(value))),
-            Completion::Return(_) => self.next(runtime),
+            Completion::Return(value) => {
+                runtime.release_jsvalue(value)?;
+                self.next(runtime)
+            }
         }
     }
 }
@@ -121,7 +148,7 @@ pub(crate) fn finish(
                 let arguments = resume.take_call_arguments();
                 resume.resume(
                     runtime,
-                    runtime.call_internal(realm, &callable, receiver, &arguments)?,
+                    runtime.call_internal_jsvalue(realm, &callable, receiver, arguments)?,
                 )?
             }
         };
@@ -131,14 +158,14 @@ pub(crate) fn finish(
 #[derive(Default)]
 struct EachStepPending {
     call_callable: Option<CallableRef>,
-    call_receiver: Option<Value>,
-    call_arguments: Option<Vec<Value>>,
+    call_receiver: Option<JsValue>,
+    call_arguments: Option<Vec<JsValue>>,
 }
 impl EachStep {
     pub(crate) fn request_call(
         callable: CallableRef,
-        receiver: Value,
-        arguments: Vec<Value>,
+        receiver: JsValue,
+        arguments: Vec<JsValue>,
         mut resume: EachResume,
     ) -> Self {
         resume.0.pending_effect.call_callable = Some(callable);
@@ -155,14 +182,14 @@ impl EachResume {
             .take()
             .expect("EachStep Call callable")
     }
-    pub(crate) fn take_call_receiver(&mut self) -> Value {
+    pub(crate) fn take_call_receiver(&mut self) -> JsValue {
         self.0
             .pending_effect
             .call_receiver
             .take()
             .expect("EachStep Call receiver")
     }
-    pub(crate) fn take_call_arguments(&mut self) -> Vec<Value> {
+    pub(crate) fn take_call_arguments(&mut self) -> Vec<JsValue> {
         self.0
             .pending_effect
             .call_arguments

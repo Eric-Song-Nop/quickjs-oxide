@@ -1,3 +1,4 @@
+use crate::engine::atom::AtomIdx;
 use crate::engine::heap::{AutoInitProperty, PropertySlot};
 use crate::engine::object::shape::PropertyFlags;
 
@@ -23,11 +24,21 @@ fn string_case_family_is_ordered_autoinit_and_has_distinct_stable_functions() {
         let state = runtime.0.state.borrow();
         let object = state.heap.object(prototype.object_id()).unwrap();
         let shape = state.heap.shape(object.shape).unwrap();
-        let slot_indices = keys
-            .each_ref()
-            .map(|(_, _, key)| usize::try_from(shape.find(key.atom()).unwrap()).unwrap());
-        let value_of_slot = usize::try_from(shape.find(value_of.atom()).unwrap()).unwrap();
-        let iterator_slot = usize::try_from(shape.find(iterator.atom()).unwrap()).unwrap();
+        let slot_indices = keys.each_ref().map(|(_, _, key)| {
+            usize::try_from(shape.find(AtomIdx::from_raw(key.atom().raw())).unwrap()).unwrap()
+        });
+        let value_of_slot = usize::try_from(
+            shape
+                .find(AtomIdx::from_raw(value_of.atom().raw()))
+                .unwrap(),
+        )
+        .unwrap();
+        let iterator_slot = usize::try_from(
+            shape
+                .find(AtomIdx::from_raw(iterator.atom().raw()))
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             slot_indices[0],
             value_of_slot + 1,
@@ -149,17 +160,22 @@ fn string_case_methods_coerce_only_the_receiver_and_ignore_every_argument() {
 fn string_case_expansion_limit_uses_internal_error_and_accepts_exact_boundary() {
     let runtime = Runtime::new();
     let mut context = runtime.new_context();
-    let Completion::Throw(Value::Object(error)) = runtime
-        .call_string_prototype_case_with_limit(
-            context.realm,
-            StringCaseKind::Upper,
-            NativeInvocation::Call {
-                this_value: Value::String(JsString::try_from_utf8("ß").unwrap()),
-            },
-            1,
-        )
-        .unwrap()
-    else {
+    let Value::Object(error) = thrown(
+        &runtime,
+        runtime
+            .call_string_prototype_case_with_limit(
+                context.realm,
+                StringCaseKind::Upper,
+                NativeInvocation::Call {
+                    this_value: js(
+                        &runtime,
+                        Value::String(JsString::try_from_utf8("ß").unwrap()),
+                    ),
+                },
+                1,
+            )
+            .unwrap(),
+    ) else {
         panic!("one-below-boundary uppercase conversion did not throw an Error object");
     };
     for (name, expected) in [("name", "InternalError"), ("message", "string too long")] {
@@ -172,17 +188,23 @@ fn string_case_expansion_limit_uses_internal_error_and_accepts_exact_boundary() 
         assert_eq!(value, JsString::from_static(expected));
     }
     assert_eq!(
-        runtime
-            .call_string_prototype_case_with_limit(
-                context.realm,
-                StringCaseKind::Upper,
-                NativeInvocation::Call {
-                    this_value: Value::String(JsString::try_from_utf8("ß").unwrap()),
-                },
-                2,
-            )
-            .unwrap(),
-        Completion::Return(Value::String(JsString::from_static("SS"))),
+        returned(
+            &runtime,
+            runtime
+                .call_string_prototype_case_with_limit(
+                    context.realm,
+                    StringCaseKind::Upper,
+                    NativeInvocation::Call {
+                        this_value: js(
+                            &runtime,
+                            Value::String(JsString::try_from_utf8("ß").unwrap()),
+                        ),
+                    },
+                    2,
+                )
+                .unwrap(),
+        ),
+        Value::String(JsString::from_static("SS")),
         "the exact uppercase expansion boundary was rejected",
     );
 }

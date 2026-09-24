@@ -15,7 +15,7 @@ use crate::engine::object::shape::PropertyFlags;
 use crate::engine::object::{
     DescriptorField, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, WellKnownSymbol,
 };
-use crate::engine::value::{JsString, Value};
+use crate::engine::value::{JsString, JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
 
@@ -579,17 +579,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::finish(
-            self,
-            realm,
-            operation::MathStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::finish(
                 self,
                 realm,
-                operation::MathKind::MinMax(selector),
-                &invocation,
-                arguments,
-            )?,
-        )
+                operation::MathStep::start(
+                    self,
+                    realm,
+                    operation::MathKind::MinMax(selector),
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_math_unary(
@@ -599,17 +601,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::finish(
-            self,
-            realm,
-            operation::MathStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::finish(
                 self,
                 realm,
-                operation::MathKind::Unary(selector),
-                &invocation,
-                arguments,
-            )?,
-        )
+                operation::MathStep::start(
+                    self,
+                    realm,
+                    operation::MathKind::Unary(selector),
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_math_binary(
@@ -619,17 +623,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::finish(
-            self,
-            realm,
-            operation::MathStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::finish(
                 self,
                 realm,
-                operation::MathKind::Binary(selector),
-                &invocation,
-                arguments,
-            )?,
-        )
+                operation::MathStep::start(
+                    self,
+                    realm,
+                    operation::MathKind::Binary(selector),
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_math_hypot(
@@ -638,17 +644,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::finish(
-            self,
-            realm,
-            operation::MathStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::finish(
                 self,
                 realm,
-                operation::MathKind::Hypot,
-                &invocation,
-                arguments,
-            )?,
-        )
+                operation::MathStep::start(
+                    self,
+                    realm,
+                    operation::MathKind::Hypot,
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_math_random(
@@ -662,7 +670,7 @@ impl Runtime {
             ));
         };
         let random = self.0.state.borrow_mut().heap.next_math_random_u64(realm)?;
-        Ok(Completion::Return(Value::Float(quickjs_random_fraction(
+        Ok(Completion::Return(JsValue::Float(quickjs_random_fraction(
             random,
         ))))
     }
@@ -673,17 +681,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::finish(
-            self,
-            realm,
-            operation::MathStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::finish(
                 self,
                 realm,
-                operation::MathKind::Imul,
-                &invocation,
-                arguments,
-            )?,
-        )
+                operation::MathStep::start(
+                    self,
+                    realm,
+                    operation::MathKind::Imul,
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_math_clz32(
@@ -692,17 +702,19 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        operation::finish(
-            self,
-            realm,
-            operation::MathStep::start(
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            operation::finish(
                 self,
                 realm,
-                operation::MathKind::Clz32,
-                &invocation,
-                arguments,
-            )?,
-        )
+                operation::MathStep::start(
+                    self,
+                    realm,
+                    operation::MathKind::Clz32,
+                    invocation,
+                    arguments,
+                )?,
+            )
+        })
     }
 
     pub(crate) fn call_math_sum_precise(
@@ -711,10 +723,12 @@ impl Runtime {
         invocation: NativeInvocation,
         arguments: &NativeArguments,
     ) -> Result<Completion, RuntimeError> {
-        sum::finish(
-            self,
-            realm,
-            sum::SumStep::start(self, realm, &invocation, arguments)?,
-        )
+        self.dispatch_borrowed_invocation(invocation, |invocation| {
+            sum::finish(
+                self,
+                realm,
+                sum::SumStep::start(self, realm, invocation, arguments)?,
+            )
+        })
     }
 }

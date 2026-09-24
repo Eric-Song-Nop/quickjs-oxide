@@ -13,10 +13,9 @@ mod string;
 mod vm;
 
 use super::{
-    BytecodeCallRequest, CompleteOrdinaryPropertyDescriptor, Completion, DescriptorResume,
-    DescriptorStep, DirectCallTarget, NativeConversion, ObjectRef, OrdinaryPropertyDescriptor,
-    OrdinaryRead, PropertyKey, ProxyBooleanResume, ProxyBooleanStep, ProxyGetResume, ProxyGetStep,
-    ProxyOwnResume, ProxyOwnStep, Runtime, Value,
+    BytecodeCallRequest, Completion, DescriptorResume, DescriptorStep, DirectCallTarget, JsValue,
+    NativeConversion, ObjectRef, OrdinaryRead, PropertyKey, ProxyBooleanResume, ProxyBooleanStep,
+    ProxyGetResume, ProxyGetStep, ProxyOwnResume, ProxyOwnStep, Runtime, Value,
 };
 use crate::engine::object::operations::{
     InternalDefineResult, InternalSetResult, PropertySetAction,
@@ -43,13 +42,13 @@ pub(super) struct BooleanResultPayload {
 }
 pub(super) struct DefineTypedPayload {
     pub(super) object: ObjectRef,
-    pub(super) _descriptor: OrdinaryPropertyDescriptor,
+    pub(super) _descriptor: crate::engine::object::OwnedPropertyDescriptor,
     pub(super) resume: Box<Resume>,
 }
 pub(super) struct DefineLengthPayload {
     pub(super) object: ObjectRef,
     pub(super) key: PropertyKey,
-    pub(super) descriptor: OrdinaryPropertyDescriptor,
+    pub(super) descriptor: crate::engine::object::OwnedPropertyDescriptor,
     pub(super) resume: Box<Resume>,
 }
 
@@ -289,7 +288,7 @@ pub(super) enum Step {
         resume: Option<Resume>,
     },
     IntrinsicPromiseResolve {
-        value: Option<Value>,
+        value: Option<JsValue>,
         realm: Option<crate::engine::heap::ContextId>,
         resume: Option<Resume>,
     },
@@ -299,34 +298,34 @@ pub(super) enum Step {
         resume: Option<Resume>,
     },
     ForInComplete {
-        value: Option<Value>,
+        value: Option<JsValue>,
         done: Option<Option<bool>>,
     },
     TypedIteratorMethod {
-        source: Option<Value>,
+        source: Option<JsValue>,
         resume: Option<Resume>,
     },
     TypedIteratorMethodComplete(
         Option<NativeConversion<Option<crate::engine::object::CallableRef>>>,
     ),
     TypedCollect {
-        source: Option<Value>,
+        source: Option<JsValue>,
         method: Option<crate::engine::object::CallableRef>,
         element: Option<TypedArrayElementKind>,
         resume: Option<Resume>,
     },
-    TypedCollectComplete(Option<NativeConversion<Vec<Value>>>),
+    TypedCollectComplete(Option<NativeConversion<Vec<JsValue>>>),
     TypedCreate {
-        constructor: Option<Value>,
+        constructor: Option<JsValue>,
         length: Option<u64>,
         resume: Option<Resume>,
     },
     NumericComplete {
-        value: Option<Value>,
-        previous: Option<Option<Value>>,
+        value: Option<JsValue>,
+        previous: Option<Option<JsValue>>,
     },
     NumericHtmlDda {
-        value: Option<Value>,
+        value: Option<JsValue>,
         resume: Option<crate::engine::vm::numeric::operation::NumericResume>,
     },
     TypedSpeciesView {
@@ -347,7 +346,7 @@ pub(super) enum Step {
         resume: Option<Resume>,
     },
     Aggregate {
-        iterable: Option<Value>,
+        iterable: Option<JsValue>,
         resume: Option<Resume>,
     },
     OrdinaryPrimitive {
@@ -355,7 +354,7 @@ pub(super) enum Step {
         hint: Option<ToPrimitiveHint>,
     },
     ConstructorSource {
-        new_target: Option<Value>,
+        new_target: Option<JsValue>,
         resume: Option<Resume>,
     },
     ConstructorSourceComplete(
@@ -378,7 +377,7 @@ pub(super) enum Step {
     },
     OrdinaryInstance {
         constructor: Option<crate::engine::object::CallableRef>,
-        value: Option<Value>,
+        value: Option<JsValue>,
         resume: Option<Resume>,
     },
     ParseIterator {
@@ -386,15 +385,15 @@ pub(super) enum Step {
         resume: Option<Resume>,
     },
     String {
-        value: Option<Value>,
+        value: Option<JsValue>,
         resume: Option<Resume>,
     },
     ObjectTag {
-        receiver: Option<Value>,
+        receiver: Option<JsValue>,
     },
     RegExpExec {
-        regexp: Option<Value>,
-        input: Option<Value>,
+        regexp: Option<JsValue>,
+        input: Option<JsValue>,
         resume: Option<Resume>,
     },
     IteratorCloseWithResume {
@@ -410,12 +409,12 @@ pub(super) enum Step {
     },
     ArrayPush {
         object: Option<ObjectRef>,
-        value: Option<Value>,
+        value: Option<JsValue>,
         resume: Option<Resume>,
     },
     IteratorNext {
         iterator: Option<ObjectRef>,
-        method: Option<Value>,
+        method: Option<JsValue>,
         resume: Option<Resume>,
     },
     IteratorNextComplete(Option<crate::engine::builtins::ObjectIteratorStep>),
@@ -435,19 +434,19 @@ pub(super) enum Step {
         min_readable_args: Option<u8>,
         mode: Option<crate::engine::vm::call::NativeInvokeMode>,
         invocation: Option<crate::engine::vm::call::NativeInvocation>,
-        arguments: Option<Vec<Value>>,
+        arguments: Option<Vec<JsValue>>,
         resume: Option<Resume>,
     },
     Construct {
         target: Option<crate::engine::vm::call::ConstructorRef>,
         new_target: Option<crate::engine::vm::call::ConstructNewTarget>,
-        arguments: Option<Vec<Value>>,
+        arguments: Option<Vec<JsValue>>,
         resume: Option<Resume>,
     },
     ConstructProxy {
         target: Option<crate::engine::vm::call::ConstructorRef>,
         new_target: Option<crate::engine::vm::call::ConstructNewTarget>,
-        arguments: Option<Vec<Value>>,
+        arguments: Option<Vec<JsValue>>,
         resume: Option<Resume>,
     },
     ConstructorReady {
@@ -457,10 +456,10 @@ pub(super) enum Step {
         resume: Option<Resume>,
     },
     Arguments {
-        value: Option<Value>,
+        value: Option<JsValue>,
         resume: Option<Resume>,
     },
-    ArgumentsComplete(Option<NativeConversion<Vec<Value>>>),
+    ArgumentsComplete(Option<NativeConversion<Vec<JsValue>>>),
     SnapshotEnumerable {
         object: Option<ObjectRef>,
         key: Option<PropertyKey>,
@@ -478,7 +477,7 @@ pub(super) enum Step {
     },
     KeysComplete(Option<NativeConversion<Vec<PropertyKey>>>),
     ReadValue {
-        receiver: Option<Value>,
+        receiver: Option<JsValue>,
         key: Option<PropertyKey>,
         resume: Option<Resume>,
     },
@@ -493,7 +492,7 @@ pub(super) enum Step {
         resume: Option<Resume>,
     },
     Primitive {
-        value: Option<Value>,
+        value: Option<JsValue>,
         hint: Option<crate::engine::vm::ToPrimitiveHint>,
         resume: Option<Resume>,
     },
@@ -517,19 +516,19 @@ pub(super) enum Step {
     },
     Element {
         element: Option<TypedArrayElementKind>,
-        value: Option<Value>,
+        value: Option<JsValue>,
         resume: Option<Resume>,
     },
     ElementComplete(Option<NativeConversion<[u8; 8]>>),
     TypedComplete(Option<NativeConversion<bool>>),
     Number {
-        value: Option<Value>,
+        value: Option<JsValue>,
         resume: Option<Resume>,
     },
     NumberComplete(Option<NativeConversion<f64>>),
     LengthComplete(Option<ArrayLengthConversion>),
     SetLength {
-        value: Option<Value>,
+        value: Option<JsValue>,
         resume: Option<SetResume>,
     },
     SetComplete(Option<PropertySetAction>),
@@ -541,41 +540,43 @@ pub(super) enum Step {
     SetSpecial {
         object: Option<ObjectRef>,
         key: Option<PropertyKey>,
-        value: Option<Value>,
-        receiver: Option<Value>,
+        value: Option<JsValue>,
+        receiver: Option<JsValue>,
         resume: Option<SetResume>,
     },
     Set {
         object: Option<ObjectRef>,
         key: Option<PropertyKey>,
-        value: Option<Value>,
-        receiver: Option<Value>,
+        value: Option<JsValue>,
+        receiver: Option<JsValue>,
         resume: Option<Resume>,
     },
     SetProxy {
         object: Option<ObjectRef>,
         key: Option<PropertyKey>,
-        value: Option<Value>,
-        receiver: Option<Value>,
+        value: Option<JsValue>,
+        receiver: Option<JsValue>,
         resume: Option<Resume>,
     },
     Define {
         object: Option<ObjectRef>,
         key: Option<PropertyKey>,
-        descriptor: Option<OrdinaryPropertyDescriptor>,
+        descriptor: Option<crate::engine::object::DefinitionInput>,
         resume: Option<Resume>,
     },
     DefineOrdinary {
         object: Option<ObjectRef>,
         key: Option<PropertyKey>,
-        descriptor: Option<OrdinaryPropertyDescriptor>,
+        descriptor: Option<crate::engine::object::DefinitionInput>,
         resume: Option<Resume>,
     },
     Defined(Option<NativeConversion<InternalDefineResult>>),
     Complete(Option<Completion>),
     BooleanComplete(Option<NativeConversion<bool>>),
-    OwnComplete(Option<NativeConversion<Option<CompleteOrdinaryPropertyDescriptor>>>),
-    Converted(Option<NativeConversion<OrdinaryPropertyDescriptor>>),
+    OwnComplete(
+        Option<NativeConversion<Option<crate::engine::object::OwnedCompletePropertyDescriptor>>>,
+    ),
+    Converted(Option<NativeConversion<crate::engine::object::OwnedPropertyDescriptor>>),
     Has {
         object: Option<ObjectRef>,
         key: Option<PropertyKey>,
@@ -584,13 +585,13 @@ pub(super) enum Step {
     Read {
         object: Option<ObjectRef>,
         key: Option<PropertyKey>,
-        receiver: Option<Value>,
+        receiver: Option<JsValue>,
         resume: Option<Resume>,
     },
     Call {
         target: Option<DirectCallTarget>,
-        receiver: Option<Value>,
-        arguments: Option<Vec<Value>>,
+        receiver: Option<JsValue>,
+        arguments: Option<Vec<JsValue>>,
         resume: Option<Resume>,
     },
     Descriptor {
@@ -603,9 +604,808 @@ pub(super) enum Step {
         resume: Option<Resume>,
     },
     Convert {
-        value: Option<Value>,
+        value: Option<JsValue>,
         resume: Option<Resume>,
     },
+}
+
+impl Step {
+    /// Drain a request abandoned before its consumer takes the owned fields.
+    /// Replacing with an empty terminal makes cleanup safe after partial takes.
+    pub(super) fn release_owned(&mut self, runtime: &Runtime) {
+        let release = |value| {
+            let _ = runtime.release_jsvalue(value);
+        };
+        let release_completion = |value| {
+            let (Completion::Return(value) | Completion::Throw(value)) = value;
+            release(value);
+        };
+        match std::mem::replace(self, Self::Complete(None)) {
+            Self::RootDescriptor(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::ModuleCallbackOperation { step, resume } => {
+                if let Some(value) = step {
+                    value.release(runtime);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::ModuleBodyOperation { step, resume } => {
+                if let Some(value) = step {
+                    value.release(runtime);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::ModuleLink {
+                realm: _,
+                callable: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::PromiseOperation { step, resume } => {
+                if let Some(value) = step {
+                    value.release(runtime);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::IntrinsicPromiseResolve {
+                value,
+                realm: _,
+                resume,
+            } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::ResumeFrame {
+                activation: _,
+                input,
+                resume,
+            } => {
+                if let Some(value) = input {
+                    use crate::engine::vm::VmResume;
+                    use crate::engine::vm::suspend::VmActivationResume;
+                    match value {
+                        VmActivationResume::Initial => {}
+                        VmActivationResume::AwaitFulfill(value)
+                        | VmActivationResume::AwaitReject(value)
+                        | VmActivationResume::Generator(
+                            VmResume::Next(value)
+                            | VmResume::Return(value)
+                            | VmResume::Throw(value),
+                        ) => release(value),
+                    }
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::ForInComplete { value, done: _ } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+            }
+            Self::TypedIteratorMethod { source, resume } => {
+                if let Some(value) = source {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::TypedIteratorMethodComplete(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::TypedCollect {
+                source,
+                method: _,
+                element: _,
+                resume,
+            } => {
+                if let Some(value) = source {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::TypedCollectComplete(value) => {
+                if let Some(value) = value {
+                    match value {
+                        NativeConversion::Value(values) => {
+                            for value in values {
+                                release(value);
+                            }
+                        }
+                        NativeConversion::Throw(value) => release(value),
+                    }
+                }
+            }
+            Self::TypedCreate {
+                constructor,
+                length: _,
+                resume,
+            } => {
+                if let Some(value) = constructor {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::NumericComplete { value, previous } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(Some(value)) = previous {
+                    release(value);
+                }
+            }
+            Self::NumericHtmlDda { value, resume: _ } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+            }
+            Self::TypedSpeciesView {
+                source: _,
+                element: _,
+                buffer: _,
+                offset: _,
+                length: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::RegExpSpecies { regexp: _, resume } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::RegExpSpeciesComplete(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::IndirectEval { source: _, resume } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Aggregate { iterable, resume } => {
+                if let Some(value) = iterable {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::OrdinaryPrimitive { object: _, hint: _ } => {}
+            Self::ConstructorSource { new_target, resume } => {
+                if let Some(value) = new_target {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::ConstructorSourceComplete(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::TypedSpecies {
+                source: _,
+                element: _,
+                length: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::TypedSpeciesComplete(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::ArrayCopy {
+                object: _,
+                to: _,
+                from: _,
+                count: _,
+                backwards: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::OrdinaryInstance {
+                constructor: _,
+                value,
+                resume,
+            } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::ParseIterator { result, resume } => {
+                if let Some(value) = result {
+                    release_completion(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::String { value, resume } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::ObjectTag { receiver } => {
+                if let Some(value) = receiver {
+                    release(value);
+                }
+            }
+            Self::RegExpExec {
+                regexp,
+                input,
+                resume,
+            } => {
+                if let Some(value) = regexp {
+                    release(value);
+                }
+                if let Some(value) = input {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::IteratorCloseWithResume {
+                iterator: _,
+                completion,
+                resume,
+            } => {
+                if let Some(value) = completion {
+                    release_completion(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::NativeRawComplete(value) => {
+                if let Some(value) = value {
+                    match value {
+                        crate::engine::vm::call::NativeInvokeOutcome::Completion(value) => {
+                            release_completion(value)
+                        }
+                        crate::engine::vm::call::NativeInvokeOutcome::IteratorNextRaw {
+                            value,
+                            ..
+                        } => release(value),
+                    }
+                }
+            }
+            Self::ArraySpecies {
+                source: _,
+                length: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::ArrayPush {
+                object: _,
+                value,
+                resume,
+            } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::IteratorNext {
+                iterator: _,
+                method,
+                resume,
+            } => {
+                if let Some(value) = method {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::IteratorNextComplete(value) => {
+                if let Some(value) = value {
+                    match value {
+                        crate::engine::builtins::ObjectIteratorStep::Yield(value)
+                        | crate::engine::builtins::ObjectIteratorStep::Throw(value) => {
+                            release(value)
+                        }
+                        crate::engine::builtins::ObjectIteratorStep::Done => {}
+                    }
+                }
+            }
+            Self::IteratorCall {
+                callable: _,
+                iterator: _,
+                resume: _,
+            } => {}
+            Self::IteratorClose {
+                iterator: _,
+                completion,
+            } => {
+                if let Some(value) = completion {
+                    release_completion(value);
+                }
+            }
+            Self::Native {
+                callable: _,
+                target: _,
+                defining_realm: _,
+                min_readable_args: _,
+                mode: _,
+                invocation,
+                arguments,
+                resume,
+            } => {
+                if let Some(value) = invocation {
+                    let _ = value.release(runtime);
+                }
+                if let Some(values) = arguments {
+                    for value in values {
+                        release(value);
+                    }
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Construct {
+                target: _,
+                new_target,
+                arguments,
+                resume,
+            } => {
+                if let Some(value) = new_target {
+                    let _ = value.release(runtime);
+                }
+                if let Some(values) = arguments {
+                    for value in values {
+                        release(value);
+                    }
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::ConstructProxy {
+                target: _,
+                new_target,
+                arguments,
+                resume,
+            } => {
+                if let Some(value) = new_target {
+                    let _ = value.release(runtime);
+                }
+                if let Some(values) = arguments {
+                    for value in values {
+                        release(value);
+                    }
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::ConstructorReady {
+                request,
+                receiver,
+                derived: _,
+                resume,
+            } => {
+                if let Some(mut value) = request {
+                    let _ = value.release_owned_values(runtime);
+                }
+                if let Some(value) = receiver {
+                    release_completion(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Arguments { value, resume } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::ArgumentsComplete(value) => {
+                if let Some(value) = value {
+                    match value {
+                        NativeConversion::Value(values) => {
+                            for value in values {
+                                release(value);
+                            }
+                        }
+                        NativeConversion::Throw(value) => release(value),
+                    }
+                }
+            }
+            Self::SnapshotEnumerable {
+                object: _,
+                key: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::OwnFlag {
+                object: _,
+                key: _,
+                enumerable: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Keys { object: _, resume } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::KeysComplete(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::ReadValue {
+                receiver,
+                key: _,
+                resume,
+            } => {
+                if let Some(value) = receiver {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::PreparedHas {
+                probe: _,
+                key: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::PreparedRead {
+                read,
+                key: _,
+                resume,
+            } => {
+                if let Some(value) = read {
+                    value.release(runtime);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Primitive {
+                value,
+                hint: _,
+                resume,
+            } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::GetPrototype { object: _, resume } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::SetPrototype {
+                object: _,
+                prototype: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Delete {
+                object: _,
+                key: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::PreventExtensions { object: _, resume } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Element {
+                element: _,
+                value,
+                resume,
+            } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::ElementComplete(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::TypedComplete(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::Number { value, resume } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::NumberComplete(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::LengthComplete(value) => {
+                if let Some(ArrayLengthConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::SetLength { value, resume: _ } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+            }
+            Self::SetComplete(value) => {
+                if let Some(value) = value {
+                    SetStep::Complete(value).release(runtime);
+                }
+            }
+            Self::PreparedSet { step, resume } => {
+                if let Some(value) = step {
+                    value.release(runtime);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::SetContinue(value) => {
+                drop(value);
+            }
+            Self::SetSpecial {
+                object: _,
+                key: _,
+                value,
+                receiver,
+                resume: _,
+            } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(value) = receiver {
+                    release(value);
+                }
+            }
+            Self::Set {
+                object: _,
+                key: _,
+                value,
+                receiver,
+                resume,
+            } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(value) = receiver {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::SetProxy {
+                object: _,
+                key: _,
+                value,
+                receiver,
+                resume,
+            } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(value) = receiver {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Define {
+                object: _,
+                key: _,
+                descriptor: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::DefineOrdinary {
+                object: _,
+                key: _,
+                descriptor: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Defined(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::Complete(value) => {
+                if let Some(value) = value {
+                    release_completion(value);
+                }
+            }
+            Self::BooleanComplete(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::OwnComplete(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::Converted(value) => {
+                if let Some(NativeConversion::Throw(value)) = value {
+                    release(value);
+                }
+            }
+            Self::Has {
+                object: _,
+                key: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Read {
+                object: _,
+                key: _,
+                receiver,
+                resume,
+            } => {
+                if let Some(value) = receiver {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Call {
+                target: _,
+                receiver,
+                arguments,
+                resume,
+            } => {
+                if let Some(value) = receiver {
+                    release(value);
+                }
+                if let Some(values) = arguments {
+                    for value in values {
+                        release(value);
+                    }
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Descriptor {
+                object: _,
+                key: _,
+                resume,
+            } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Extensible { object: _, resume } => {
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+            Self::Convert { value, resume } => {
+                if let Some(value) = value {
+                    release(value);
+                }
+                if let Some(value) = resume {
+                    value.release_owned();
+                }
+            }
+        }
+    }
+}
+
+impl Resume {
+    /// Real continuation owners can contain a raw constructor request.
+    /// Other domain resumes release their own edge records when dropped.
+    pub(super) fn release_owned(self) {
+        match self {
+            Self::ConstructorPrototype {
+                mut request,
+                resume,
+            } => {
+                let runtime = request.callable.as_object().runtime().clone();
+                let _ = request.release_owned_values(&runtime);
+                resume.release_owned();
+            }
+            Self::StringValue { resume, .. }
+            | Self::OwnFlagReply { resume, .. }
+            | Self::PrototypeGetReply(resume)
+            | Self::PrototypeSetReply(resume) => resume.release_owned(),
+            Self::DefineTyped { payload } => payload.resume.release_owned(),
+            Self::DefineLength { payload } => payload.resume.release_owned(),
+            _ => {}
+        }
+    }
 }
 
 pub(super) fn set_result(
@@ -638,7 +1438,7 @@ impl Resume {
             Self::RootSet => Ok(Step::Complete(Some(match set_result(action)? {
                 NativeConversion::Throw(value) => Completion::Throw(value),
                 NativeConversion::Value(result) => {
-                    Completion::Return(Value::Bool(matches!(result, InternalSetResult::Accepted)))
+                    Completion::Return(JsValue::Bool(matches!(result, InternalSetResult::Accepted)))
                 }
             }))),
 
@@ -716,9 +1516,13 @@ impl Resume {
             Self::Property(resume) => resume.set(runtime, set_result(action)?).map(Into::into),
             Self::OrdinarySet(resume) => resume.forward(action).map(Into::into),
             Self::ProxySet(resume) => resume.set(set_result(action)?).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "Set result has no matching continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                SetStep::Complete(action).release(runtime);
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "Set result has no matching continuation",
+                ))
+            }
         }
     }
     pub(super) fn defined(
@@ -729,15 +1533,16 @@ impl Resume {
         match self {
             Self::RootDefine => Ok(Step::Complete(Some(match result {
                 NativeConversion::Throw(value) => Completion::Throw(value),
-                NativeConversion::Value(result) => {
-                    Completion::Return(Value::Bool(matches!(result, InternalDefineResult::Defined)))
-                }
+                NativeConversion::Value(result) => Completion::Return(JsValue::Bool(matches!(
+                    result,
+                    InternalDefineResult::Defined
+                ))),
             }))),
 
             Self::LiteralDefinition(resume) => resume.defined(result).map(Into::into),
             Self::PublicField => match Runtime::finish_public_class_field_definition(result)? {
                 crate::engine::object::operations::PropertyDefineOutcome::Defined(true) => {
-                    Ok(Step::Complete(Some(Completion::Return(Value::Undefined))))
+                    Ok(Step::Complete(Some(Completion::Return(JsValue::Undefined))))
                 }
                 crate::engine::object::operations::PropertyDefineOutcome::Defined(false) => {
                     Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
@@ -773,9 +1578,15 @@ impl Resume {
             Self::Property(resume) => resume.defined(runtime, result).map(Into::into),
             Self::OrdinarySet(resume) => resume.defined(runtime, result).map(Into::into),
             Self::Define(resume) => resume.defined(result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "Define result has no matching continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "Define result has no matching continuation",
+                ))
+            }
         }
     }
 
@@ -810,7 +1621,7 @@ impl Resume {
                 .finish_property_delete(result, payload.strict_delete)
                 .map(|result| Step::Complete(Some(result))),
             Self::Definitions(resume) => resume.boolean(runtime, result).map(Into::into),
-            Self::Predicate(resume) => resume.boolean(result).map(Into::into),
+            Self::Predicate(resume) => resume.boolean(runtime, result).map(Into::into),
             Self::Keys(resume) => resume.boolean(runtime, result).map(Into::into),
             Self::Property(resume) => resume.boolean(runtime, result).map(Into::into),
             Self::BuiltinPrototype(resume) => resume.boolean(runtime, result).map(Into::into),
@@ -818,9 +1629,15 @@ impl Resume {
             Self::Own(resume) => resume.extensible(result).map(Into::into),
             Self::Boolean(resume) => resume.boolean(runtime, result).map(Into::into),
             Self::Conversion(resume) => resume.has(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "Proxy Get received a boolean reply",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "Proxy Get received a boolean reply",
+                ))
+            }
         }
     }
 
@@ -834,9 +1651,20 @@ impl Resume {
             Self::Async(resume) => resume.body(outcome).map(Into::into),
             Self::GeneratorCreate(creation) => creation.initial(runtime, outcome).map(Into::into),
             Self::Generator(resume) => resume.resume(outcome).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "ordinary callback returned a suspension",
-            )),
+            resume => {
+                resume.release_owned();
+                match outcome {
+                    crate::engine::vm::suspend::VmRunOutcome::Complete(
+                        Completion::Return(value) | Completion::Throw(value),
+                    )
+                    | crate::engine::vm::suspend::VmRunOutcome::Suspend { value, .. } => {
+                        let _ = runtime.release_jsvalue(value);
+                    }
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "ordinary callback returned a suspension",
+                ))
+            }
         }
     }
 
@@ -846,7 +1674,11 @@ impl Resume {
         completion: Completion,
     ) -> Result<Step, crate::engine::api::runtime_error::RuntimeError> {
         match self {
-            Self::RootDescriptor | Self::RootDefine | Self::RootSet => {
+            abandoned @ (Self::RootDescriptor | Self::RootDefine | Self::RootSet) => {
+                abandoned.release_owned();
+                let (Completion::Return(value) | Completion::Throw(value)) = completion;
+                let _ = runtime.release_jsvalue(value);
+
                 Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
                     "typed root received an untyped reply",
                 ))
@@ -896,7 +1728,7 @@ impl Resume {
             Self::TypedWith(resume) => resume.resume(runtime, completion).map(Into::into),
             Self::Uint8Codec(resume) => resume.resume(runtime, completion).map(Into::into),
             Self::VmNumeric(resume) => resume
-                .resume(completion)
+                .resume(runtime, completion)
                 .map(Into::into)
                 .map_err(crate::engine::api::runtime_error::RuntimeError::Engine),
             Self::TypedSearch(resume) => resume.resume(runtime, completion).map(Into::into),
@@ -922,7 +1754,7 @@ impl Resume {
             }
 
             Self::Bind(resume) => resume.resume(runtime, completion).map(Into::into),
-            Self::FunctionText(resume) => resume.resume(completion).map(Into::into),
+            Self::FunctionText(resume) => resume.resume(runtime, completion).map(Into::into),
             Self::DynamicFunction(resume) => resume.resume(runtime, completion).map(Into::into),
             Self::JsonParse(resume) => resume.resume(runtime, completion).map(Into::into),
             Self::JsonStringify(resume) => resume.resume(runtime, completion).map(Into::into),
@@ -1001,7 +1833,11 @@ impl Resume {
             Self::IteratorCreate(resume) => resume.resume(runtime, completion).map(Into::into),
             Self::StringValue { realm, resume } => {
                 let result = match completion {
-                    Completion::Return(value) => runtime.string_from_primitive(realm, &value)?,
+                    Completion::Return(value) => {
+                        let result = runtime.string_from_primitive_jsvalue(realm, &value);
+                        runtime.release_jsvalue(value)?;
+                        result?
+                    }
                     Completion::Throw(value) => NativeConversion::Throw(value),
                 };
                 resume.string(runtime, result)
@@ -1025,13 +1861,15 @@ impl Resume {
             }
             Self::Identity => Ok(Step::Complete(Some(completion))),
             Self::ObjectString(resume) => resume.resume(runtime, completion).map(Into::into),
-            Self::Definitions(resume) => resume.read(completion).map(Into::into),
+            Self::Definitions(resume) => resume.read(runtime, completion).map(Into::into),
             Self::PredicateKey(resume) => resume.key(runtime, completion).map(Into::into),
             Self::Keys(resume) => resume.resume(runtime, completion).map(Into::into),
             Self::PropertyKey(resume) => resume.key(runtime, completion).map(Into::into),
             Self::Property(resume) => resume.read(runtime, completion).map(Into::into),
             Self::Primitive(resume) => resume.resume(runtime, completion).map(Into::into),
             Self::BuiltinPrototype(_) => {
+                let (Completion::Return(value) | Completion::Throw(value)) = completion;
+                let _ = runtime.release_jsvalue(value);
                 Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
                     "prototype builtin received an untyped reply",
                 ))
@@ -1039,12 +1877,14 @@ impl Resume {
             Self::Prototype(resume) => resume.resume(runtime, completion).map(Into::into),
             Self::PrototypeGetReply(resume) => {
                 let result = match completion {
-                    Completion::Return(Value::Object(object)) => {
-                        NativeConversion::Value(Some(object))
-                    }
-                    Completion::Return(Value::Null) => NativeConversion::Value(None),
+                    Completion::Return(JsValue::Object(object)) => NativeConversion::Value(Some(
+                        ObjectRef::from_owned_handle(runtime.clone(), object),
+                    )),
+                    Completion::Return(JsValue::Null) => NativeConversion::Value(None),
                     Completion::Throw(value) => NativeConversion::Throw(value),
-                    _ => {
+                    Completion::Return(value) => {
+                        let _ = runtime.release_jsvalue(value);
+                        resume.release_owned();
                         return Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
                             "invalid GetPrototypeOf reply",
                         ));
@@ -1054,9 +1894,11 @@ impl Resume {
             }
             Self::PrototypeSetReply(resume) => {
                 let result = match completion {
-                    Completion::Return(Value::Bool(value)) => NativeConversion::Value(value),
+                    Completion::Return(JsValue::Bool(value)) => NativeConversion::Value(value),
                     Completion::Throw(value) => NativeConversion::Throw(value),
-                    _ => {
+                    Completion::Return(value) => {
+                        let _ = runtime.release_jsvalue(value);
+                        resume.release_owned();
                         return Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
                             "invalid SetPrototypeOf reply",
                         ));
@@ -1067,10 +1909,17 @@ impl Resume {
             Self::ProxySet(resume) => resume.resume(runtime, completion).map(Into::into),
             Self::Define(resume) => resume.resume(runtime, completion).map(Into::into),
             Self::Setter => Ok(Step::SetComplete(Some(match completion {
-                Completion::Return(_) => PropertySetAction::Complete,
+                Completion::Return(value) => {
+                    runtime.release_jsvalue(value)?;
+                    PropertySetAction::Complete
+                }
                 Completion::Throw(value) => PropertySetAction::Throw(value),
             }))),
-            Self::BooleanResult { .. } => {
+            abandoned @ Self::BooleanResult { .. } => {
+                abandoned.release_owned();
+                let (Completion::Return(value) | Completion::Throw(value)) = completion;
+                let _ = runtime.release_jsvalue(value);
+
                 Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
                     "boolean operation received an untyped reply",
                 ))
@@ -1078,7 +1927,7 @@ impl Resume {
             Self::ReadOwner(_owner) => Ok(Step::Complete(Some(completion))),
             Self::Element(resume) => resume.resume(runtime, completion).map(Into::into),
             Self::Number(resume) => resume.resume(runtime, completion).map(Into::into),
-            Self::IteratorConstructor(_)
+            abandoned @ (Self::IteratorConstructor(_)
             | Self::IteratorTag(_)
             | Self::ArrayConstructorSet { .. }
             | Self::ArraySliceSet { .. }
@@ -1098,7 +1947,11 @@ impl Resume {
             | Self::LengthNumber(_)
             | Self::SetLength(_)
             | Self::DefineLength { .. }
-            | Self::OrdinarySet(_) => {
+            | Self::OrdinarySet(_)) => {
+                abandoned.release_owned();
+                let (Completion::Return(value) | Completion::Throw(value)) = completion;
+                let _ = runtime.release_jsvalue(value);
+
                 Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
                     "ordinary Set received an untyped reply",
                 ))
@@ -1113,10 +1966,12 @@ impl Resume {
     pub(super) fn descriptor(
         self,
         runtime: &Runtime,
-        result: NativeConversion<Option<CompleteOrdinaryPropertyDescriptor>>,
+        result: NativeConversion<Option<crate::engine::object::OwnedCompletePropertyDescriptor>>,
     ) -> Result<Step, crate::engine::api::runtime_error::RuntimeError> {
         match self {
-            Self::RootDescriptor => Ok(Step::RootDescriptor(Some(result))),
+            Self::RootDescriptor => Ok(Step::RootDescriptor(Some(
+                runtime.public_descriptor_result(result)?,
+            ))),
             Self::OwnFlagReply { enumerable, resume } => resume.boolean(
                 runtime,
                 match result {
@@ -1126,7 +1981,7 @@ impl Resume {
                     ),
                 },
             ),
-            Self::Predicate(resume) => resume.descriptor(result).map(Into::into),
+            Self::Predicate(resume) => resume.descriptor(runtime, result).map(Into::into),
             Self::Keys(resume) => resume.descriptor(runtime, result).map(Into::into),
             Self::Get(resume) => resume.descriptor(runtime, result).map(Into::into),
             Self::Property(resume) => resume.descriptor(runtime, result).map(Into::into),
@@ -1135,9 +1990,15 @@ impl Resume {
             Self::OrdinarySet(resume) => resume.descriptor(runtime, result).map(Into::into),
             Self::ProxySet(resume) => resume.descriptor(runtime, result).map(Into::into),
             Self::Define(resume) => resume.descriptor(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "descriptor conversion received an own-property reply",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "descriptor conversion received an own-property reply",
+                ))
+            }
         }
     }
 }
@@ -1161,8 +2022,12 @@ impl Resume {
                 let result = match result {
                     ArrayLengthConversion::Throw(value) => NativeConversion::Throw(value),
                     ArrayLengthConversion::Length(length) => match runtime
-                        .apply_array_length_descriptor(&object, &key, &descriptor, length)?
-                    {
+                        .apply_array_length_descriptor(
+                            &object,
+                            &key,
+                            &descriptor.attributes_public(),
+                            length,
+                        )? {
                         PropertyDefineOutcome::Defined(true) => {
                             NativeConversion::Value(InternalDefineResult::Defined)
                         }
@@ -1174,9 +2039,15 @@ impl Resume {
                 };
                 resume.defined(runtime, result)
             }
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "Array length result has no matching continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                if let ArrayLengthConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "Array length result has no matching continuation",
+                ))
+            }
         }
     }
 }
@@ -1214,9 +2085,15 @@ impl Resume {
                 };
                 resume.defined(runtime, result)
             }
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "TypedArray result has no matching continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "TypedArray result has no matching continuation",
+                ))
+            }
         }
     }
 }
@@ -1229,13 +2106,19 @@ impl Resume {
     ) -> Result<Step, crate::engine::api::runtime_error::RuntimeError> {
         match self {
             Self::ForIn(resume) => resume.prototype(runtime, result).map(Into::into),
-            Self::Instance(resume) => resume.prototype(result).map(Into::into),
-            Self::Predicate(resume) => resume.prototype(result).map(Into::into),
-            Self::BuiltinPrototype(resume) => resume.prototype(result).map(Into::into),
+            Self::Instance(resume) => resume.prototype(runtime, result).map(Into::into),
+            Self::Predicate(resume) => resume.prototype(runtime, result).map(Into::into),
+            Self::BuiltinPrototype(resume) => resume.prototype(runtime, result).map(Into::into),
             Self::Prototype(resume) => resume.prototype(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "prototype result has no matching continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "prototype result has no matching continuation",
+                ))
+            }
         }
     }
 }
@@ -1244,15 +2127,21 @@ impl Resume {
     pub(super) fn converted(
         self,
         runtime: &Runtime,
-        result: NativeConversion<OrdinaryPropertyDescriptor>,
+        result: NativeConversion<crate::engine::object::OwnedPropertyDescriptor>,
     ) -> Result<Step, crate::engine::api::runtime_error::RuntimeError> {
         match self {
-            Self::Definitions(resume) => resume.converted(result).map(Into::into),
+            Self::Definitions(resume) => resume.converted(runtime, result).map(Into::into),
             Self::Own(resume) => resume.converted(runtime, result).map(Into::into),
-            Self::Property(resume) => resume.converted(result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "descriptor conversion has no matching operation",
-            )),
+            Self::Property(resume) => resume.converted(runtime, result).map(Into::into),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "descriptor conversion has no matching operation",
+                ))
+            }
         }
     }
 }
@@ -1273,10 +2162,10 @@ impl Resume {
             Self::JsonStringify(resume) => resume.number(runtime, result).map(Into::into),
 
             Self::TypedSort(resume) => resume.number(runtime, result).map(Into::into),
-            Self::Math(resume) => resume.number(result).map(Into::into),
-            Self::Global(resume) => resume.number(result).map(Into::into),
+            Self::Math(resume) => resume.number(runtime, result).map(Into::into),
+            Self::Global(resume) => resume.number(runtime, result).map(Into::into),
             Self::Numeric(resume) => resume.number(runtime, result).map(Into::into),
-            Self::ScalarText(resume) => resume.number(result).map(Into::into),
+            Self::ScalarText(resume) => resume.number(runtime, result).map(Into::into),
             Self::DateConstructor(resume) => resume.number(runtime, result).map(Into::into),
             Self::DatePrototype(resume) => resume.number(runtime, result).map(Into::into),
 
@@ -1296,9 +2185,15 @@ impl Resume {
             Self::Arguments(resume) => resume.number(runtime, result).map(Into::into),
             Self::LengthNumber(resume) => resume.number(runtime, result).map(Into::into),
             Self::Keys(resume) => resume.number(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "numeric reply has no matching continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "numeric reply has no matching continuation",
+                ))
+            }
         }
     }
     pub(super) fn keys(
@@ -1316,9 +2211,15 @@ impl Resume {
             Self::Definitions(resume) => resume.keys(runtime, result).map(Into::into),
             Self::Keys(resume) => resume.keys(runtime, result).map(Into::into),
             Self::Property(resume) => resume.keys(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "key-list reply has no matching continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "key-list reply has no matching continuation",
+                ))
+            }
         }
     }
 }
@@ -1327,13 +2228,26 @@ impl Resume {
     pub(super) fn arguments(
         self,
         runtime: &Runtime,
-        result: NativeConversion<Vec<Value>>,
+        result: NativeConversion<Vec<JsValue>>,
     ) -> Result<Step, crate::engine::api::runtime_error::RuntimeError> {
         match self {
             Self::Invoke(resume) => resume.arguments(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "argument list has no matching continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                match result {
+                    NativeConversion::Value(values) => {
+                        for value in values {
+                            let _ = runtime.release_jsvalue(value);
+                        }
+                    }
+                    NativeConversion::Throw(value) => {
+                        let _ = runtime.release_jsvalue(value);
+                    }
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "argument list has no matching continuation",
+                ))
+            }
         }
     }
 }
@@ -1357,9 +2271,19 @@ impl Resume {
             Self::IteratorConsume(resume) => resume.next(runtime, result).map(Into::into),
             Self::IteratorHelper(resume) => resume.next(runtime, result).map(Into::into),
             Self::ObjectIteration(resume) => resume.next(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "iterator result has no continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                match result {
+                    crate::engine::builtins::ObjectIteratorStep::Yield(value)
+                    | crate::engine::builtins::ObjectIteratorStep::Throw(value) => {
+                        let _ = runtime.release_jsvalue(value);
+                    }
+                    crate::engine::builtins::ObjectIteratorStep::Done => {}
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "iterator result has no continuation",
+                ))
+            }
         }
     }
 }
@@ -1388,7 +2312,9 @@ impl Resume {
                 .resume(
                     runtime,
                     match result {
-                        NativeConversion::Value(value) => Completion::Return(Value::String(value)),
+                        NativeConversion::Value(value) => {
+                            Completion::Return(runtime.into_jsvalue(Value::String(value))?)
+                        }
                         NativeConversion::Throw(value) => Completion::Throw(value),
                     },
                 )
@@ -1398,7 +2324,9 @@ impl Resume {
             resume @ (Self::EvalScript(_) | Self::Test262Agent(_)) => resume.resume(
                 runtime,
                 match result {
-                    NativeConversion::Value(value) => Completion::Return(Value::String(value)),
+                    NativeConversion::Value(value) => {
+                        Completion::Return(runtime.into_jsvalue(Value::String(value))?)
+                    }
                     NativeConversion::Throw(value) => Completion::Throw(value),
                 },
             ),
@@ -1407,8 +2335,8 @@ impl Resume {
 
             Self::RegExpIterator(resume) => resume.string(runtime, result).map(Into::into),
 
-            Self::FunctionText(resume) => resume.string(result).map(Into::into),
-            Self::DynamicFunction(resume) => resume.string(result).map(Into::into),
+            Self::FunctionText(resume) => resume.string(runtime, result).map(Into::into),
+            Self::DynamicFunction(resume) => resume.string(runtime, result).map(Into::into),
             Self::JsonParse(resume) => resume.string(runtime, result).map(Into::into),
             Self::JsonStringify(resume) => resume.string(runtime, result).map(Into::into),
             Self::JsonRaw(resume) => resume
@@ -1423,9 +2351,15 @@ impl Resume {
 
             Self::ArraySort(resume) => resume.string(runtime, result).map(Into::into),
             Self::ArrayString(resume) => resume.string(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "string result has no continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "string result has no continuation",
+                ))
+            }
         }
     }
 }
@@ -1448,9 +2382,15 @@ impl Resume {
 
             Self::Collection(resume) => resume.prototype(runtime, result).map(Into::into),
             Self::IteratorConstructor(resume) => resume.prototype(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "constructor prototype source has no continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "constructor prototype source has no continuation",
+                ))
+            }
         }
     }
     pub(super) fn element(
@@ -1467,9 +2407,15 @@ impl Resume {
 
             Self::TypedIteration(resume) => resume.element(runtime, result).map(Into::into),
             Self::TypedElement(resume) => resume.element(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "element result has no continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "element result has no continuation",
+                ))
+            }
         }
     }
     pub(super) fn typed_species(
@@ -1483,9 +2429,15 @@ impl Resume {
             Self::TypedSlice(resume) => resume.species(runtime, result).map(Into::into),
 
             Self::TypedIteration(resume) => resume.species(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "typed species result has no continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "typed species result has no continuation",
+                ))
+            }
         }
     }
 }
@@ -1499,9 +2451,15 @@ impl Resume {
         match self {
             Self::RegExpMatchAll(resume) => resume.species(runtime, result).map(Into::into),
             Self::RegExpSplit(resume) => resume.species(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "RegExp species has no continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "RegExp species has no continuation",
+                ))
+            }
         }
     }
 }
@@ -1514,21 +2472,40 @@ impl Resume {
     ) -> Result<Step, crate::engine::api::runtime_error::RuntimeError> {
         match self {
             Self::TypedCreate(resume) => resume.method(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "typed iterator method has no continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                if let NativeConversion::Throw(value) = result {
+                    let _ = runtime.release_jsvalue(value);
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "typed iterator method has no continuation",
+                ))
+            }
         }
     }
     pub(super) fn typed_collected(
         self,
         runtime: &Runtime,
-        result: NativeConversion<Vec<Value>>,
+        result: NativeConversion<Vec<JsValue>>,
     ) -> Result<Step, crate::engine::api::runtime_error::RuntimeError> {
         match self {
             Self::TypedCreate(resume) => resume.collected(runtime, result).map(Into::into),
-            _ => Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
-                "typed collected values have no continuation",
-            )),
+            resume => {
+                resume.release_owned();
+                match result {
+                    NativeConversion::Value(values) => {
+                        for value in values {
+                            let _ = runtime.release_jsvalue(value);
+                        }
+                    }
+                    NativeConversion::Throw(value) => {
+                        let _ = runtime.release_jsvalue(value);
+                    }
+                }
+                Err(crate::engine::api::runtime_error::RuntimeError::Invariant(
+                    "typed collected values have no continuation",
+                ))
+            }
         }
     }
 }

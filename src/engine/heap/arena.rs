@@ -1,4 +1,5 @@
 use super::*;
+use std::cell::Cell;
 
 impl Heap {
     #[must_use]
@@ -13,6 +14,8 @@ impl Heap {
             zero_queue: VecDeque::new(),
             weak_head: None,
             weak_tail: None,
+            #[cfg(debug_assertions)]
+            alloc_sites: Vec::new(),
         }
     }
 
@@ -76,6 +79,16 @@ impl Heap {
         &mut self,
         kind: HeapNodeKind,
     ) -> Result<(u32, u32), HeapError> {
+        let (index, generation) = self.reserve_vacant()?;
+        self.slots[index as usize].state = SlotState::Initializing { kind, strong: 1 };
+        #[cfg(debug_assertions)]
+        self.record_alloc_site(index, generation, kind);
+        Ok((index, generation))
+    }
+
+    /// Reserve storage without transporting a wide node payload. Callers must
+    /// publish immediately or install Initializing before any fallible work.
+    fn reserve_vacant(&mut self) -> Result<(u32, u32), HeapError> {
         let index = if let Some(index) = self.free.pop() {
             index
         } else {
@@ -104,8 +117,38 @@ impl Heap {
                 "free list referenced a linked weak-collection slot",
             ));
         }
-        slot.state = SlotState::Initializing { kind, strong: 1 };
         Ok((index, slot.generation))
+    }
+
+    // Leaf payloads own no outgoing heap edges. Keep their concrete variants at
+    // the final slot assignment: passing NodeData through publish caused two
+    // arena-sized memcpy operations even with publish inlined in release builds.
+    pub(in crate::engine::heap) fn allocate_string_leaf(
+        &mut self,
+        value: JsString,
+    ) -> Result<StringId, HeapError> {
+        let (index, generation) = self.reserve_vacant()?;
+        self.slots[index as usize].state = SlotState::Live(Node {
+            strong: Cell::new(1),
+            data: NodeData::String(value),
+        });
+        #[cfg(debug_assertions)]
+        self.record_alloc_site(index, generation, HeapNodeKind::String);
+        Ok(StringId { index, generation })
+    }
+
+    pub(in crate::engine::heap) fn allocate_bigint_leaf(
+        &mut self,
+        value: JsBigInt,
+    ) -> Result<BigIntId, HeapError> {
+        let (index, generation) = self.reserve_vacant()?;
+        self.slots[index as usize].state = SlotState::Live(Node {
+            strong: Cell::new(1),
+            data: NodeData::BigInt(value),
+        });
+        #[cfg(debug_assertions)]
+        self.record_alloc_site(index, generation, HeapNodeKind::BigInt);
+        Ok(BigIntId { index, generation })
     }
 
     pub(in crate::engine::heap) fn abort_initializing(
@@ -123,9 +166,14 @@ impl Heap {
         }
         slot.state = SlotState::Vacant;
         self.free.push(index);
+        #[cfg(debug_assertions)]
+        self.clear_alloc_site(index);
         Ok(())
     }
 
+    // Expose the concrete payload variant to allocation sites, so leaf nodes
+    // do not travel through an opaque wide-enum copy in no-LTO builds.
+    #[inline]
     pub(in crate::engine::heap) fn publish(
         &mut self,
         index: u32,
@@ -149,7 +197,10 @@ impl Heap {
                 "initializing slot metadata did not match its payload",
             ));
         }
-        slot.state = SlotState::Live(Node { strong, data });
+        slot.state = SlotState::Live(Node {
+            strong: Cell::new(strong),
+            data,
+        });
         Ok(())
     }
 
@@ -171,6 +222,38 @@ impl Heap {
                 index: id.index(),
                 generation: id.generation(),
             }),
+        }
+    }
+
+    /// Trusted accessor for a handle that a live owning edge keeps valid.
+    ///
+    /// The generation check runs only in debug builds; release builds keep the
+    /// `Vec` bounds check. A non-live slot or wrong kind at a trusted call site
+    /// is a heap invariant violation, so it panics rather than returning an
+    /// error. General and untrusted callers must keep using
+    /// [`Heap::live_node`].
+    #[inline]
+    pub(in crate::engine::heap) fn live_node_fast(&self, id: RawId) -> &Node {
+        debug_assert!(
+            self.validate_slot_identity(id).is_ok(),
+            "trusted handle failed its debug identity check"
+        );
+        match &self.slots[id.index() as usize].state {
+            SlotState::Live(node) => node,
+            _ => unreachable!("trusted handle reached a non-live slot"),
+        }
+    }
+
+    /// Trusted mutable accessor paired with [`Heap::live_node_fast`].
+    #[inline]
+    pub(in crate::engine::heap) fn live_node_fast_mut(&mut self, id: RawId) -> &mut Node {
+        debug_assert!(
+            self.validate_slot_identity(id).is_ok(),
+            "trusted handle failed its debug identity check"
+        );
+        match &mut self.slots[id.index() as usize].state {
+            SlotState::Live(node) => node,
+            _ => unreachable!("trusted handle reached a non-live slot"),
         }
     }
 
@@ -197,7 +280,9 @@ impl Heap {
             NodeData::Shape(_)
             | NodeData::VarRef(_)
             | NodeData::Context(_)
-            | NodeData::FunctionBytecode(_) => Err(HeapError::Invariant(
+            | NodeData::FunctionBytecode(_)
+            | NodeData::String(_)
+            | NodeData::BigInt(_) => Err(HeapError::Invariant(
                 "typed object lookup reached another node payload",
             )),
         }
@@ -212,7 +297,9 @@ impl Heap {
             NodeData::Object(_)
             | NodeData::Shape(_)
             | NodeData::Context(_)
-            | NodeData::FunctionBytecode(_) => Err(HeapError::Invariant(
+            | NodeData::FunctionBytecode(_)
+            | NodeData::String(_)
+            | NodeData::BigInt(_) => Err(HeapError::Invariant(
                 "typed var-ref lookup reached another node payload",
             )),
         }
@@ -224,6 +311,12 @@ impl Heap {
             index: id.index(),
             generation: id.generation(),
         })
+    }
+
+    /// Overwrite one live node's strong count for saturation tests.
+    #[cfg(test)]
+    pub(in crate::engine::heap) fn set_strong_count_for_test(&mut self, id: RawId, count: u32) {
+        self.live_node_fast_mut(id).strong.set(count);
     }
 
     pub(in crate::engine::heap) fn is_live(&self, id: RawId) -> bool {

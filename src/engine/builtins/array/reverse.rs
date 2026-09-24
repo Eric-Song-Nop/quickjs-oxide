@@ -3,7 +3,7 @@ use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     heap::ContextId,
     object::{ObjectRef, PropertyKey, operations::InternalSetResult},
-    value::{Value, conversion::NativeConversion},
+    value::{JsValue, conversion::NativeConversion},
     vm::{Completion, call::NativeInvocation},
 };
 pub(crate) enum ReverseStep {
@@ -38,6 +38,7 @@ impl std::ops::DerefMut for ReverseResume {
 }
 const _: () = assert!(std::mem::size_of::<ReverseResume>() <= 8);
 pub(crate) struct ReverseResumeState {
+    runtime: Runtime,
     pending_effect: ReverseStepPending,
     scheduler_set_key: Option<PropertyKey>,
     realm: ContextId,
@@ -45,8 +46,24 @@ pub(crate) struct ReverseResumeState {
     phase: Phase,
     lower: u64,
     upper: u64,
-    lower_value: Option<Value>,
-    upper_value: Option<Value>,
+    lower_value: Option<JsValue>,
+    upper_value: Option<JsValue>,
+}
+impl Drop for ReverseResumeState {
+    fn drop(&mut self) {
+        for value in [self.lower_value.take(), self.upper_value.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.pending_effect.number_value.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+        if let Some(value) = self.pending_effect.set_value.take() {
+            let _ = self.runtime.release_jsvalue(value);
+        }
+    }
 }
 impl ReverseStep {
     pub(crate) fn start(
@@ -59,14 +76,18 @@ impl ReverseStep {
                 "Array reverse requires generic invocation",
             ));
         };
-        let object = match runtime.native_to_object(realm, this_value.clone())? {
-            NativeConversion::Value(value) => value,
-            NativeConversion::Throw(value) => return Ok(Self::Complete(Completion::Throw(value))),
-        };
+        let object =
+            match runtime.native_to_object_jsvalue(realm, runtime.dup_jsvalue(this_value)?)? {
+                NativeConversion::Value(value) => value,
+                NativeConversion::Throw(value) => {
+                    return Ok(Self::Complete(Completion::Throw(value)));
+                }
+            };
         Ok(Self::request_read(
             object.clone(),
             runtime.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Length)?,
             ReverseResume(Box::new(ReverseResumeState {
+                runtime: runtime.clone(),
                 pending_effect: ReverseStepPending::default(),
                 scheduler_set_key: None,
                 realm,
@@ -104,16 +125,23 @@ impl ReverseResume {
                 Ok(ReverseStep::request_number(value, self))
             }
             Phase::LowerRead => {
-                self.0.lower_value = Some(value);
+                if let Some(previous) = self.0.lower_value.replace(value) {
+                    runtime.release_jsvalue(previous)?;
+                }
                 self.upper(runtime)
             }
             Phase::UpperRead => {
-                self.0.upper_value = Some(value);
+                if let Some(previous) = self.0.upper_value.replace(value) {
+                    runtime.release_jsvalue(previous)?;
+                }
                 self.write_lower(runtime)
             }
-            _ => Err(RuntimeError::Invariant(
-                "Array reverse value phase mismatch",
-            )),
+            _ => {
+                runtime.release_jsvalue(value)?;
+                Err(RuntimeError::Invariant(
+                    "Array reverse value phase mismatch",
+                ))
+            }
         }
     }
     pub(crate) fn number(
@@ -122,6 +150,9 @@ impl ReverseResume {
         result: NativeConversion<f64>,
     ) -> Result<ReverseStep, RuntimeError> {
         if !matches!(self.0.phase, Phase::Number) {
+            if let NativeConversion::Throw(value) = result {
+                let _ = runtime.release_jsvalue(value);
+            }
             return Err(RuntimeError::Invariant(
                 "Array reverse number phase mismatch",
             ));
@@ -136,13 +167,17 @@ impl ReverseResume {
     }
     fn next(mut self, runtime: &Runtime) -> Result<ReverseStep, RuntimeError> {
         if self.0.lower >= self.0.upper {
-            return Ok(ReverseStep::Complete(Completion::Return(Value::Object(
-                self.0.object,
+            return Ok(ReverseStep::Complete(Completion::Return(JsValue::Object(
+                self.0.object.clone().into_handle(),
             ))));
         }
         self.0.phase = Phase::LowerHas;
-        self.0.lower_value = None;
-        self.0.upper_value = None;
+        for value in [self.0.lower_value.take(), self.0.upper_value.take()]
+            .into_iter()
+            .flatten()
+        {
+            runtime.release_jsvalue(value)?;
+        }
         Ok(ReverseStep::request_has(
             self.0.object.clone(),
             runtime.property_key_for_index(self.0.lower)?,
@@ -159,10 +194,11 @@ impl ReverseResume {
     }
     fn write_lower(mut self, runtime: &Runtime) -> Result<ReverseStep, RuntimeError> {
         self.0.phase = Phase::LowerWrite;
+        let key = runtime.property_key_for_index(self.0.lower)?;
         if let Some(value) = self.0.upper_value.take() {
             Ok(ReverseStep::request_set(
                 self.0.object.clone(),
-                runtime.property_key_for_index(self.0.lower)?,
+                key,
                 value,
                 self,
             ))
@@ -178,10 +214,11 @@ impl ReverseResume {
     }
     fn write_upper(mut self, runtime: &Runtime) -> Result<ReverseStep, RuntimeError> {
         self.0.phase = Phase::UpperWrite;
+        let key = runtime.property_key_for_index(self.0.upper)?;
         if let Some(value) = self.0.lower_value.take() {
             Ok(ReverseStep::request_set(
                 self.0.object.clone(),
-                runtime.property_key_for_index(self.0.upper)?,
+                key,
                 value,
                 self,
             ))
@@ -236,7 +273,7 @@ impl ReverseResume {
             Phase::LowerWrite | Phase::UpperWrite => {
                 if !value {
                     return Ok(ReverseStep::Complete(Completion::Throw(
-                        runtime.new_native_error(
+                        runtime.new_native_error_jsvalue(
                             self.0.realm,
                             NativeErrorKind::Type,
                             "could not delete property",
@@ -288,7 +325,7 @@ pub(crate) fn finish(
             }
             ReverseStep::Number { mut resume } => {
                 let value = resume.take_number_value();
-                resume.number(runtime, runtime.native_to_number(realm, &value)?)?
+                resume.number(runtime, runtime.native_to_number_jsvalue(realm, value)?)?
             }
             ReverseStep::Has { mut resume } => {
                 let object = resume.take_has_object();
@@ -303,12 +340,12 @@ pub(crate) fn finish(
                 let key = resume.take_set_key();
                 let value = resume.take_set_value();
                 {
-                    let result = runtime.internal_set(
+                    let result = runtime.internal_set_jsvalue(
                         realm,
                         &object,
                         &key,
                         value,
-                        Value::Object(object.clone()),
+                        JsValue::Object(object.clone().into_handle()),
                     )?;
                     resume.set(runtime, key, result)?
                 }
@@ -329,12 +366,12 @@ pub(crate) fn finish(
 struct ReverseStepPending {
     read_object: Option<ObjectRef>,
     read_key: Option<PropertyKey>,
-    number_value: Option<Value>,
+    number_value: Option<JsValue>,
     has_object: Option<ObjectRef>,
     has_key: Option<PropertyKey>,
     set_object: Option<ObjectRef>,
     set_key: Option<PropertyKey>,
-    set_value: Option<Value>,
+    set_value: Option<JsValue>,
     delete_object: Option<ObjectRef>,
     delete_key: Option<PropertyKey>,
 }
@@ -348,7 +385,7 @@ impl ReverseStep {
         resume.0.pending_effect.read_key = Some(key);
         Self::Read { resume }
     }
-    pub(crate) fn request_number(value: Value, mut resume: ReverseResume) -> Self {
+    pub(crate) fn request_number(value: JsValue, mut resume: ReverseResume) -> Self {
         resume.0.pending_effect.number_value = Some(value);
         Self::Number { resume }
     }
@@ -364,7 +401,7 @@ impl ReverseStep {
     pub(crate) fn request_set(
         object: ObjectRef,
         key: PropertyKey,
-        value: Value,
+        value: JsValue,
         mut resume: ReverseResume,
     ) -> Self {
         resume.0.pending_effect.set_object = Some(object);
@@ -397,7 +434,7 @@ impl ReverseResume {
             .take()
             .expect("ReverseStep Read key")
     }
-    pub(crate) fn take_number_value(&mut self) -> Value {
+    pub(crate) fn take_number_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .number_value
@@ -432,7 +469,7 @@ impl ReverseResume {
             .take()
             .expect("ReverseStep Set key")
     }
-    pub(crate) fn take_set_value(&mut self) -> Value {
+    pub(crate) fn take_set_value(&mut self) -> JsValue {
         self.0
             .pending_effect
             .set_value
