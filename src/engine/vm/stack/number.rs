@@ -44,6 +44,22 @@ impl SlotStore {
         Ok(Some(result))
     }
 
+    /// Non-failing writeback after `immediate_local` proved the target holds a
+    /// direct number: the replaced binding is a scalar, so no release,
+    /// capacity check or arena access is involved.
+    #[inline]
+    pub(super) fn store_number_local_current(
+        &mut self,
+        window: &FrameWindow,
+        index: u16,
+        value: Number,
+    ) {
+        self.slots[window.locals().start + usize::from(index)] =
+            Some(FrameBinding::Direct(value.into()));
+        #[cfg(feature = "profiling")]
+        record_owned_storage(Cost::Move(1));
+    }
+
     pub(super) fn update_number_local_current(
         &mut self,
         window: &mut FrameWindow,

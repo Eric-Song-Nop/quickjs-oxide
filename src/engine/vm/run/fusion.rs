@@ -1,6 +1,7 @@
 //! Number-only execution of publication-authenticated canonical spans.
-use super::{Error, Instruction, RunSlots};
+use super::{BytecodeConstant, Error, Instruction, RawValue, RunSlots};
 use crate::engine::code::fusion::UpdateLocal;
+use crate::engine::value::number::operations::Number;
 
 pub(super) fn update_local(
     slots: &mut RunSlots<'_>,
@@ -23,6 +24,136 @@ pub(super) fn update_local(
         "fusion.UpdateLocalPrefix"
     });
     Ok(true)
+}
+
+/// The comparison semantics shared by the stack-consuming `CompareBranch`
+/// span and the non-consuming local span. NaN and signed-zero behavior is the
+/// float comparison itself; the caller has already proven both operands are
+/// numbers.
+#[inline(always)]
+fn compare_numbers(instruction: &Instruction, left: Number, right: Number) -> bool {
+    let (left, right) = (left.float(), right.float());
+    match instruction {
+        Instruction::Lt => left < right,
+        Instruction::Lte => left <= right,
+        Instruction::Gt => left > right,
+        Instruction::Gte => left >= right,
+        Instruction::Eq | Instruction::StrictEq => left == right,
+        Instruction::Neq | Instruction::StrictNeq => left != right,
+        _ => unreachable!("comparison opcode was validated before the transaction"),
+    }
+}
+
+/// S2/S4 numeric writeback for one `LocalAdd` span:
+/// `producer(a); producer(b) | number; Add; store(a)[; Drop]`. The guard reads
+/// the operands non-owningly and the writeback replaces a scalar, so a hit
+/// cannot release an owner, allocate or fail; a miss returns `None` before
+/// changing anything. Outlined on purpose: the `GetLocal` arm keeps the shape
+/// of the pre-S2 build, whose hot loops are sensitive to added inline branches.
+#[inline(never)]
+pub(super) fn numeric_local_add(
+    slots: &mut RunSlots<'_>,
+    executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
+    pc: usize,
+    index: u16,
+) -> Option<()> {
+    let operands = executable.code.get(pc..)?;
+    let right = match operands {
+        [
+            _,
+            Instruction::GetLocal(right) | Instruction::GetLocalCheck(right),
+            ..,
+        ] => slots.immediate_local(*right)?,
+        [_, Instruction::PushI32(value), ..] => Number::Int(*value),
+        [_, Instruction::PushConst(key), ..] => match executable.constant(*key) {
+            Some(BytecodeConstant::Value(RawValue::Int(value))) => Number::Int(*value),
+            Some(BytecodeConstant::Value(RawValue::Float(value))) => Number::Float(*value),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let left = slots.immediate_local(index)?;
+    slots.store_number_local(index, left.add(right));
+    Some(())
+}
+
+/// S3 numeric writeback for one `LocalFieldAddStore` span:
+/// `producer(acc); producer(base); GetField(key); Add; store(acc)[; Drop]`.
+/// The guard reads the accumulator and the base binding non-owningly and takes
+/// the cached field value without creating an owner edge, so a hit cannot
+/// release an owner, allocate or fail; a miss returns `None` before changing
+/// anything. Outlined for the same layout reason as `numeric_local_add`.
+#[inline(never)]
+pub(super) fn numeric_local_field_add(
+    slots: &mut RunSlots<'_>,
+    runtime: &crate::engine::api::runtime::Runtime,
+    executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
+    pc: usize,
+    index: u16,
+) -> Option<()> {
+    let operands = executable.code.get(pc..)?;
+    let (base, key) = match operands {
+        [
+            _,
+            Instruction::GetLocal(base) | Instruction::GetLocalCheck(base),
+            Instruction::GetField(key),
+            Instruction::Add,
+            ..,
+        ] => (*base, *key),
+        _ => return None,
+    };
+    let base = slots.immediate_object_local(base)?;
+    let value = runtime.property_ic_peek_number(base, executable, pc + 2, key)?;
+    let left = slots.immediate_local(index)?;
+    slots.store_number_local(index, left.add(value));
+    Some(())
+}
+
+/// Execute an S1 `producer(a); producer(b); cmp; If*; [Goto]` span. Both
+/// bindings are read non-owningly; on any guard miss nothing has changed and
+/// the caller re-runs the canonical span start. `code` begins at the span's
+/// first PC, `instructions` is its authenticated length (4 or 5), and `pc`
+/// supplies the no-`Goto` fallthrough.
+#[inline]
+pub(super) fn local_compare_branch(
+    slots: &RunSlots<'_>,
+    code: &[Instruction],
+    pc: usize,
+    instructions: usize,
+) -> Option<usize> {
+    let (left, right) = match (code.first()?, code.get(1)?) {
+        (
+            Instruction::GetLocal(left) | Instruction::GetLocalCheck(left),
+            Instruction::GetLocal(right) | Instruction::GetLocalCheck(right),
+        ) => (
+            slots.immediate_local(*left)?,
+            slots.immediate_local(*right)?,
+        ),
+        (
+            Instruction::GetLocal(left) | Instruction::GetLocalCheck(left),
+            Instruction::GetArg(right),
+        ) => (
+            slots.immediate_local(*left)?,
+            slots.immediate_parameter(*right)?,
+        ),
+        _ => return None,
+    };
+    let (target, when) = match code.get(3)? {
+        Instruction::IfTrue(target) => (*target as usize, true),
+        Instruction::IfFalse(target) => (*target as usize, false),
+        _ => return None,
+    };
+    let taken = compare_numbers(code.get(2)?, left, right) == when;
+    Some(if taken {
+        target
+    } else if instructions == 5 {
+        match code.get(4)? {
+            Instruction::Goto(next) => *next as usize,
+            _ => return None,
+        }
+    } else {
+        pc + 4
+    })
 }
 
 // Keep the number-pair comparison inlined into `run`: without the hint the
@@ -179,6 +310,179 @@ mod tests {
             let final=0;try{final++;throw 1;}catch(error){++final;}finally{final++;}
             return old===3 && x===4 && caught && y===77 && add===3 && sum===3 && read===2
                 && first.value===0 && !first.done && second.value===2 && second.done && final===3;
+        })()"#
+                )
+                .unwrap(),
+            Value::Bool(true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_compare_tests {
+    use crate::engine::api::{Runtime, Value};
+
+    #[test]
+    fn every_operator_and_edge_value_matches_canonical_results() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        assert_eq!(
+            context
+                .eval(
+                    r#"((n)=>{
+            let a=0; for (let i=0;i<n;i++) a++;
+            let b=0; for (let i=n;i>0;i--) b++;
+            let c=0; for (let i=0;i<=n;i++) c++;
+            let d=0; for (let i=n;i>=0;i--) d++;
+            let e=0; for (let i=0;i!=n;i++) e++;
+            let base=0; let f=0; for (let i=0;i==base;i++) f++;
+            let g=0; for (let i=0;i!==n;i++) g++;
+            let h=0; for (let i=0;i===base;i++) h++;
+            let localBound=3; let lb=0; for (let i=0;i<localBound;i++) lb++;
+            let nan=NaN; let zeros=0; for (let i=0;i<nan;i++) zeros++;
+            let negative=-0; let negativeBody=0; for (let i=0;i<negative;i++) negativeBody++;
+            return a===4&&b===4&&c===5&&d===5&&e===4&&f===1&&g===4&&h===1&&lb===3
+                && zeros===0 && negativeBody===0;
+        })(4)"#
+                )
+                .unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn coercion_capture_tdz_and_bigint_stay_canonical() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        assert_eq!(
+            context
+                .eval(
+                    r#"(()=>{
+            let conversions=0;
+            let limit={valueOf(){conversions++; return 3;}};
+            let body=0; for (let i=0;i<limit;i++) body++;
+            let text='0'; let textBody=0; for (let i=0;i<text;i++) textBody++;
+            let captured=0; function peek(){return captured;}
+            let three=3; for (;captured<three;) captured++;
+            let tdz=false;
+            try { if (later<1) {} } catch(e) { tdz=e instanceof ReferenceError; }
+            let later=1;
+            let big=0; for (let i=0n;i<3n;i++) big++;
+            return conversions===4 && body===3 && textBody===0
+                && captured===3 && peek()===3 && tdz && big===3;
+        })()"#
+                )
+                .unwrap(),
+            Value::Bool(true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_field_add_tests {
+    use crate::engine::api::{Runtime, Value};
+
+    #[test]
+    fn field_accumulators_match_canonical_results() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        assert_eq!(
+            context
+                .eval(
+                    r#"(()=>{
+            let s=0; let o={a:1}; for(let i=0;i<1000;i++) s+=o.a;
+            let t=0; let f={a:0.5}; for(let i=0;i<1000;i++) t+=f.a;
+            let proto={a:2}; let p=Object.create(proto); let u=0; for(let i=0;i<10;i++) u+=p.a;
+            let w={a:10}; let overflow=2147483645; overflow+=w.a;
+            let z=1; let n={a:-0}; z+=n.a;
+            let sum=0n; let b={a:1n}; for(let i=0;i<3;i++) sum+=b.a;
+            return s===1000 && t===500 && u===20 && overflow===2147483655 && z===1 && sum===3n;
+        })()"#
+                )
+                .unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn getters_strings_and_shape_changes_stay_canonical() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        assert_eq!(
+            context
+                .eval(
+                    r#"(()=>{
+            let log=[];
+            let g={get a(){log.push('get'); return 3;}}; let s=0; for(let i=0;i<3;i++) s+=g.a;
+            let text={a:'x'}; let joined=''; for(let i=0;i<2;i++) joined+=text.a;
+            let changing={a:1}; let mixed=0; for(let i=0;i<2;i++) mixed+=changing.a;
+            changing.a='2'; mixed+=changing.a;
+            let captured=0; let c={a:1}; function read(){return captured;}
+            for(let i=0;i<3;i++) captured+=c.a;
+            let base={a:5}; let deleted=0; for(let i=0;i<2;i++) deleted+=base.a;
+            delete base.a; base.a=7; deleted+=base.a;
+            let inherited=0; let holder={a:1}; let child=Object.create(holder);
+            for(let i=0;i<2;i++) inherited+=child.a;
+            Object.setPrototypeOf(child,{a:4}); inherited+=child.a;
+            return s===9 && log.length===3 && joined==='xx' && mixed==='22'
+                && captured===3 && read()===3 && deleted===17 && inherited===6;
+        })()"#
+                )
+                .unwrap(),
+            Value::Bool(true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_add_tests {
+    use crate::engine::api::{Runtime, Value};
+
+    #[test]
+    fn numeric_literal_and_pair_accumulators_match_canonical_results() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        assert_eq!(
+            context
+                .eval(
+                    r#"(()=>{
+            let s=0; for (let i=0;i<1000;i++) s=s+1;
+            let t=0; for (let i=0;i<1000;i++) t=t+t;
+            let u=5; for (let i=0;i<10;i++) u=u+u;
+            let v=0; for (let i=0;i<1000;i++) v=v+0.5;
+            let w=2147483645; for (let i=0;i<5;i++) w=w+1;
+            let x=0; for (let i=0;i<3;i++) x=x+2.5;
+            let direct; direct=1; let y=0; for (let i=0;i<4;i++) y=y+direct;
+            let kept=0; for (let i=0;i<3;i++) kept=(kept=kept+1);
+            return s===1000 && t===0 && u===5120 && v===500
+                && w===2147483650 && x===7.5 && y===4 && kept===3;
+        })()"#
+                )
+                .unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn string_bigint_captured_and_tdz_accumulators_stay_canonical() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        assert_eq!(
+            context
+                .eval(
+                    r#"(()=>{
+            let text='a'; for (let i=0;i<3;i++) text=text+1;
+            let big=0n; for (let i=0;i<3;i++) big=big+1n;
+            let typeError=false;
+            try { let mixed=0n; for (let i=0;i<1;i++) mixed=mixed+1; }
+            catch(e) { typeError=e instanceof TypeError; }
+            let captured=0; function peek(){return captured;}
+            for (let i=0;i<3;i++) captured=captured+1;
+            let tdz=false;
+            try { (()=>{ later=later+1; let later; })(); }
+            catch(e) { tdz=e instanceof ReferenceError; }
+            return text==='a111' && big===3n && typeError
+                && captured===3 && peek()===3 && tdz;
         })()"#
                 )
                 .unwrap(),
