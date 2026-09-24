@@ -600,3 +600,385 @@ perf record -F 999 --call-graph dwarf -o target/perf-p1b-functions.data -- bash 
      target/compile-corpus/functions-4194304.js >/dev/null; done'
 perf report -i target/perf-p1b-functions.data --stdio --no-children
 ```
+
+### 9.8 P2 checkpoint（P2a `7f8fc101` + P2b commit-path reuse，2026-09-24）
+
+P2a（`7f8fc101`：`LookaheadCache` 备忘 17 处 clone-lexer 探针）与 P2b
+（commit-path reuse：提交扫描直接消费探针已备忘的 token；原计划的 `TokenBuffer`
+全量改造按实测取消，见 `docs/lexer-parser-refactor.md` §3 P2b）相对 §9.6 P1b 的
+checkpoint。度量口径与 §9.6 相同（P1b/P2a/P2b 三探针交错各 7 次取最小值，
+4MB 扣 64KB tiny 档；task-clock 粒度 10ms，约 ±0.7% 噪声）。探针目录：
+`target/p1b-*`、`target/p2a-*`、`target/p2b-final-*`。
+
+命中数据（4MB 档，profiling 探针 stderr；提交复用=提交路径消费的探针备忘项；
+`max_entries` 是缓存活跃条目峰值，上限 8192）：
+
+| 语料 | 探针命中 | 探针未命中 | 命中率 | 提交复用（P2b） | max_entries |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| functions | 292,314 | 533,644 | 35.4% | 421,476 | 24 |
+| expressions | 245,017 | 649,709 | 27.4% | 388,173 | 31 |
+| syntax-mixed | 325,916 | 767,837 | 29.8% | 555,162 | 25 |
+
+perf（4MB 扣 64KB tiny 档，三探针交错 7 次最小值）：
+
+| 语料 | 指标 | P1b | P2a（vs P1b） | P2b（vs P1b） |
+| --- | --- | ---: | ---: | ---: |
+| functions | instr/KB | 2,621,754 | 2,597,486（−0.9%） | 2,488,994（−5.1%） |
+| | cycles/KB | 1,394,373 | 1,348,550（−3.3%） | 1,324,844（−5.0%） |
+| | cache-ref/KB | 84,328 | 86,184（+2.2%） | 85,441（+1.3%） |
+| | cache-miss/KB | 5,107 | 5,112（+0.1%） | 5,117（+0.2%） |
+| | task-clock/KB | 0.335 ms | 0.328 ms（−2.1%） | 0.321 ms（−4.0%） |
+| | IPC | 1.88 | 1.93 | 1.88 |
+| expressions | instr/KB | 1,751,097 | 1,748,105（−0.2%） | 1,657,049（−5.4%） |
+| | cycles/KB | 821,956 | 796,958（−3.0%） | 771,238（−6.2%） |
+| | cache-ref/KB | 40,764 | 42,478（+4.2%） | 42,149（+3.4%） |
+| | cache-miss/KB | 1,482 | 1,476（−0.4%） | 1,454（−1.9%） |
+| | task-clock/KB | 0.209 ms | 0.203 ms（−2.9%） | 0.197 ms（−5.9%） |
+| | IPC | 2.13 | 2.19 | 2.15 |
+| syntax-mixed | instr/KB | 2,585,892 | 2,582,731（−0.1%） | 2,453,895（−5.1%） |
+| | cycles/KB | 1,517,328 | 1,497,006（−1.3%） | 1,420,726（−6.4%） |
+| | cache-ref/KB | 70,395 | 72,558（+3.1%） | 71,212（+1.2%） |
+| | cache-miss/KB | 4,691 | 4,687（−0.1%） | 4,631（−1.3%） |
+| | task-clock/KB | 0.383 ms | 0.381 ms（−0.5%） | 0.361 ms（−5.8%） |
+| | IPC | 1.70 | 1.73 | 1.73 |
+
+分配（4MB 档，计数逐次完全一致；P2 相对 P1b 的差就是缓存 `Vec` 本身）：
+
+| 语料 | P1b alloc | P2b alloc | 差值 | P1b 分配字节 | P2b 分配字节 | peak live 差值 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| functions | 5,574,821 | 5,574,827 | +6 | 793.4 MB | 793.4 MB | +16,384 B |
+| expressions | 2,745,314 | 2,745,320 | +6 | 650.0 MB | 650.0 MB | +16,384 B |
+| syntax-mixed | 6,548,538 | 6,548,544 | +6 | 1,180.0 MB | 1,180.0 MB | +16,384 B |
+
+相对 P0 基线（§9.1/§9.2，P2b）：alloc 次数 functions −27.7%、
+expressions −32.4%、syntax-mixed −22.4%（与 P1b 持平）；instr/KB
+−14.1%/−10.7%/−9.4%；cache-miss/KB −70.9%/−36.1%/−32.6%；task-clock
+−26.2%/−21.5%/−21.9%。
+
+#### 9.8.1 test262 `--full`（语义中立验证）
+
+P2 全量报告 `target/test262-full.tsv`（engine hash `6e6e2003…`，2026-09-24）
+与 P1b 报告（`5dbb43ca…`）除首行 hash 外**逐字节一致**：body sha256 均为
+`971cc666…`，summary 行一致（pass=80010、fail-parse=7、fail-runtime=43、
+unsupported-negative-provenance=2534 等，102,037 variants）。runner 的
+line-count/checksum/diagnostic-contract/metadata/classified-vector 检查全部
+通过；已知 +28 runnable 漂移（80060 vs 里程碑 80032）为 P1a/P1b 既有问题，
+与本次改动无关。
+
+#### 9.8.2 真实 bundle 矩阵与病态用例
+
+`scripts/benchmark/compile_matrix.py --corpus target/compile-bundles --metric
+compile --repeat 5`，P1b/P2b 探针同场交错（每 case 5 次取中位）：
+
+| 引擎 | 中位吞吐 | 范围 | 每 case 比值（P1b/P2b） |
+| --- | ---: | ---: | ---: |
+| P1b | 5.461 MB/s | 4.838–11.706 | — |
+| P2b | 5.953 MB/s | 5.026–12.396 | 中位 1.080（几何均值 1.070，52/67 case 更快） |
+
+真实 bundle（67 个多小文件，约 34KB）上 P2 收益（中位吞吐 +9.0%）大于 4MB
+生成语料（task-clock −4.0%~−5.9%）：小文件上探针/提交重扫在总时间中占比更高。
+
+病态用例 `test/staging/sm/String/string-upper-lower-mapping.js`（3.2 MB 数组
+字面量）用非 profiling 探针复测：P1b 360–378ms（3 次），P2b 355–361ms；修复
+后与 P1b 持平（缓存缺陷中间态为 272s）。
+
+结论与校准：
+
+1. **P2a 单独收益很小**（instr −0.1%~−0.9%、cycles −1.3%~−3.3%、task-clock 在
+   10ms 粒度噪声内）：探针重扫在总成本中占比小（命中率 27–35%，每 4MB 省
+   25–33 万次扫描），计划 §3 P2a 预期的“分配次数下降”被实测否决——token 扫描
+   本身几乎不分配，P2a 分配中性（缓存自身 +4 次/+4 KB）。
+2. **提交路径复用是 P2 的主要收益来源**：再省 39–56 万次重扫（=探针已扫、提交
+   重扫的全部浪费），相对 P1b 贡献 instr −4.2%~−5.2%、cycles −1.8%~−5.1%、
+   task-clock −2.1%~−5.3%（与 P2a 合计见表），分配中性、cache-miss 基本持平。
+   它与探针共用同一纯记忆化缓存，`tokens`/`cursor`/`relex*`/`set_future*` 语义
+   不变（见 §C.1 不变量），因此不改变提交 token 边界与 PR #30 的栈守卫采样时机。
+3. **缓存结构修复（本 checkpoint 发现）**：探针 `array_assignment_pattern_ahead`
+   会把整个 `[...]` 扫到匹配的 `]`，在巨型数组字面量上会备忘数十万 token；
+   原 `invalidate_before` 用 `Vec::drain(..k)` 从头部逐条删除，每次 advance
+   搬移整个活跃区，退化为 O(n²)：test262
+   `test/staging/sm/String/string-upper-lower-mapping.js`（3.2 MB 数组字面量，
+   约 39 万 token）从 P1b 的 376ms 恶化到 272s（>700×）。修复=活跃条目上限
+   8192 条 + `base` 偏移摊销压缩（`base >= 64` 且不小于活跃数时一次性 drain），
+   失效摊销 O(1)；该文件回到 355–361ms（非 profiling 探针，与 P1b 持平），
+   三个基准语料的命中/条目峰值不变（24/31/25 条），语义 gate 全绿。
+4. **原 P2b `TokenBuffer` 全量改造取消**：commit-path reuse 已把可归因的重扫浪费
+   全部吃掉；剩余空间（探针未命中之间的重叠、`parenthesized_parameter_tokens`
+   的 Vec 复制）远小于其 15 条不变量 + 逐产生式迁移的回归风险。
+   `parenthesized_parameter_tokens` 去复制降级为 P3 触发项（触发=分配探针可
+   归因 >1%）。因此 P2 未达 §5 原“P2a+P2b”方向目标（instr −10%~−20%、miss
+   −20%~−35%、分配 −5%~−10%），按 §5 校准规则改以本表为 P3 的起点。
+
+复现命令：按 §9.4 构建三组探针（`--output target/{p1b,p2a,p2b-final}-compile-probe`
+与 `...-alloc-probe`，分配探针加 `--probe scripts/benchmark/probes/compile_alloc_probe.rs
+--name oxide-compile-alloc-probe`；profiling 命中计数加 `--profiling`），
+perf 用三探针交错 min-of-7，alloc/RSS 直接跑探针。test262 全量用
+`target/run-test262-full.sh`（清空 `GIT_*` 环境变量），bundle 矩阵用
+`scripts/benchmark/compile_matrix.py` 并传两个 `--engine`。
+
+### 9.9 P3 lexer 字节快路（2026-09-24）
+
+改动（`src/engine/compiler/lexer.rs`）：词法扫描全面改走可移植的 ASCII 字节快
+路径，非 ASCII 与转义仍走原逐标量慢路径（语义不变）：
+
+- `peek_char`/`bump_char`：ASCII 直接读字节，跳过 UTF-8 解码与
+  `quickjs_column_delta`（原实现每字符做 slice 取字节 + filter 计数）；
+  例外是 `INVALID_BYTE_CARRIER`（0x7F）——它在 carrier 里是 ASCII，但可能代表
+  原始 continuation 字节（列增量为 0），仍走慢路径（回归测试
+  `raw_script_error_columns_scan_authored_comment_bytes` 覆盖）。
+- `skip_trivia`/`skip_to_line_end`：按首字节分派，批量跳过空白与行注释体，
+  用字节比较替代 `starts_with`（消除 `scan_punctuator`→`starts_with` 的
+  memcmp 归因）。
+- `scan_identifier_with_value`：用字节表批量消费 ASCII 标识符 run；注入
+  string limit 的报错位置按“第一个超限字符”精确对齐逐字符路径。
+- `scan_punctuator`：首字节 `match` 分派替代 55 项线性 `starts_with` 表，
+  `?.` 的非数字前瞻用字节判断。
+
+perf（4MB 扣 64KB tiny 档，P1b/P2b/P3 三探针交错 min-of-7）：
+
+| 语料 | 指标 | P2b | P3（vs P2b） | P3（vs P1b） |
+| --- | --- | ---: | ---: | ---: |
+| functions | instr/KB | 2,489,067 | 2,225,524（−10.6%） | −15.1% |
+| | cycles/KB | 1,329,333 | 1,249,775（−6.0%） | −10.5% |
+| | task-clock/KB | 0.328 ms | 0.311 ms（−5.1%） | −9.7% |
+| | cache-miss/KB | 5,068 | 5,102（+0.7%） | +3.2% |
+| expressions | instr/KB | 1,657,093 | 1,333,937（−19.5%） | −23.8% |
+| | cycles/KB | 769,071 | 656,311（−14.7%） | −19.2% |
+| | task-clock/KB | 0.199 ms | 0.175 ms（−12.0%） | −16.5% |
+| | cache-miss/KB | 1,454 | 1,456（+0.2%） | +0.8% |
+| syntax-mixed | instr/KB | 2,454,067 | 2,144,125（−12.6%） | −17.1% |
+| | cycles/KB | 1,428,572 | 1,308,482（−8.4%） | −12.6% |
+| | task-clock/KB | 0.378 ms | 0.351 ms（−7.2%） | −10.8% |
+| | cache-miss/KB | 4,665 | 4,642（−0.5%） | −0.0% |
+
+探针内计时（`compile_ns`，5 次 min）：functions 1.231s→1.130s（−8.2%）、
+expressions 0.770s→0.678s（−12.0%）；64KB 档 instr/KB −15.2%/−20.2%/−15.2%
+（同一方向，排除大文件效应）。相对 P0 累计（P2b×P3 相乘）：task-clock
+−29.9%/−30.9%/−27.5%、instr −23.2%/−28.1%/−20.8%、cache-miss
+−70.7%/−36.0%/−32.9%、分配不变（−27.7%/−32.4%/−22.4%）。
+
+真实 bundle（67 case，P2b/P3 交错 5 次）：中位吞吐 5.874→6.547 MB/s
+（**+11.5%**），每 case 比值中位 1.122（几何均值 1.121，64/67 更快）；相对 P0
+基线 4.79 MB/s 累计 **+36.7%**。
+
+分配（4MB）：三个语料的 alloc/realloc/dealloc/bytes/peak 与 P2b **逐位相同**
+（快路径零分配）。
+
+语义：全量 test262 报告与 P1b 逐字节一致（body sha `971cc666…`，102,037
+variants）；oracle 912、fixtures 13/13、unsupported_diagnostics 6、lib 2270
+全绿。
+
+flat profile（expressions 4MB，self time）：`next_token_with_goal` 4.08%→3.94%
+（占比因总量下降 −19.5% 而几乎持平，绝对成本约 −22%）、`bump_char`
+1.72%→<0.5%、`scan_punctuator` 1.49%→<0.5%、`scan_identifier_with_value`
+1.19%→0.89%；libc 桶仍是最大项（malloc/free 与 memcpy），归因不变。
+
+结论与校准：
+
+1. **P3 首项（lexer 字节快路）已超 §5 目标**：time −5.1%~−12.0%（目标
+   −3%~−6%）、instr −10.6%~−19.5%（目标 −5%~−10%）；miss ≈0（目标
+   −5%~−10%）、alloc 0（目标 0~−5%）——与 P2 一致，miss/alloc 大头不在
+   lexer，转 P4 触发项。
+2. 收益主要来自三点：消除逐字符 `quickjs_column_delta`/UTF-8 解码、消除
+   `skip_trivia`/`scan_punctuator` 的 `starts_with` 调用与 memcmp、标识符批量
+   扫描（expressions 语料标识符/标点最密，收益最大 −19.5%）。
+3. 剩余 P3 项按触发规则重判：数字字面量快路（flat profile 未见
+   `scan_number` ≥0.5%，触发不成立，跳过）；`SourceText` 共享（需分配归因，
+   分配总量未变且深拷贝未见归因，暂缓）；SmallVec/ThinVec 按 §2.4 决策规则
+   在 P4 分配归因后决定。
+
+复现命令：同 §9.8；lexer 探针为 `target/p3-lexer-{compile,alloc}-probe`，
+perf 目录 `target/p3-perf/`，矩阵 `target/p3-matrix-bundles/`。
+
+### 9.10 P4-6 预实验：closure 描述符索引（已回滚，2026-09-24）
+
+`docs/lexer-parser-refactor.md` §3 P4 第 6 条的触发证据与可行性预实验。按 §6
+“P4 候选不进入本分支”，实验代码已回滚，本记录仅保留证据。
+
+触发证据（临时诊断计数，P3 树 + profiling 探针；`ensure_closure_variable` 每次
+调用扫描的候选总数）：
+
+| 语料（4MB） | 查找次数 | 扫描候选总数 | 平均 | 最长 Vec |
+| --- | ---: | ---: | ---: | ---: |
+| functions | 6,798 | 69,315,807 | 10,196 | 13,595 |
+| expressions | 27,530 | 63,314 | 2.3 | 5 |
+| syntax-mixed | 5,524 | 2,761 | 0.5 | 1 |
+
+`functions` 档是唯一的 O(N²) 形态：某个函数（按条目数应为 root）积累约 1.36
+万个 closure 条目，而 `Global` 查找按名字线性扫过整个向量（生成语料每个块都
+声明并引用新名字，属压力档构造，非真实负载形态）。`ensure_captured_closure_variable`
+（captured 路径）在三语料均为 ≤0.5 步/次，无问题。
+
+预实验实现：`FunctionIr` 增加 `global_closure_index: HashMap<GlobalClosureKey, u16>`
+（`Global`/`GlobalDeclaration` 按名字分命名空间索引，`push_closure_variable`
+写入、首见索引优先），`ensure_closure_variable` 对这两种 source 走索引，
+其余 source 保持线性扫描；`limits.rs` 的直写向量测试改为走
+`push_closure_variable`。
+
+perf（4MB 扣 64KB tiny 档，P3/P4 两探针交错 min-of-7）：
+
+| 语料 | 指标 | P3 | P4（vs P3） |
+| --- | --- | ---: | ---: |
+| functions | instr/KB | 2,225,543 | 2,086,331（−6.26%） |
+| | cycles/KB | 1,231,437 | 1,216,343（−1.23%） |
+| | branches/KB | 491,572 | 440,167（−10.46%） |
+| | cache-ref/KB | 84,685 | 75,754（−10.55%） |
+| | task-clock/KB | 0.311 ms | 0.309 ms（−0.63%） |
+| expressions | instr/KB | 1,333,898 | 1,342,261（+0.63%） |
+| | cycles/KB | 653,256 | 660,278（+1.07%） |
+| | task-clock/KB | 0.175 ms | 0.177 ms（+1.32%） |
+| syntax-mixed | instr/KB | 2,144,142 | 2,163,651（+0.91%） |
+| | cycles/KB | 1,333,167 | 1,332,879（−0.02%） |
+| | task-clock/KB | 0.351 ms | 0.350 ms（−0.28%） |
+
+64KB 档：functions instr +0.46%、cycles +1.74%；expressions +0.48%/−0.17%；
+syntax-mixed +0.78%/+2.62%。探针内 `compile_ns`（5 次 min）：functions
+1.171s→1.151s（−1.8%）。即 69.3M 步扫描被消除，但指令节省多为廉价的向量化
+比较，cycles/task-clock 几乎不动，而小函数侧被 HashMap 常数开销抵消。
+
+真实 bundle（67 case，P1b/P3/P4 交错 5 次）：每 case 速度比值 p3/p4 中位
+**1.007**（38/66 case P4 更快），逐 case 求和耗时 −1.50%，而 459KB 的
+`066-all` 中位 51.79ms→52.42ms（**+1.22%**）——整体在噪声内，无真实负载收益。
+
+分配（4MB）：`FunctionIr` 增大导致 arena 扩容，realloc_bytes
+functions/syntax +67.6MB、expressions +33.8MB；另有 map 表 alloc_bytes
++4.49/+1.57/+3.15MB、alloc 次数 +13/+2/+1；peak live +3.1/+1.6/+3.1MB。
+与 P4 的分配削减目标方向相反。
+
+结论：触发证据成立但**收益不成立**——真实 bundle 中性、分配反向、函数侧常数
+开销。判定为按 §6 不进入本分支；如后端计划重启该候选，应采用“按向量长度阈值
+惰性建索引 + 索引放侧表（避免 `FunctionIr` 增大）”的形态，并先取得真实 bundle
+的明确收益再落地。
+
+复现：探针 `target/p4-global-index-{compile,alloc}-probe`（`build_compile_probe.py`
++ 临时诊断计数，计数源码未保留），perf 目录 `target/p4-perf/`（脚本
+`target/p4-perf.sh`、汇总 `target/p4-summarize.py`），矩阵
+`target/p4-matrix-bundles/`。
+
+### 9.11 P4-2 预研：分配归因（P3 树 `23b918e7`，2026-09-24）
+
+`docs/lexer-parser-refactor.md` §3 P4 第 2 条（IR/常量/绑定/字节码侧分配削减）
+的触发证据与归因方法。按 §6 不改产品代码：临时插桩与采样工具全部在
+`target/p4-attr/`，产品树已回滚。
+
+方法（三路互证）：
+
+1. **阶段精确计数**：临时给 `profiling` 加 `AllocationObserver`
+   （`fn() -> (u64, u64)`，探针注册）并让 `PhaseTimer` 在边界快照，计数分配器
+   探针 `target/p4-alloc-phase-probe` 输出每阶段 alloc 次数/字节（临时补丁
+   `target/p4-attr/temp-instrumentation.patch`，已回滚）。分配计数逐次完全一致。
+2. **站点采样**：`LD_PRELOAD` 分配拦截器 `target/p4-attr/malloc_trace.c`
+   每 32 次分配记录一次 backtrace，离线用 `addr2line -f -C -i` 符号化到
+   file:line（`target/p4-attr/symbolize.py`；带 debug info 的探针
+   `target/p4-debug-probe`）。**调用次数**为均匀采样（±1%）；
+   **字节列受重尾影响（9.11.4），本文不单独引用**。
+3. **大块精确**：同一拦截器 `TRACE_EVERY=1 TRACE_MIN=8192`，≥8KB 分配全量
+   记录（无采样偏差）。
+
+#### 9.11.1 阶段分布（4MB 档，精确）
+
+分配次数（括号为占该语料）：
+
+| 阶段 | functions | expressions | syntax-mixed |
+| --- | ---: | ---: | ---: |
+| parse | 958,636（18.6%） | 1,161,827（43.1%） | 1,469,479（23.4%） |
+| resolution | 690,041（13.4%） | 267,089（9.9%） | 560,726（8.9%） |
+| lowering | 1,128,485（21.9%） | 459,772（17.0%） | 1,400,356（22.3%） |
+| verify | 1,063,930（20.7%） | 300,141（11.1%） | 1,284,398（20.4%） |
+| publish | 1,301,897（25.3%） | 509,399（18.9%） | 1,577,208（25.1%） |
+| 合计 | 5,143,001 | 2,698,240 | 6,292,179 |
+
+分配字节（alloc，不含 realloc）：
+
+| 阶段 | functions | expressions | syntax-mixed |
+| --- | ---: | ---: | ---: |
+| parse | 59.1MB（14.3%） | 51.8MB（20.7%） | 136.0MB（19.4%） |
+| resolution | 32.5MB（7.9%） | 11.8MB（4.7%） | 25.5MB（3.6%） |
+| lowering | 145.7MB（35.2%） | 91.5MB（36.6%） | 221.2MB（31.5%） |
+| verify | 57.3MB（13.9%） | 28.8MB（11.5%） | 125.2MB（17.8%） |
+| publish | 118.9MB（28.7%） | 66.1MB（26.4%） | 194.3MB（27.7%） |
+| 合计 | 413.5MB | 250.0MB | 702.3MB |
+
+阶段时间占比（同探针 inclusive，与 §9.9 结构一致）：functions
+27.8/16.1/17.6/15.0/23.6，expressions 40.8/9.7/18.8/11.7/19.0，
+syntax-mixed 28.1/8.5/20.2/17.2/26.0（parse/resolution/lowering/verify/
+publish）。
+
+#### 9.11.2 规模与斜率（4MB）
+
+| 语料 | lowered 函数 | 指令 | alloc 次数 | alloc/函数 | alloc/指令 | realloc 次数 | realloc 字节 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| functions | 37,390 | 1,233,839 | 5,143,001 | 137.6 | 4.2 | 700,361 | 849.8MB |
+| expressions | 22,025 | 988,329 | 2,698,240 | 122.5 | 2.7 | 204,013 | 878.7MB |
+| syntax-mixed | 38,669 | 1,436,242 | 6,292,179 | 162.7 | 4.4 | 615,439 | 1,090.9MB |
+
+64KB 档斜率与 4MB 一致（functions 137.6 → 139.6、expressions 122.5 → 124.1、
+syntax-mixed 162.7 → 164.6 次/函数），说明分配以函数/条目为单位的常数项为主、
+无显著固定开销。realloc 字节与 alloc 同量级，是“容量增长”的第二成本；其中
+大块占绝对多数（9.11.4）。
+
+#### 9.11.3 站点 Top（functions-4MB，采样×32，±1%；仅调用次数）
+
+| 次数 alloc+realloc | 站点（file:line） | 说明 |
+| ---: | --- | --- |
+| 360,320 | `scope_validation::validate_scope_graph`（scope_validation.rs:827/1129/1590-1593/1913/1995-1997） | 每函数 5–7 个 `vec![false/0; len]` 校验缓冲 |
+| 345,408 + 243,360 + 204,896 | `JsString::from_validated_utf16`（primitive.rs:997 collect、999 Rc）/`try_from_utf16_with_limit`（950） | 每个字符串 2–3 次分配 |
+| 190,496 + 83,232 | `verify::private_elements::setter_storage_base`（private_elements.rs:41） | 每私有 setter 2 个 collect + `to_vec` |
+| 133,600（全 realloc） | parser `ops.push`（builder.rs:287） | 每函数 IR ops 扩容（大块见表 9.11.4） |
+| 124,384 / 96,416 / 107,424 / 99,808 | verify：`worklist`（bytecode.rs:959）/`next_*` 克隆（989-991）/`VerificationState::clone`（1520）/`CompactVisits::depths`（1548） | 每函数/每次验证状态分配 |
+| 114,752 + 54,912 + 60,672 + 38,720 | parse 文本拷贝：expressions.rs:124（NamedEvaluation 标识符 `to_owned`）、expressions.rs:1096（字段名）、tokens.rs:457（label + lexer clone）、arrow.rs:333（for-head 分隔符 `vec!`） | P1b 后残留的 owned 文本 |
+| 89,216（expressions 280,608） | `parse_digits`（literals.rs:461） | 非十进制字面量走 `BigUint::parse_bytes` |
+| 104,352 + 72,448 + 63,136 | `bytecode_validation`：explicit parameter layout、derived constructor（193 `with_capacity(4)`、228 `HashSet` collect） | 每构造函数校验 |
+| 91,328 | `gc::function_bytecode_edges`（gc.rs:1833） | 每函数 GC 边表 |
+| 71,104 | `lowering::build_unlinked_debug`（lowering.rs） | 每函数 debug 切片 |
+| 70,688 | `Heap::allocate_function_bytecode`（allocation.rs:657） | 每函数 HashMap + 注册 |
+| 111,904 | `lower_ops`（lowering.rs:1101 offsets、1171/1172 code/pc_sites） | 每函数 3 个 Vec |
+| 116,032 | `FunctionIr::add_binding`（function.rs:571 bindings、576 map） | 每条绑定 2 次 |
+| 53,536 | `FunctionIr::append_constant`（function.rs:544） | 每常量 |
+| 187,136 | publish `Vec→Box` 转换（runtime.rs:234/242/244/248） | 每函数 ~7 个 `into_boxed_slice`/`into` |
+| 50,784（+31MB） | `resolution::resolve_identifiers` unresolved 列表扩容（resolution.rs:150） | 预分配 |
+| 37,344 | `FlattenFrame::new`（runtime.rs:457） | 每函数 constants Vec |
+
+跨语料差异：expressions 的 parse 占比最高（43.1%），`parse_digits`（28.1 万）
+与 `regexp_case_change_mask`（2,753 次 ≥8KB）更突出；syntax-mixed 的 verify
+状态克隆与 `CompactVisits` 更重。
+
+#### 9.11.4 大块分配（≥8KB，精确）
+
+| 语料 | ≥8KB 次数 | alloc 字节（占自身） | realloc 字节（占自身） |
+| --- | ---: | ---: | ---: |
+| functions | 393（0.008%） | 67.5MB（16.1%） | 572.5MB（66.0%） |
+| expressions | 3,066（0.11%） | 116.8MB（45.7%） | 812.5MB（91.9%） |
+| syntax-mixed | 409（0.007%） | 306.3MB（43.3%） | 929.3MB（83.9%） |
+
+大块站点（按字节）：`parser/tokens.rs:615`（提交 token 缓冲扩容；functions
+234.9MB、expressions/syntax 各 469.7MB，峰值容量 117–224MB）、
+`function.rs:442`（FunctionBuilder 列表，58–100MB）、`Heap::reserve`
+（arena.rs:85，57.7MB）、`flatten_unlinked_tree`（bytecode_publish.rs:159，
+43.0MB）、`CompactVisits` exceptional 状态（bytecode.rs:1597，syntax-mixed
+167MB）、`verify/children.rs:439`（18.9MB）、`class/fields.rs:106`（14.8MB）、
+`gc::finish_node`（14.7MB）、`regexp_case_change_mask`（expressions 2,753 次
+×8KB）。token 缓冲与 FunctionBuilder 列表属 P4-1/表增长范畴，与 P4-2 的
+“海量小分配”分开处理。
+
+#### 9.11.5 复现
+
+```sh
+# 阶段计数（临时插桩）：target/p4-attr/temp-instrumentation.patch
+python3 scripts/benchmark/build_compile_probe.py --repo . --profiling \
+  --output target/p4-alloc-phase-probe --probe target/p4-alloc-phase-probe.rs \
+  --name oxide-compile-alloc-phase-probe
+target/p4-alloc-phase-probe/target/release/oxide-compile-alloc-phase-probe FILE
+
+# 站点采样（debug info 探针 + 拦截器）
+CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none \
+  python3 scripts/benchmark/build_compile_probe.py --repo . \
+  --output target/p4-debug-probe --name oxide-compile-debug-probe
+gcc -shared -fPIC -O2 -o target/p4-attr/malloc_trace.so target/p4-attr/malloc_trace.c -ldl
+TRACE_OUT=target/p4-attr/samples.bin LD_PRELOAD=target/p4-attr/malloc_trace.so \
+  target/p4-debug-probe/target/release/oxide-compile-debug-probe FILE
+python3 target/p4-attr/symbolize.py target/p4-attr/samples.bin \
+  target/p4-debug-probe/target/release/oxide-compile-debug-probe --top 35
+
+# 大块精确：TRACE_EVERY=1 TRACE_MIN=8192（同一拦截器）
+```

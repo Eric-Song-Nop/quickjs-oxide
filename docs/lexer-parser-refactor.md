@@ -568,30 +568,56 @@ A.5 move/绑定点、A.6 token 复制、A.7 标志规则、A.8 测试适配）�
 `relex*`/`set_future*` 全部不动。缓存按 offset 有序，`set_future_lex_context`/
 `relex` 清掉 `start >= future_offset` 的条目。
 
-验收：全量 Rust 测试 + focused test262 + fixtures；新增缓存命中/失效单测
-（C.4）；分配次数下降（探针缓存省掉重复 token 扫描的分配）；instr/KB 相对
-P1b 下降 5%~10%（方向性，P2 checkpoint 后按实测钉死；P1b 实测 instr 仅
-−0.9%~−6.2%，见 §9.6）。此阶段不追求 P2 的总目标。
+**实施记录（2026-09-24，`7f8fc101`）**：已按上述落地（新增
+`parser/lookahead.rs`；16 文件 +393/−34），探针命中/未命中/提交复用计数经
+`engine::api::profiling::lookahead_probe_counters()` 暴露给 profiling 探针。
+验收结果：
 
-### P2b 提交路径 `TokenBuffer`
+- 语义 gate 全绿：workspace 全量测试、profiling 测试、doc、test262-host、
+  unsupported_diagnostics、oracle 912、fixtures 13/13、c-oracles、
+  source-layout/rust-only/bc5、oracle-registry `--compiled`；test262 `--full`
+  （P2a+P2b 树）与 P1b 报告逐字节一致（见 P2b 段）。
+- 单测：缓存排序/失效/复用 + 提交路径复用回归（C.4）。
+- 实测（`docs/compile-benchmark.md` §9.8）：命中率 27.4%~35.4%；instr/KB
+  相对 P1b **−0.1%~−0.9%**、cycles −1.3%~−3.3%（task-clock 在 10ms 粒度
+  噪声内）、分配中性（+4 次/+4 KB，即缓存 `Vec` 自身）。原“分配次数下降”与
+  “instr −5%~−10%”预期被实测否决（探针重扫只占前端总成本一小部分，token
+  扫描本身几乎不分配）；P2 的 instr 目标由 P2b commit-path reuse 补足
+  （−5.1%~−5.4%），分配目标转入 P4。
 
-改动点：按 §2.3 在 `parser/context.rs` 引入 `TokenBuffer`，重写
-`parser/tokens.rs` 的 `advance*/ensure*/relex*/set_future*`；把 17 处
-clone-lexer 前瞻换成 `mark/ensure/restore`；`destructuring.rs` 的
-`parenthesized_parameter_tokens`/`object_binding_has_rest`、
-`arrow.rs` 的 `parenthesized_arrow_ahead`、`loops.rs` 的 for-head 探针逐个迁移；
-历史读取点（`statements.rs:846`、`arrow.rs:296-300`、directive 的
-`tokens[start]`）保留按索引访问。
+### P2b 提交路径复用（原 `TokenBuffer` 全量改造取消）
 
-语义风险与对策：附录 C.1 的 15 条不变量逐条实现并测试；每个迁移点配对应语法
-测试（for/箭头/解构/指令序言/正则 goal）；一次性只迁移 1–2 个产生式并跑
-Oracle；`line_terminator_before` 与 span 保持不变；旧 clone-lexer 路径保留为
-test-only 对拍（差异测试，C.4）。
+原计划：按 §2.3 引入 `TokenBuffer`，重写 `advance*/ensure*/relex*/set_future*`，
+17 处 clone-lexer 前瞻换成 `mark/ensure/restore`，逐产生式迁移
+（C.3、C.1 的 15 条不变量）。
 
-验收：全量测试 + fixtures/C-oracles + focused test262；指标按 §5 重校准表
-（相对 P1b：instr/KB −10%~−20%、cache-miss/KB −20%~−35%、时间 −10%~−15%，
-P2 checkpoint 后钉死）；`parenthesized_parameter_tokens` 不再出现 Vec 复制
-（代码审查 + 分配计数）；PR #30 兼容约定（§2.3）逐条检查。
+**决策（2026-09-24，P2a 实测后）**：取消全量 `TokenBuffer`，改为
+**commit-path reuse**——提交路径 `ensure_token_with_goal` 在扫描前按
+`(lexer 当前位置, goal, context)` 查询同一 `LookaheadCache`，命中则直接
+`seek(token.span.end)` 并把备忘 token 压入 `tokens`，未命中才扫描。依据：
+
+- profiling 计数证明“探针已扫、提交重扫”是探针重扫的最大单一来源：4MB 档
+  functions 421,476 / expressions 388,173 / syntax-mixed 555,162 次
+  （≈探针命中的 1.4–1.7 倍），与 17 处探针命中高度重叠；
+- 该改动约 15 行，不新建数据结构、不重写 `tokens`/`cursor`、不逐产生式迁移，
+  完整保留 C.1 的 15 条不变量：缓存是 `(source, offset, goal, context)` 的纯
+  函数记忆化，命中 token 与重扫逐字节相同（span/`line_terminator_before` 均由
+  同一次扫描产生），lexer 状态由 `seek` 重定位，提交 token 边界与 PR #30 的
+  栈守卫采样时机不变；
+- 剩余空间（探针未命中之间的重叠、`parenthesized_parameter_tokens` 的 Vec
+  复制）已很小，不值得全量改造的回归风险；
+- 同 checkpoint 发现并修复缓存结构缺陷：巨型数组字面量会触发整段
+  `array_assignment_pattern_ahead` 备忘，原 `invalidate_before` 的头部
+  `Vec::drain` 使其退化为 O(n²)（test262 3.2 MB 用例 376ms→272s）。修复=
+  活跃条目上限 8192 + `base` 偏移摊销压缩，失效摊销 O(1)；该用例回到
+  355–361ms（§9.8 第 3 条）。
+
+验收（`docs/compile-benchmark.md` §9.8）：全量 Rust 测试 + oracle 912 +
+fixtures 13/13 + test262 `--full` 报告与 P1b 逐字节一致（engine hash
+`6e6e2003` vs `5dbb43ca`，body sha 相同，§9.8.1）；相对 P1b instr/KB
+−5.1%~−5.4%、cycles −5.0%~−6.4%、task-clock −4.0%~−5.9%、真实 bundle 中位
+吞吐 5.46→5.95 MB/s（§9.8.2）、分配 +6 次/+16 KB；`parenthesized_parameter_tokens` 去复制降级为 P3 触发项
+（触发=分配探针可归因 >1%）。
 
 ### P3 杂项收尾（决策规则制）
 
@@ -624,6 +650,20 @@ checkpoint 记录。触发依据来自 P1b checkpoint（`docs/compile-benchmark.
 验收：全量 gate（含 test262 `--full` 或 receipt 更新流程）；终态指标见 §5
 （已按 P1b 重校准）。
 
+**实施记录（2026-09-24，P3 主项第 4 条）**：lexer 字节快路已落地
+（`peek_char`/`bump_char` 的 ASCII 快路径、`skip_trivia`/`skip_to_line_end`
+首字节分派与批量空白/注释体、`scan_identifier_with_value` 的字节表批量
+run、`scan_punctuator` 首字节 `match` 替代 55 项线性 `starts_with` 表；
+非 ASCII/转义/`INVALID_BYTE_CARRIER` 保持慢路径）。结果（§9.9）：相对 P2b
+instr −10.6%~−19.5%、cycles −6.0%~−14.7%、task-clock −5.1%~−12.0%、
+`compile_ns` −8.2%/−12.0%、真实 bundle 中位 +11.5%（64/67 case 更快）、
+相对 P0 累计吞吐 +36.7%；分配逐位不变；全量 test262 与 P1b 逐字节一致。
+**已超 §5 P3 目标**（time −3%~−6%、instr −5%~−10%）；miss/alloc 仍 ≈0，
+按规则转 P4。触发重判：第 2 条（数字字面量）flat profile 未见
+`scan_number` 热点，跳过；第 1 条（`SourceText` 共享）与第 3 条
+（SmallVec）需分配归因，暂缓至 P4 分配归因；第 5 条（scratch 池）待
+P4 触发。
+
 ### P4 候选（不承诺，按触发条件启动）
 
 P1b checkpoint 显示：名字字符串只占分配约 1/6，剩余大头在 IR/常量/绑定/字节码
@@ -636,20 +676,56 @@ P2/P3 收尾：
    `tokens[start]`），最终删掉提交 token 缓冲（`NoTokensParserConfig` 路线，
    §2.5 第 6 条）。触发=P2 完成后 RSS/cache-miss 仍是主要瓶颈且 P3 决策项无
    更大收益；**与 P2b 不并行**；启动前需 PR #30 合并或完成标定对拍。
+   新增证据（§9.11.4）：提交 token 缓冲 `tokens.rs:615` 扩容是单点最大
+   realloc 来源（4MB：functions 234.9MB、expressions/syntax 各 469.7MB），
+   峰值容量 117–224MB；该候选同时消掉这块内存与拷贝。
 2. **IR/常量侧分配削减**：对解析期 `IrOp`/常量/绑定/字节码路径做分配归因
    （P1b 后占约 5/6），针对性改 Vec 预留/索引化/复用。触发=分配未达 §5 重校准
    值且归因明确；动作=另立计划（可能触及 verify/publish）。P1b 证据（§9.7）：
    分配相对 P0 降 27.7% 后 libc 自时间仍 27.4%、`code/verify/publish` 20.1%，
    并可见 `JsString::content_hash` 1.1%、`Utf16Units` drop 1.2% 等转换/哈希项。
+   **触发证据（§9.11，P3 树实测）**：functions-4MB 5.14M 次/413.5MB 分配、
+   0.70M 次/849.8MB realloc，137.6 次/函数、4.2 次/指令；阶段（次数/字节）
+   publish 25.3%/28.7%、lowering 21.9%/35.2%、verify 20.7%/13.9%、
+   parse 18.6%/14.3%、resolution 13.4%/7.9%。站点 Top（采样 ±1%）：
+   `validate_scope_graph` 每函数校验 Vec 36.0 万；JsString 构造 79.3 万；
+   verify 状态/worklist/depths 42.8 万；`setter_storage_base` 27.4 万；
+   parser `ops.push` realloc 13.4 万；parse 文本 `to_owned` 26.9 万；
+   `parse_digits` BigUint 8.9 万（expressions 28.1 万）；bytecode_validation
+   24.0 万；publish `Vec→Box` 18.7 万；`lower_ops` 11.2 万；FunctionIr
+   绑定/常量 17.0 万；resolution 10.8 万。
+   **验收指标（4MB 对 P3）**：alloc 次数 ≥ −30%、alloc 字节 ≥ −25%、
+   realloc 字节 ≥ −25%；verify+publish 阶段时间合计 ≥ −15%；真实 bundle 中位
+   速度 ≥ +5%（逐 case 分布 + `066-all` 单列）；全量 test262 报告 body 逐字节
+   一致 + fixtures 字节一致 + §5 gate 全绿。
+   **回滚点**：按“scratch 复用 → 单次分配 → 容量预留 → Cow/NameId → 表转换”
+   分组，每组一个可独立回滚提交；真实 bundle 中性即回滚该组。
 3. **u32 Span / 坐标计算**：当前 `Span` 为 4×usize；改 u32 需源大小上限约定。
-   触发已部分成立（§9.7）：`QuickJsSourceCursor::locate` 自时间 1.9%，line/col
-   计算随 span 使用增长；动作=先做 line/col 惰性化或缓存，再评估 u32 Span。
-4. **arena**：与 verify/publish 改造一起（§2.4）。
+   触发已部分成立（§9.9：P3 `QuickJsSourceCursor::locate` 自时间 1.64%，P1b 1.9%，
+   附录 D：1.6%~2.3% 为独立候选；line/col 计算随 span 使用增长）；动作=先做
+   line/col 惰性化或按行缓存，再评估
+   u32 Span。**验收**：locate 自时间 ≤0.5%、4MB 时间 ≥ −1.5% 且 instr 同步；
+   **回滚点**=单提交，无收益即回滚。
+4. **arena**：与 verify/publish 改造一起（§2.4）。新证据（§9.11.1/9.11.4）：
+   resolution 边界 IR Vec 容量 216.2MB（4MB 源）；≥8KB 大块仅 393 次却占
+   alloc 字节 16%、realloc 字节 66%，集中在 token 缓冲（`tokens.rs:615`，
+   224MB 容量）、FunctionBuilder 列表、heap arena、flatten、`CompactVisits`
+   exceptional 状态。大块与 P4-2 的小分配分开处理；P4-2 落地后再评估
+   chunked ops/arena。
 5. **表驱动二元/一元循环**：仅当 P2 后 profiling 仍显示表达式阶梯开销显著
    （§2.5 第 3 条）。
 6. **closure 描述符查找**：`ensure_closure_variable`（resolution.rs）线性扫描
    2.5% 自时间（§9.7，functions 4MB）；触发=P2 后仍 ≥2%；动作=索引化/哈希，
    或按函数缓存最近命中；可与第 2 条合并做。
+   **预实验（2026-09-24，已回滚）**：触发证据成立（P2b functions-4MB 自时间
+   3.02%；诊断计数 6,798 次查找共 69.3M 个候选、最长 Vec 13,595，全部来自
+   `Global` 名字查找的 O(N²)）。按名字索引实现后：functions-4MB instr −6.3%、
+   branches −10.5%，但 cycles 仅 −1.2%、task-clock −0.6%；expressions/
+   syntax/tiny 的 instr +0.5%~+0.9%（HashMap 常数开销）；真实 bundle 每 case
+   速度比值中位 +0.7%（38/66），`066-all` −1.2%，在噪声内；分配反向（arena
+   扩容 realloc +34~68MB）。判定：**收益不成立，不进入本分支**（§6）；如后端
+   计划重启，需改“阈值惰性建索引 + 侧表”形态并先取得真实 bundle 收益。
+   详见 `docs/compile-benchmark.md` §9.10。
 
 启动任一候选前，在本节记录触发证据、验收指标与回滚点。
 
@@ -709,27 +785,42 @@ cargo test --locked --workspace --all-targets
 | --- | ---: | ---: | ---: | ---: | ---: |
 | P1a | −5.6% | −3.6% | −8.7% | −13.0% | −13.8% |
 | P1b | −21.1% | −9.6% | −71.2% | −27.7% | −27.4% |
+| P2 (P2a+P2b) | −26.2% | −14.1% | −70.9% | −27.7% | −27.4% |
+| P3 (lexer 字节快路) | −29.9% | −23.2% | −70.7% | −27.7% | −27.4% |
 
 三语料范围（vs P0，§9.6）：时间 −14.7%~−21.1%、instr −4.9%~−9.6%、
 miss −32.9%~−71.2%、alloc −22.4%~−32.4%。
 
 原绝对目标表（P1a −15% 时间 … P3 −55%/−90%）基于“名字分配是主瓶颈”的假设，
 已被 P1b 实测证伪：名字字符串仅约 1/6 分配，剩余大头在 IR/常量/绑定/字节码。
-下表改为**相对上一 checkpoint** 的方向性重校准，P2 checkpoint 后按实测钉死：
+下表改为**相对上一 checkpoint** 的方向性重校准，并在 P2 checkpoint 后按实测
+钉死：
 
 | 阶段 | 时间 | instr/KB | cache-miss/KB | 分配次数 |
 | --- | ---: | ---: | ---: | ---: |
-| P2a+P2b | −10%~−15% | −10%~−20% | −20%~−35% | −5%~−10% |
-| P3 | −8%~−12% | −10%~−20% | −10%~−20% | −5%~−15% |
+| P2a+P2b（原目标） | −10%~−15% | −10%~−20% | −20%~−35% | −5%~−10% |
+| P2a+P2b（实测，§9.8） | −4.0%~−5.9% | −5.1%~−5.4% | ≈0（−1.9%~+0.2%） | ≈0（+6 次） |
+| P3（P2 后重校准） | −3%~−6% | −5%~−10% | −5%~−10% | −0%~−5% |
+| P3 lexer 快路（实测，§9.9） | −5.1%~−12.0% | −10.6%~−19.5% | ≈0 | 0 |
 
-P1–P3 合计预期（functions，vs P0）：时间 −30%~−40%、instr −25%~−40%、
-miss −75%~−85%、alloc −30%~−50%。若要接近 issue #32 原始的 −90% 分配目标，
-需启动 P4 的 IR/常量侧削减（§3 P4 第 2 条）。
+P2 实测未达原合并目标：instr/时间约达一半，cache-miss 基本持平（重扫不是
+miss 的主要来源），分配中性。P2 后 functions vs P0 为时间 −26.2%、
+instr −14.1%、miss −70.9%、alloc −27.7%。P3 lexer 字节快路（§9.9）超过
+重校准目标：相对 P2b 时间 −5.1%~−12.0%、instr −10.6%~−19.5%、miss/alloc
+≈0；P3 后 functions vs P0 为时间 −29.9%、instr −23.2%、miss −70.7%、
+alloc −27.7%，真实 bundle 中位吞吐 6.55 MB/s（相对 P0 +36.7%）。
+miss/分配大头已确认在 verify/publish 与 IR/常量侧，转入 P4 触发条件
+（§3 P4 第 2 条）。若要接近 issue #32 原始的 −90% 分配目标，需启动 P4 的
+IR/常量侧削减。
 
-P2 分 P2a（前瞻备忘）与 P2b（提交缓冲）两步，表中 P2 行为两步合并目标。
-真实 bundle 中位吞吐（compile-only，基线 4.79 MB/s）：P1b 复测 5.50 MB/s
-（Boa 5.00，§9.7），P2 checkpoint 时再测并按实测重定；`>7 MB/s` 不再作为
-P3 承诺，视 P4/后端计划决定。语义 gate（test262/QuickJS 差分）仍要求全绿。
+P2 分 P2a（前瞻备忘）与 P2b 两步；P2b 已按实测从 `TokenBuffer` 全量改造降级为
+commit-path reuse（§3 P2b）。真实 bundle 中位吞吐（compile-only，基线
+4.79 MB/s）：P1b 复测 5.50 MB/s（Boa 5.00，§9.7）；P2 checkpoint 同场交错
+复测 P1b 5.46 / P2b 5.95 MB/s（+9.0%，52/67 case 更快，§9.8.2）；P3 lexer
+字节快路再测 P2b 5.87 / P3 6.55 MB/s（+11.5%，64/67 case 更快，§9.9），相对
+P0 累计 +36.7%。`>7 MB/s` 继续不作为硬承诺，视 P4/后端计划决定。语义 gate
+（test262/QuickJS 差分）仍要求全绿：P2 与 P3 全量 test262 报告均与 P1b
+逐字节一致（§9.8.1、§9.9）。
 
 P1a checkpoint 实测（`docs/compile-benchmark.md` §9.5，HEAD `a5b651be`）：
 alloc 次数 −13.0%~−19.5%、alloc+realloc −13.8%~−21.7%、instr/KB
@@ -769,8 +860,8 @@ P1b 外部对照与结构复测（`docs/compile-benchmark.md` §9.7，HEAD `bd3e
   `feat/lexer-parser-refactor`。
 - 提交粒度：P0 工具/基线 1–2 个；P1a 3–5 个（Copy 化 → 惰性解码 → 消费点 → 清 clone）；
   P1b 4–6 个（NameTable → IR 字段 → parser → resolution/lowering → 诊断/测试）；
-  P2a 1–2 个（前瞻备忘）+ P2b 3–5 个（缓冲核心 → 逐产生式迁移）；P3 按决策
-  规则实际触发数（预计 2–4 个）。
+  P2a 1 个（前瞻备忘）+ P2b 1–2 个（commit-path reuse → 缓存上限/摊销失效，
+  全量 `TokenBuffer` 取消）；P3 按决策规则实际触发数（预计 2–4 个）。
 - P4 候选不进入本分支：启动前另立计划/分支，并在 §3 P4 记录触发证据。
 - 每个提交可编译、可跑 focused gate；每阶段结束跑全量 gate + 矩阵并更新
   `docs/compile-benchmark.md` 的指标表。
@@ -1030,17 +1121,19 @@ struct LookaheadEntry<'a> {
 - 迁移顺序：先单 token 简单探针（3-7、10-12、15-17），再 two-token following
   （13/14），最后整头扫描（1、2、9、13 主体）；每步跑对应 oracle/单元测试。
 
-### C.3 P2b `TokenBuffer`
+### C.3 P2b 提交路径复用（原 `TokenBuffer` 设计，已降级）
 
-- `entries: Vec<{ token, goal, context, start }>` + `cursor`；提交 entry 不可变，
-  relex 时整体替换并保留 bit。
-- `ensure(index, goal, context)`：三者匹配则复用；否则 truncate 到 index 并从
-  `entries[index].start`（或 lexer 当前位置）重扫；EOF 粘性由调用方保留。
-- `mark/restore`：记录 `entries.len()`/cursor，restore 只回退游标、不清条目；
-  下次 goal/context 匹配即可复用。
-- `parenthesized_parameter_tokens` 改 `&entries[a..b]`；
-  `object_binding_has_rest` 二次重扫改复用。
-- 旧 clone 路径保留 test-only 差异测试（C.4）。
+原设计（未实施）：`entries: Vec<{ token, goal, context, start }>` + `cursor`；
+提交 entry 不可变，relex 时整体替换并保留 bit；`ensure(index, goal, context)`
+三者匹配则复用，否则 truncate 到 index 重扫；`mark/restore` 只回退游标；
+`parenthesized_parameter_tokens` 改 `&entries[a..b]`；旧 clone 路径保留
+test-only 差异测试。
+
+实际实施（commit-path reuse，见 §3 P2b）：复用同一 `LookaheadCache`，
+`ensure_token_with_goal` 扫描前查 `(lexer 当前位置, goal, context)`，命中则
+`seek(token.span.end)` 并压入备忘 token；`tokens`/`cursor`/`relex*`/
+`set_future*` 与 C.1 不变量全部不动；`parenthesized_parameter_tokens` 的 Vec
+复制保留，降级为 P3 触发项。
 
 ### C.4 P2 新增测试
 
@@ -1055,6 +1148,12 @@ struct LookaheadEntry<'a> {
   `control_flow/oracle_for_*.rs`、`templates/`、`regexp/`；`tests/syntax.rs:392`、
   `tests/async_functions.rs:746`、`tests/parameters.rs:398,426,465`、
   `lexer.rs:3066-3342`。
+
+实施结果（`7f8fc101` + P2b-lite）：已落地缓存排序/失效/复用/上限/摊销压缩
+单测（`parser/lookahead.rs`）与 `tests/parameters.rs` 的探针复用、context
+失效、提交路径消费备忘 token 回归（合成 token 注入断言）；纯记忆化使逐产生式
+差异对拍不再需要（提交路径复用不改变扫描输入，语义由全量 gate + test262
+`--full` 主体字节一致覆盖）。
 
 ## 附录 D 会话校准记录（P1a/P1b 后，2026-09-24）
 
@@ -1089,3 +1188,48 @@ struct LookaheadEntry<'a> {
 5. P2b 必须保持 PR #30 的栈守卫不变量（§2.3、§4 第 10 条）。
 6. 分配目标修正：P1b 实测显示名字字符串仅约 1/6，剩余大头在 IR/常量/绑定/
    字节码；新增 P4 候选“IR/常量侧分配削减”（§3 P4 第 2 条）。
+
+### D.4 P2 后校准（2026-09-24）
+
+1. P2a 实测（§9.8）：命中率 27.4%~35.4%，instr −0.1%~−0.9%、cycles
+   −1.3%~−3.3%、分配中性。结论：clone-lexer 重扫不是前端主要成本，
+   “缓存省扫描→省分配”的假设不成立（扫描几乎不分配）。
+2. P2b 决策：保留 `LookaheadCache`，把提交路径接到同一缓存
+   （commit-path reuse，约 15 行），取消 `TokenBuffer` 全量改造。依据是
+   profiling 计数显示“探针已扫、提交重扫”为最大单一浪费（39–56 万次/4MB），
+   而全量改造的剩余空间只剩探针未命中重叠与参数列表 Vec 复制。
+3. P2 合并实测（§9.8，vs P1b）：instr −5.1%~−5.4%、cycles −5.0%~−6.4%、
+   时间 −4.0%~−5.9%、分配 +6 次/+16 KB、cache-miss ≈0（−1.9%~+0.2%）。
+   未达 §5 原 P2 目标，P3 目标已按实测重校准（§5）；miss/分配大头转 P4
+   触发项。
+4. 缓存结构缺陷与修复：巨型数组字面量触发整段备忘，头部 `Vec::drain` 使
+   `invalidate_before` 退化 O(n²)（test262 3.2 MB 用例 376ms→272s）；改为
+   活跃上限 8192 + `base` 偏移摊销压缩后回到 355–361ms（与 P1b 持平），命中
+   数据不变。教训：探针备忘要按“可能扫描任意长区域”设计，失效必须摊销 O(1)
+   且有内存上限。
+5. 真实 bundle 矩阵（§9.8.2）：P1b 5.46 / P2b 5.95 MB/s（+9.0%，52/67 case
+   更快），收益大于 4MB 生成语料；全量 test262 报告与 P1b 逐字节一致
+   （§9.8.1），语义中立成立。
+6. 测量口径：P1b/P2a/P2b 三探针交错 min-of-7；命中/提交复用/条目峰值计数由
+   `lookahead_probe_counters()`（`feature = "profiling"`）输出，生产构建编译
+   为空；探针目录 `target/p2b-final-*`，原始 CSV `target/p2b-final-perf/`。
+
+### D.5 P3 lexer 快路后校准（2026-09-24）
+
+1. P3 主项（lexer 字节快路）实测（§9.9，vs P2b）：instr
+   −10.6%~−19.5%、cycles −6.0%~−14.7%、task-clock −5.1%~−12.0%、
+   `compile_ns` −8.2%/−12.0%、真实 bundle 中位 +11.5%（64/67 case）、
+   分配逐位不变、cache-miss ≈0。**超过 §5 P3 重校准目标**（time −3%~−6%、
+   instr −5%~−10%）。
+2. 收益来源：消除逐字符 UTF-8 解码与 `quickjs_column_delta`、消除
+   `skip_trivia`/`scan_punctuator` 的 `starts_with`/memcmp、标识符批量扫描。
+   expressions（标识符/标点最密）收益最大（instr −19.5%）。
+3. 触发重判（§3 P3）：数字字面量快路跳过（`scan_number` 未进 flat profile
+   ≥0.5%）；`SourceText` 共享与 SmallVec 暂缓（需 P4 分配归因）；
+   scratch 复用池待 P4 触发。
+4. 下一阶段（P4 候选，§3 P4）：miss/分配大头在 verify/publish 与
+   IR/常量/绑定/字节码侧（`verify_parts_with_visits` 9.6%、
+   `enqueue_fallthrough` 5.2%、`validate_scope_graph` 4.2%，
+   expressions 4MB），按触发条件启动 IR/常量侧分配归因；
+   `ensure_closure_variable` 3.0%（functions）与
+   `QuickJsSourceCursor::locate` 1.6%~2.3% 为独立候选。
