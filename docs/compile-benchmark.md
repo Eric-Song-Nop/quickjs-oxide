@@ -27,7 +27,7 @@
 1. **eager vs lazy**：QuickJS 单遍编译器无惰性编译；Oxide 全量 lower；V8 默认惰性，
    用 `--no-lazy` 对齐。Boa 的 parse 档只产出 AST，不进入字节码口径。
 2. **AST vs 字节码**：Boa parse 档只产出 AST + scope 分析；QuickJS/Oxide/V8 是字节码口径。
-3. **Oxide 包含 verify/publish**：这是 `Context::compile_*` 的真实边界，不做删减；
+3. **Oxide 包含 publish**：这是 `Context::compile_*` 的真实边界，不做删减；
    阶段拆分由 §4 的 profiling 提供。
 4. **Unicode 版本**：Oxide 使用 checksum-pinned QuickJS Unicode 17 表；Boa/V8 各自实现。
 5. **测量方式**：四引擎均为探针进程内计时（`compile_ns`/`parse_ns`）；进程墙钟另存
@@ -70,11 +70,11 @@ test262 语料拼接与 Module goal 留作后续，需要联网与各引擎 load
 ## 4. 剖析方法
 
 1. **阶段占比**：`build_compile_probe.py --profiling` 构建的探针在 stderr 输出
-   parse/resolution/lowering/blocks/fusion/relocation/verify/publish 的
+   parse/resolution/lowering/blocks/fusion/relocation/publish 的
    inclusive/exclusive 纳秒与 attempts（现有 `CostProfile`），在 512KB 生成语料上采集。
 2. **函数级拆分**：release + `debug=1` 构建普通探针，`perf record -g` 后按符号归并
    `lexer.rs`（`scan_identifier`/`skip_trivia`/`scan_number`/…）、parser、resolution、
-   lowering、验证与分配（malloc）占比。用于回答“lexer 还是 parser 更贵”。
+   lowering、publish 与分配（malloc）占比。用于回答“lexer 还是 parser 更贵”。
 3. 若 perf 归因不足，再评估在 `profiling` 构建中加入 lexer 级计数器
    （token 数、identifier 分配次数、seek/re-scan 次数），仅诊断、不参与正式计时。
 
@@ -982,3 +982,91 @@ python3 target/p4-attr/symbolize.py target/p4-attr/samples.bin \
 
 # 大块精确：TRACE_EVERY=1 TRACE_MIN=8192（同一拦截器）
 ```
+
+上述 9.11.1–9.11.4 是 P3 基线的实测；其中 `flatten_unlinked_tree`、
+`FlattenFrame::new`、`Vec→Box` 与 verify 站点已在 2026-09-24 的
+verify/publication 简化中删除或改写，结果见 §9.12。
+
+#### 9.12 verify/publication 简化实测（P4-2 收尾，2026-09-24）
+
+对照三个提交，语料均为 `functions-4194304.js`：
+
+- P3：`172fde6e`（基线，含 verify 与 flatten）；
+- verify：`ca88c763`（删除独立 verify 阶段）；
+- walk：`cf91f28a`（publication 单遍后序 walk）。
+
+阶段时间（release `qjs -d`，同机同语料，各 3 次取 min，单位 ms）：
+
+| 阶段 | P3 | verify | walk | walk vs P3 |
+| --- | ---: | ---: | ---: | ---: |
+| parse | 322.98 | 329.85 | 323.86 | +0.3% |
+| resolution | 188.48 | 192.39 | 187.85 | −0.3% |
+| lowering | 197.28 | 207.37 | 199.48 | +1.1% |
+| fusion | 7.23 | 6.94 | 6.97 | −3.6% |
+| relocation | 2.48 | 2.45 | 2.44 | −1.5% |
+| verify | 173.02 | 0 | 0 | −100% |
+| publish | 281.83 | 223.41 | 198.19 | −29.7% |
+| 合计 | 1173.31 | 962.41 | 918.79 | −21.7% |
+
+verify+publish：454.85 → 223.41 → 198.19ms（walk 相对 P3 −56.4%）。
+verify 提交同时把 publish 从 281.83ms 降到 223.41ms：P3 的 publish 计时
+包含 verification 产物包装（`VerifiedFunction`）与 flatten 两段调用，删除
+这些包装后 publish 自身即少一次整树拷贝。
+
+分配探针（`scripts/benchmark/probes/compile_alloc_probe.rs`，单次运行）：
+
+| 指标 | P3 | verify | walk | walk vs P3 |
+| --- | ---: | ---: | ---: | ---: |
+| alloc 次数 | 5,574,827 | 4,252,556 | 4,194,756 | −24.8% |
+| alloc 字节 | 831.9MB | 718.5MB | 691.5MB | −16.9% |
+| realloc 次数 | 700,361 | 594,977 | 588,165 | −16.0% |
+| realloc 字节 | 849.8MB | 813.2MB | 771.1MB | −9.3% |
+| peak live | 342.2MB | 342.2MB | 342.2MB | 0% |
+| 窗口内 compile | 1226.8ms | 972.5ms | 937.1ms | −23.6% |
+
+peak live 未变：高水位由 parser/token 与 FunctionBuilder 的大块缓冲决定
+（§9.11.4），不属于本次简化范围。
+
+阶段分配计数（临时阶段插桩：`PhaseTimer` 边界读取全局分配计数；profiling
+构建，`functions-4194304` 单次；探针与补丁不入库）：
+
+| 阶段 alloc 次数 | P3 | HEAD | 变化 |
+| --- | ---: | ---: | ---: |
+| parse | 1,186,527 | 1,186,527 | 0% |
+| resolution | 734,284 | 734,284 | 0% |
+| lowering | 1,264,271 | 1,264,271 | 0% |
+| verify | 1,148,920 | 0 | −100% |
+| publish | 1,376,777 | 1,145,626 | −16.8% |
+| verify+publish | 2,525,697 | 1,145,626 | −54.6% |
+
+该构建的窗口总量为 P3 5,710,792 / HEAD 4,330,720，阶段之和与总量一致
+（差 ≤11）；比非 profiling 总量探针多出的约 13.6 万次是 profiling 计数
+自身开销，两种口径不可混用。publish 阶段剩余的 1,145,626 次分配是定义/
+闭包名 atom 驻留与堆节点注册，未纳入本次范围。
+
+验收对照（计划 §4）：
+
+| 条目 | 目标 | 实测 |
+| --- | ---: | ---: |
+| verify 提交编译时间 | ≥ −10% | −18.0% |
+| verify 提交 alloc 次数 | ≥ −20% | −23.7% |
+| verify 提交 alloc 字节 | ≥ −13.9% | −13.6% |
+| publish 阶段时间 | ≥ −25% | −29.7% |
+| publish 阶段 alloc 次数 | ≥ −25% | −16.8% |
+| verify+publish 时间 | ≥ −40% | −56.4% |
+| verify+publish alloc 次数 | ≥ −40% | −54.6% |
+| realloc 字节 | ≥ −5% | −9.3% |
+
+未达两项：verify alloc 字节差 0.3pp（边际）；publish 阶段 alloc 次数
+−16.8%（目标 −25%），单遍化主要削减的是大块与中间层，publish 剩余成本
+是 atom 驻留与堆节点注册。总量口径下的 −24.8% 覆盖了未参与本次简化的
+parse/resolution/lowering 常数项，不能作为 publish 验收量。test262 语义
+中性：P3 与 walk 各跑一次 `--full`（12 workers，102,037 variants），除首行
+metadata 的 engine 哈希外 TSV 与 JSONL 逐字节一致（pass=80010、
+fail=3552、unsupported=3502、skipped=18475）；该 +28 漂移已在阶段收尾
+随 `4712f679` promote 为新的 pinned 向量（pass=80010/eligible=80060）。
+fixtures 13/13 稳定。
+
+复现：`cargo build --release -p quickjs-oxide-cli --features profiling --bin
+qjs` + `qjs -d`；分配探针见 §9.11.5 的第一条命令（`compile_alloc_probe.rs`）；
+test262 对照需 `env -i` 清空 `GIT_*` 后 `--full`。

@@ -4,7 +4,7 @@
 
 ## 架构
 
-**编译**：完整前端保留；共享 IR/名字/绑定模型在 `compiler/model/{ir,scope,bindings}`，解析临时状态归 `parser/context`，完成产物由消费式 `finish` 移交。发布前有独立只读验证与事务化发布：`code/verify/*` 负责入口/参数/绑定/模块/操作数检查，`code/instruction.rs` 集中指令的栈效果、控制流与可捕获异常分类，`code/runtime.rs` 提交发布、链接 Atom 并在失败时回滚。
+**编译**：完整前端保留；共享 IR/名字/绑定模型在 `compiler/model/{ir,scope,bindings}`，解析临时状态归 `parser/context`，完成产物由消费式 `finish` 移交。发布由单一入口事务化完成：`code/bytecode_publish.rs` 负责常量与绑定链接，`code/instruction.rs` 集中指令的栈效果、控制流与可捕获异常分类，`code/runtime.rs` 提交发布、链接 Atom 并在失败时回滚。
 
 **调用帧**：`FrameStore` 持有不可变 executable 与冷状态（`FrameEntry` / `ColdFrame`），`SlotStore` 管理互斥的原始实参、可写形参、局部与操作数窗口。帧惰性认证：只有真正发生观察（错误、回调、回溯、GC 边界）时才物化 active frame；冷帧容量跨调用复用。活跃帧登记只保存 domain/identity 与诊断状态，不持有运行 Value。
 
@@ -18,9 +18,9 @@
 
 ## 验证
 
-- Test262 冻结向量：`pass=79982 / eligible=80032 / total=102037`。
+- Test262 冻结向量：`pass=80010 / eligible=80060 / total=102037`。
 - workspace `--all-targets`、profiling lib、`--doc`、test262-host `--lib --bins`、oracle `test262_` 全部通过。
-- pinned 1.88：clippy `-D warnings`、`cargo fmt --check`、source-layout、rust-only、oracle registry、BC5 pinned atoms/opcodes、QuickJS fixtures/c-oracles/dynamic-import 全部通过。
+- pinned 1.88：clippy `-D warnings`、`cargo fmt --check`、source-layout、rust-only、oracle registry、QuickJS fixtures/c-oracles/dynamic-import 全部通过。
 
 ## 性能（相对重写前基线）
 
