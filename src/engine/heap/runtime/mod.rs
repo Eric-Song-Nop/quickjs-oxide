@@ -15,12 +15,13 @@ use crate::engine::{builtins as intrinsics, jobs, modules as module};
 
 use crate::engine::atom::{Atom, AtomIdx, AtomTable};
 use crate::engine::code::debug::DebugInfoMode;
+use crate::engine::hash::FxBuildHasher;
 use crate::engine::heap::{
     BigIntId, ContextId, FunctionBytecodeId, Heap, HeapCleanup, ObjectId, PropertySlot, RawValue,
-    ShapeId, StringId, VarRefId,
+    ShapeId, StringId, VarRefId, object_records::Slots,
 };
 use crate::engine::object::WellKnownSymbol;
-use crate::engine::object::shape::{Shape, ShapeEntry};
+use crate::engine::object::shape::{self, Shape, ShapeEntry};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
@@ -115,11 +116,14 @@ pub(crate) struct RuntimeState {
     /// by each subsequent compilation.
     pub(crate) debug_info_mode: DebugInfoMode,
     /// QuickJS's shape hash is non-owning. These generational IDs are likewise
-    /// weak and are validated before reuse.
-    pub(crate) shape_cache: HashMap<ShapeFingerprint, ShapeId>,
-    pub(crate) shape_fingerprints: HashMap<ShapeId, ShapeFingerprint>,
-    pub(crate) shape_transitions: HashMap<ShapeId, HashMap<ShapeEntry, ShapeId>>,
-    pub(crate) shape_transition_parents: HashMap<ShapeId, Vec<(ShapeId, ShapeEntry)>>,
+    /// weak and are validated before reuse. Buckets are keyed by
+    /// [`shape::compute_fingerprint_hash`] and collisions compare layouts.
+    pub(crate) shape_cache: HashMap<u64, Vec<ShapeId>, FxBuildHasher>,
+    pub(crate) shape_hashes: HashMap<ShapeId, u64, FxBuildHasher>,
+    pub(crate) shape_transitions:
+        HashMap<ShapeId, HashMap<ShapeEntry, ShapeId, FxBuildHasher>, FxBuildHasher>,
+    pub(crate) shape_transition_parents:
+        HashMap<ShapeId, Vec<(ShapeId, ShapeEntry)>, FxBuildHasher>,
     pub(crate) well_known_symbols: HashMap<WellKnownSymbol, Atom>,
     /// One guarded handler-trap location cache per Proxy internal method.
     /// Indexed by the closed trap selector in `PinnedAtom::proxy_method`.
@@ -285,22 +289,61 @@ impl RuntimeState {
         Ok(())
     }
 
+    /// Find the live canonical shape for `hash` accepted by `matches`.
+    fn cached_shape_matching(
+        &self,
+        hash: u64,
+        matches: impl Fn(&Shape) -> bool,
+    ) -> Option<ShapeId> {
+        self.shape_cache
+            .get(&hash)?
+            .iter()
+            .copied()
+            .find(|&shape| self.heap.shape(shape).is_ok_and(&matches))
+    }
+
+    pub(crate) fn insert_shape_cache(&mut self, shape: ShapeId, hash: u64) {
+        self.shape_cache.entry(hash).or_default().push(shape);
+        let previous = self.shape_hashes.insert(shape, hash);
+        debug_assert!(
+            previous.is_none(),
+            "shape entered the canonical cache twice"
+        );
+    }
+
+    /// Remove `shape` from the canonical cache and return its fingerprint hash.
+    pub(crate) fn remove_shape_cache(&mut self, shape: ShapeId) -> Option<u64> {
+        let hash = self.shape_hashes.remove(&shape)?;
+        if let Some(bucket) = self.shape_cache.get_mut(&hash) {
+            bucket.retain(|&candidate| candidate != shape);
+            if bucket.is_empty() {
+                self.shape_cache.remove(&hash);
+            }
+        }
+        Some(hash)
+    }
+
+    /// True when `shape` is the canonical weak-cache entry for its layout.
+    #[cfg(test)]
+    pub(crate) fn shape_is_canonical(&self, shape: ShapeId) -> bool {
+        self.shape_hashes.get(&shape).is_some_and(|hash| {
+            self.shape_cache
+                .get(hash)
+                .is_some_and(|bucket| bucket.contains(&shape))
+        })
+    }
+
     pub(crate) fn get_or_create_shape(
         &mut self,
         prototype: Option<ObjectId>,
         entries: &[ShapeEntry],
     ) -> Result<ShapeId, RuntimeError> {
-        let fingerprint = ShapeFingerprint {
-            prototype,
-            entries: entries.into(),
-        };
-        if let Some(&shape) = self.shape_cache.get(&fingerprint) {
-            if self.heap.shape(shape).is_ok() {
-                self.heap.retain_shape(shape)?;
-                return Ok(shape);
-            }
-            self.shape_cache.remove(&fingerprint);
-            self.shape_fingerprints.remove(&shape);
+        let hash = shape::compute_fingerprint_hash(prototype, entries);
+        if let Some(shape) = self.cached_shape_matching(hash, |shape| {
+            shape.prototype() == prototype && shape.entries() == entries
+        }) {
+            self.heap.retain_shape(shape)?;
+            return Ok(shape);
         }
 
         let retained_atoms = self.retain_shape_atoms(entries)?;
@@ -319,35 +362,40 @@ impl RuntimeState {
                 return Err(error.into());
             }
         };
-        self.shape_cache.insert(fingerprint.clone(), shape);
-        self.shape_fingerprints.insert(shape, fingerprint);
+        self.insert_shape_cache(shape, hash);
         Ok(shape)
     }
 
-    /// Append-only edges borrow both shapes; collection/mutation unlinks them.
-    pub(crate) fn append_transition(
-        &mut self,
+    /// Canonical successor of `parent` extended with `entry`, if one is alive.
+    ///
+    /// Checks the weak transition edge first, then the canonical cache. A
+    /// stale weak target is skipped and rebuilt by the caller.
+    pub(crate) fn canonical_successor(
+        &self,
         parent: ShapeId,
         entry: ShapeEntry,
-    ) -> Result<ShapeId, RuntimeError> {
+    ) -> Option<ShapeId> {
         if let Some(&target) = self
             .shape_transitions
             .get(&parent)
             .and_then(|edges| edges.get(&entry))
+            && self.heap.shape(target).is_ok()
         {
-            if self.heap.shape(target).is_ok() {
-                self.heap.retain_shape(target)?;
-                return Ok(target);
-            }
-            // A weak target may have entered zero-queue before its cleanup was
-            // delivered to the runtime. Never revive a stale location blindly.
-            self.unlink_shape_transitions(target);
+            return Some(target);
         }
-        let source = self.heap.shape(parent)?;
-        let prototype = source.prototype();
-        let mut entries = source.entries().to_vec();
-        entries.push(entry);
-        let target = self.get_or_create_shape(prototype, &entries)?;
+        let parent_shape = self.heap.shape(parent).ok()?;
+        let prototype = parent_shape.prototype();
+        let hash = shape::extend_fingerprint_hash(parent_shape.fingerprint_hash(), &entry);
+        let parent_len = parent_shape.entries().len();
+        self.cached_shape_matching(hash, |shape| {
+            shape.prototype() == prototype
+                && shape.entries().len() == parent_len + 1
+                && shape.entries()[..parent_len] == *parent_shape.entries()
+                && shape.entries()[parent_len] == entry
+        })
+    }
+
+    fn record_transition(&mut self, parent: ShapeId, entry: ShapeEntry, target: ShapeId) {
         self.shape_transitions
             .entry(parent)
             .or_default()
@@ -356,6 +404,26 @@ impl RuntimeState {
             .entry(target)
             .or_default()
             .push((parent, entry));
+    }
+
+    /// Append-only edges borrow both shapes; collection/mutation unlinks them.
+    pub(crate) fn append_transition(
+        &mut self,
+        parent: ShapeId,
+        entry: ShapeEntry,
+    ) -> Result<ShapeId, RuntimeError> {
+        if let Some(target) = self.canonical_successor(parent, entry) {
+            self.heap.retain_shape(target)?;
+            self.record_transition(parent, entry, target);
+            return Ok(target);
+        }
+        let (prototype, mut entries) = {
+            let source = self.heap.shape(parent)?;
+            (source.prototype(), source.entries().to_vec())
+        };
+        entries.push(entry);
+        let target = self.get_or_create_shape(prototype, &entries)?;
+        self.record_transition(parent, entry, target);
         Ok(target)
     }
 
@@ -448,7 +516,7 @@ impl RuntimeState {
         object: ObjectId,
         prototype: Option<ObjectId>,
         entries: &[ShapeEntry],
-        slots: Vec<PropertySlot>,
+        slots: Slots,
     ) -> Result<(), RuntimeError> {
         if self
             .heap
@@ -476,7 +544,7 @@ impl RuntimeState {
         &mut self,
         object: ObjectId,
         shape: ShapeId,
-        slots: Vec<PropertySlot>,
+        slots: Slots,
     ) -> Result<(), RuntimeError> {
         let retained_atoms = match self.retain_slot_atoms(&slots) {
             Ok(atoms) => atoms,
@@ -532,7 +600,14 @@ impl RuntimeState {
         index: usize,
         replacement: PropertySlot,
     ) -> Result<(), RuntimeError> {
-        let atoms = self.retain_slot_atoms(std::slice::from_ref(&replacement))?;
+        // Scalar payloads own no atom, which is the common write case; skip
+        // the iterator/collect machinery of the retain helper entirely.
+        let atoms = match &replacement {
+            PropertySlot::Data(RawValue::Symbol(_) | RawValue::Private(_)) => {
+                self.retain_slot_atoms(std::slice::from_ref(&replacement))?
+            }
+            _ => Vec::new(),
+        };
         match self
             .heap
             .replace_object_slot_with_status(object, index, replacement)
@@ -548,6 +623,9 @@ impl RuntimeState {
     }
 
     pub(crate) fn apply_cleanup(&mut self, cleanup: HeapCleanup) -> Result<(), RuntimeError> {
+        if cleanup == HeapCleanup::default() {
+            return Ok(());
+        }
         self.unlink_finalized_shapes(cleanup.finalized_shape_ids);
         self.release_atom_indices(cleanup.atoms)
     }
@@ -555,12 +633,7 @@ impl RuntimeState {
     pub(crate) fn unlink_finalized_shapes(&mut self, shapes: impl IntoIterator<Item = ShapeId>) {
         for shape in shapes {
             self.unlink_shape_transitions(shape);
-            let Some(fingerprint) = self.shape_fingerprints.remove(&shape) else {
-                continue;
-            };
-            if self.shape_cache.get(&fingerprint) == Some(&shape) {
-                self.shape_cache.remove(&fingerprint);
-            }
+            self.remove_shape_cache(shape);
         }
     }
 
@@ -675,6 +748,7 @@ mod builtin_batch_tests;
 
 use crate::engine::vm::frames::*;
 
-use crate::engine::object::operations::*;
+#[cfg(test)]
+use crate::engine::object::operations::{PropertyGetAction, PropertySetAction};
 
 use crate::engine::api::runtime::Runtime;

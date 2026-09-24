@@ -7,13 +7,15 @@
 use super::Edges;
 #[cfg(debug_assertions)]
 use super::HeapNodeKind;
+#[cfg(debug_assertions)]
+use super::LeafSlot;
 use super::{
-    AsyncGeneratorRequestData, AtomIdx, AutoInitProperty, BigIntId, BytecodeConstant, ContextData,
-    ContextId, FinalizationRegistryEntry, FunctionBytecodeData, FunctionBytecodeId,
-    GeneratorActivationData, GeneratorFrameBinding, Hash, HashMap, Heap, HeapError,
-    InternalCallableData, NativeErrorKind, Node, NodeData, ObjectData, ObjectId, ObjectPayload,
-    PrimitiveKind, PrimitiveObjectData, PromiseCapabilityData, PromiseReaction, PropertySlot,
-    RawId, RawModuleEvaluationState, RawModuleLinkRealm, RawModuleNamespaceState, RawModuleRecord,
+    AsyncGeneratorRequestData, AtomIdx, BigIntId, BytecodeConstant, ContextData, ContextId,
+    FinalizationRegistryEntry, FunctionBytecodeData, FunctionBytecodeId, GeneratorActivationData,
+    GeneratorFrameBinding, Hash, HashMap, Heap, HeapError, InternalCallableData, LeafValue,
+    NativeErrorKind, Node, NodeData, ObjectData, ObjectId, ObjectPayload, PrimitiveKind,
+    PrimitiveObjectData, PromiseCapabilityData, PromiseReaction, PropertySlot, RawId,
+    RawModuleEvaluationState, RawModuleLinkRealm, RawModuleNamespaceState, RawModuleRecord,
     RawModuleRecordBody, RawValue, Shape, ShapeId, SlotState, StringId, TypedArrayElementKind,
     VarRefData, VarRefId, VecDeque, WeakCollectionKey, is_map_storable_value,
 };
@@ -525,11 +527,16 @@ impl Heap {
 
         // Subtract every internal incoming edge.  The remainder is precisely
         // the external root count, matching QuickJS's gc_decref phase.
+        // Leaf edges are skipped: leaves own no outgoing edges and can never
+        // join a cycle, so they stay outside the trial graph.
         for slot in &self.slots {
             let SlotState::Live(node) = &slot.state else {
                 continue;
             };
             for edge in node.data.edges() {
+                if edge.is_leaf() {
+                    continue;
+                }
                 let target = self.live_index(edge)?;
                 let count = trial[target].ok_or(HeapError::Invariant(
                     "live edge targeted a node outside the trial set",
@@ -559,6 +566,9 @@ impl Heap {
                 ));
             };
             for edge in node.data.edges() {
+                if edge.is_leaf() {
+                    continue;
+                }
                 let target = self.live_index(edge)?;
                 if !reachable[target] {
                     reachable[target] = true;
@@ -596,10 +606,6 @@ impl Heap {
                     generation: slot.generation,
                 })),
                 NodeData::Shape(_) | NodeData::VarRef(_) => {}
-                // String and BigInt payloads own no edges, so an unreachable
-                // one cannot participate in a cycle; it is reclaimed purely by
-                // its reference count through the zero queue.
-                NodeData::String(_) | NodeData::BigInt(_) => {}
             }
         }
 
@@ -1134,7 +1140,11 @@ impl Heap {
         Ok(())
     }
 
+    #[inline(always)]
     fn preflight_edge_retain(&self, edge: RawId, additional: u32) -> Result<(), HeapError> {
+        if edge.is_leaf() {
+            return self.preflight_leaf_edge_retain(edge, additional);
+        }
         self.live_node(edge)?
             .strong
             .get()
@@ -1145,7 +1155,23 @@ impl Heap {
         Ok(())
     }
 
+    #[inline]
+    fn preflight_leaf_edge_retain(&self, edge: RawId, additional: u32) -> Result<(), HeapError> {
+        self.live_leaf_slot(edge)?
+            .strong
+            .get()
+            .checked_add(additional)
+            .ok_or(HeapError::Overflow {
+                operation: "retaining outgoing heap edges",
+            })?;
+        Ok(())
+    }
+
+    #[inline(always)]
     pub(super) fn retain_raw(&mut self, id: RawId, additional: u32) -> Result<(), HeapError> {
+        if id.is_leaf() {
+            return self.retain_leaf_raw(id, additional);
+        }
         #[cfg(debug_assertions)]
         if let RawId::Object(object) = id
             && super::ownership::trace_object_matches(object)
@@ -1161,13 +1187,27 @@ impl Heap {
                     operation: "retaining a heap reference",
                 })?,
         );
+        Ok(())
+    }
+
+    #[inline]
+    fn retain_leaf_raw(&mut self, id: RawId, additional: u32) -> Result<(), HeapError> {
+        let strong = &self.live_leaf_slot_mut(id)?.strong;
+        strong.set(
+            strong
+                .get()
+                .checked_add(additional)
+                .ok_or(HeapError::Overflow {
+                    operation: "retaining a heap reference",
+                })?,
+        );
         #[cfg(debug_assertions)]
         if let RawId::String(string) = id
             && super::ownership::trace_string_matches(string)
         {
             eprintln!(
                 "[strong-retain] {id:?} -> {}\n{}",
-                node.strong.get(),
+                strong.get(),
                 std::backtrace::Backtrace::force_capture()
             );
         }
@@ -1180,13 +1220,17 @@ impl Heap {
     /// heap invariant violation rather than a recoverable condition. The
     /// count saturates at `u32::MAX`, matching QuickJS's immortal value; the
     /// fallible [`Heap::retain_raw`] keeps its checked overflow behavior.
-    #[inline]
+    #[inline(always)]
     pub(in crate::engine::heap) fn retain_raw_fast(&self, id: RawId) {
         #[cfg(debug_assertions)]
         if let RawId::Object(object) = id
             && super::ownership::trace_object_matches(object)
         {
             super::ownership::record_object_retain(object);
+        }
+        if id.is_leaf() {
+            self.retain_leaf_fast(id);
+            return;
         }
         let node = self.live_node_fast(id);
         node.strong.set(node.strong.get().saturating_add(1));
@@ -1199,14 +1243,25 @@ impl Heap {
                     std::backtrace::Backtrace::force_capture()
                 );
             }
-            RawId::String(string) if super::ownership::trace_string_matches(string) => {
-                eprintln!(
-                    "[strong-retain-fast] {id:?} -> {}\n{}",
-                    node.strong.get(),
-                    std::backtrace::Backtrace::force_capture()
-                );
-            }
             _ => {}
+        }
+    }
+
+    /// Leaf half of [`Heap::retain_raw_fast`], out of line so the shared fast
+    /// path keeps its original inlining.
+    #[inline]
+    fn retain_leaf_fast(&self, id: RawId) {
+        let strong = &self.live_leaf_fast(id).strong;
+        strong.set(strong.get().saturating_add(1));
+        #[cfg(debug_assertions)]
+        if let RawId::String(string) = id
+            && super::ownership::trace_string_matches(string)
+        {
+            eprintln!(
+                "[strong-retain-fast] {id:?} -> {}\n{}",
+                strong.get(),
+                std::backtrace::Backtrace::force_capture()
+            );
         }
     }
 
@@ -1214,13 +1269,16 @@ impl Heap {
     /// counter increment.  Rooting paths (for example a nested property
     /// materialization which already holds a shared state borrow) duplicate
     /// one reference without requiring `&mut` access to the arena.
-    #[inline]
+    #[inline(always)]
     pub(in crate::engine::heap) fn retain_raw_shared(&self, id: RawId) -> Result<(), HeapError> {
         #[cfg(debug_assertions)]
         if let RawId::Object(object) = id
             && super::ownership::trace_object_matches(object)
         {
             super::ownership::record_object_retain(object);
+        }
+        if id.is_leaf() {
+            return self.retain_leaf_shared(id);
         }
         let node = self.live_node(id)?;
         node.strong.set(
@@ -1232,22 +1290,35 @@ impl Heap {
                 })?,
         );
         #[cfg(debug_assertions)]
-        match id {
-            RawId::Object(object) if super::ownership::trace_object_matches(object) => {
-                eprintln!(
-                    "[retain-shared] {object:?} -> {}\n{}",
-                    node.strong.get(),
-                    std::backtrace::Backtrace::force_capture()
-                );
-            }
-            RawId::String(string) if super::ownership::trace_string_matches(string) => {
-                eprintln!(
-                    "[strong-retain-shared] {id:?} -> {}\n{}",
-                    node.strong.get(),
-                    std::backtrace::Backtrace::force_capture()
-                );
-            }
-            _ => {}
+        if let RawId::Object(object) = id
+            && super::ownership::trace_object_matches(object)
+        {
+            eprintln!(
+                "[retain-shared] {object:?} -> {}\n{}",
+                node.strong.get(),
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        Ok(())
+    }
+
+    /// Leaf half of [`Heap::retain_raw_shared`], out of line so the shared
+    /// path keeps its original inlining.
+    #[inline]
+    fn retain_leaf_shared(&self, id: RawId) -> Result<(), HeapError> {
+        let strong = &self.live_leaf_slot(id)?.strong;
+        strong.set(strong.get().checked_add(1).ok_or(HeapError::Overflow {
+            operation: "retaining a heap reference",
+        })?);
+        #[cfg(debug_assertions)]
+        if let RawId::String(string) = id
+            && super::ownership::trace_string_matches(string)
+        {
+            eprintln!(
+                "[strong-retain-shared] {id:?} -> {}\n{}",
+                strong.get(),
+                std::backtrace::Backtrace::force_capture()
+            );
         }
         Ok(())
     }
@@ -1276,10 +1347,10 @@ impl Heap {
                 return Ok(None);
             }
             // One fused lookup covers the bounds/generation/kind checks of
-            // validate_slot_identity and then serves the decrement or retire
-            // decision.
+            // the leaf identity validation and then serves the decrement or
+            // retire decision.
             let index = id.index();
-            let Some(slot) = self.slots.get_mut(index as usize) else {
+            let Some(slot) = self.leaf_slots.get_mut(index as usize) else {
                 return Err(HeapError::Stale {
                     index,
                     generation: id.generation(),
@@ -1291,29 +1362,24 @@ impl Heap {
                     generation: id.generation(),
                 });
             }
-            let SlotState::Live(node) = &slot.state else {
-                // Non-live owned states decline to the full path unchanged;
-                // dead states surface the same stale diagnostic as before.
-                return match slot.state.kind() {
-                    Some(actual) if actual != id.kind() => Err(HeapError::WrongKind {
-                        expected: id.kind(),
-                        actual,
-                    }),
-                    Some(_) => Ok(None),
-                    None => Err(HeapError::Stale {
-                        index,
-                        generation: id.generation(),
-                    }),
-                };
+            let Some(actual) = slot.value.kind() else {
+                // Dead slots surface the same stale diagnostic as before.
+                return Err(HeapError::Stale {
+                    index,
+                    generation: id.generation(),
+                });
             };
-            let actual = node.data.kind();
             if actual != id.kind() {
                 return Err(HeapError::WrongKind {
                     expected: id.kind(),
                     actual,
                 });
             }
-            let strong = node.strong.get();
+            let strong = slot.strong.get();
+            if strong == 0 {
+                // A zero-queued leaf declines to the full path unchanged.
+                return Ok(None);
+            }
             if strong == IMMORTAL_STRONG {
                 // A saturated fast retain is immortal: consume the release
                 // without decrementing or retiring the leaf.
@@ -1322,11 +1388,11 @@ impl Heap {
             if strong > 1 {
                 // The live leaf and its identity are already validated. With
                 // no queued work this decrement cannot trigger finalization.
-                node.strong.set(strong - 1);
+                slot.strong.set(strong - 1);
                 return Ok(Some(false));
             }
             if strong == 1 {
-                self.retire_validated_leaf(index, id.generation())?;
+                self.retire_validated_leaf(index)?;
                 return Ok(Some(true));
             }
         }
@@ -1334,37 +1400,24 @@ impl Heap {
     }
 
     /// Retire one identity-validated, sole-owned live leaf slot. This mirrors
-    /// `Vacant` assignment plus [`Heap::reclaim_vacant_slot`] on a slot borrow
-    /// the caller already validated: same weak-link invariant, generation
-    /// bump/retire and free-list push, without redoing the slot lookup and
-    /// vacancy checks.
-    fn retire_validated_leaf(&mut self, index: u32, generation: u32) -> Result<(), HeapError> {
-        let weak_head = self.weak_head;
-        let weak_tail = self.weak_tail;
+    /// [`Heap::reclaim_leaf_vacant`] on a slot borrow the caller already
+    /// validated: same generation bump/retire and free-list push, without
+    /// redoing the slot lookup and vacancy checks.
+    fn retire_validated_leaf(&mut self, index: u32) -> Result<(), HeapError> {
         let slot = self
-            .slots
+            .leaf_slots
             .get_mut(index as usize)
-            .ok_or(HeapError::Invariant("reclaimed slot disappeared"))?;
-        // Assignment drops the leaf in place, without moving the whole Node enum.
-        slot.state = SlotState::Vacant;
-        let weak_identity = Some(ObjectId { index, generation });
-        if slot.weak_prev.is_some()
-            || slot.weak_next.is_some()
-            || weak_head == weak_identity
-            || weak_tail == weak_identity
-        {
-            return Err(HeapError::Invariant(
-                "weak-collection slot was reclaimed while still linked",
-            ));
-        }
+            .ok_or(HeapError::Invariant("reclaimed leaf slot disappeared"))?;
+        // Assignment drops the leaf payload in place.
+        slot.value = LeafValue::Vacant;
         if let Some(generation) = slot.generation.checked_add(1) {
             slot.generation = generation;
-            self.free.push(index);
+            self.leaf_free.push(index);
         } else {
-            slot.state = SlotState::Retired;
+            slot.value = LeafValue::Retired;
         }
         #[cfg(debug_assertions)]
-        self.clear_alloc_site(index);
+        self.clear_leaf_alloc_site(index);
         Ok(())
     }
 
@@ -1378,7 +1431,7 @@ impl Heap {
     /// queued node, a stale or wrong-kind handle (which must surface its
     /// error), or an explicitly traced node in debug builds — declines so the
     /// full path keeps its exact behavior and diagnostics.
-    #[inline]
+    #[inline(always)]
     pub(in crate::engine::heap) fn try_release_nonfinal(&self, id: RawId) -> bool {
         if !self.zero_queue.is_empty() {
             return false;
@@ -1392,6 +1445,9 @@ impl Heap {
                 return false;
             }
             _ => {}
+        }
+        if id.is_leaf() {
+            return self.try_release_leaf_nonfinal(id);
         }
         let Ok(index) = self.validate_slot_identity(id) else {
             return false;
@@ -1411,10 +1467,32 @@ impl Heap {
         false
     }
 
+    /// Leaf half of [`Heap::try_release_nonfinal`], out of line so the shared
+    /// fast path keeps its original inlining.
+    fn try_release_leaf_nonfinal(&self, id: RawId) -> bool {
+        let Ok(index) = self.validate_leaf_identity(id) else {
+            return false;
+        };
+        let slot = &self.leaf_slots[index];
+        if slot.is_live() {
+            let strong = slot.strong.get();
+            if strong == IMMORTAL_STRONG {
+                // A saturated fast retain is immortal: the release is
+                // consumed without a decrement.
+                return true;
+            }
+            if strong > 1 {
+                slot.strong.set(strong - 1);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Release one reference, returning cleanup when a node is finalized.
     /// Inspect the whole queue: an earlier no-drain release may have queued a
     /// different node even when this reference remains nonzero.
-    #[inline]
+    #[inline(always)]
     pub(super) fn release_reference(
         &mut self,
         id: RawId,
@@ -1440,6 +1518,9 @@ impl Heap {
     }
 
     pub(super) fn release_raw_no_drain(&mut self, id: RawId) -> Result<(), HeapError> {
+        if id.is_leaf() {
+            return self.release_leaf_raw_no_drain(id);
+        }
         #[cfg(debug_assertions)]
         if let RawId::Object(object) = id
             && super::ownership::trace_object_matches(object)
@@ -1523,6 +1604,55 @@ impl Heap {
         Ok(())
     }
 
+    /// Full-path release for a leaf handle.
+    ///
+    /// Leaves never become zombies or initializing slots, so the reachable
+    /// states are a live payload (decrement, queue at zero), a zero-queued
+    /// payload (underflow) and dead slots (stale).
+    fn release_leaf_raw_no_drain(&mut self, id: RawId) -> Result<(), HeapError> {
+        let index = self.validate_leaf_identity(id)?;
+        let slot = &mut self.leaf_slots[index];
+        if !slot.is_live() {
+            if slot.is_zero_queued() {
+                return Err(HeapError::Underflow {
+                    kind: id.kind(),
+                    index: id.index(),
+                    generation: id.generation(),
+                });
+            }
+            return Err(HeapError::Stale {
+                index: id.index(),
+                generation: id.generation(),
+            });
+        }
+        let strong = slot.strong.get();
+        if strong == IMMORTAL_STRONG {
+            // A saturated fast retain is immortal: no decrement, no
+            // zero-queue migration.
+            return Ok(());
+        }
+        slot.strong
+            .set(strong.checked_sub(1).ok_or(HeapError::Underflow {
+                kind: id.kind(),
+                index: id.index(),
+                generation: id.generation(),
+            })?);
+        #[cfg(debug_assertions)]
+        if let RawId::String(string) = id
+            && super::ownership::trace_string_matches(string)
+        {
+            eprintln!(
+                "[strong-release] {id:?} -> {}\n{}",
+                slot.strong.get(),
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        if slot.strong.get() == 0 {
+            self.zero_queue.push_back(id);
+        }
+        Ok(())
+    }
+
     /// The queue is empty on almost every call from single-value release and
     /// replacement paths; keep that check inlinable at the call sites and
     /// leave the traversal out of line.
@@ -1537,6 +1667,22 @@ impl Heap {
     fn drain_zero_queue_slow(&mut self) -> Result<HeapCleanup, HeapError> {
         let mut cleanup = HeapCleanup::default();
         while let Some(id) = self.zero_queue.pop_front() {
+            if id.is_leaf() {
+                self.validate_leaf_identity(id)?;
+                let index = id.index();
+                let value = {
+                    let slot = &mut self.leaf_slots[index as usize];
+                    if slot.strong.get() != 0 {
+                        return Err(HeapError::Invariant(
+                            "zero queue contained a nonzero reference count",
+                        ));
+                    }
+                    std::mem::replace(&mut slot.value, LeafValue::Vacant)
+                };
+                self.finish_leaf(id, value, &mut cleanup)?;
+                self.reclaim_leaf_vacant(index)?;
+                continue;
+            }
             let index = self.validate_slot_identity(id)?;
             let node = {
                 let slot = &mut self.slots[index];
@@ -1627,13 +1773,30 @@ impl Heap {
                     self.release_raw_no_drain(edge)?;
                 }
             }
-            // String and BigInt payloads own no heap edges and no atom
-            // references; finalization only accounts for the node itself.
-            NodeData::String(_) => {
+        }
+        Ok(())
+    }
+
+    /// Finalize one detached leaf payload. String and BigInt payloads own no
+    /// heap edges and no atom references, so finalization only accounts for
+    /// the node itself.
+    fn finish_leaf(
+        &mut self,
+        id: RawId,
+        value: LeafValue,
+        cleanup: &mut HeapCleanup,
+    ) -> Result<(), HeapError> {
+        match (id, value) {
+            (RawId::String(_), LeafValue::String(_)) => {
                 cleanup.finalized_strings = cleanup.finalized_strings.saturating_add(1);
             }
-            NodeData::BigInt(_) => {
+            (RawId::BigInt(_), LeafValue::BigInt(_)) => {
                 cleanup.finalized_bigints = cleanup.finalized_bigints.saturating_add(1);
+            }
+            _ => {
+                return Err(HeapError::Invariant(
+                    "leaf payload finalized through another handle",
+                ));
             }
         }
         Ok(())
@@ -1692,6 +1855,7 @@ impl Heap {
         self.reclaim_vacant_slot(index)
     }
 
+    #[inline]
     fn reclaim_vacant_slot(&mut self, index: u32) -> Result<(), HeapError> {
         let weak_id = self.slots.get(index as usize).map(|slot| ObjectId {
             index,
@@ -1722,6 +1886,30 @@ impl Heap {
         }
         #[cfg(debug_assertions)]
         self.clear_alloc_site(index);
+        Ok(())
+    }
+
+    /// Reclaim one vacant leaf slot after its payload was detached: bump the
+    /// generation and push it onto the leaf free list, or retire a
+    /// generation-saturated slot in place. Leaves never carry weak links.
+    fn reclaim_leaf_vacant(&mut self, index: u32) -> Result<(), HeapError> {
+        let slot = self
+            .leaf_slots
+            .get_mut(index as usize)
+            .ok_or(HeapError::Invariant("reclaimed leaf slot disappeared"))?;
+        if !matches!(slot.value, LeafValue::Vacant) {
+            return Err(HeapError::Invariant(
+                "leaf generation advanced before its payload was detached",
+            ));
+        }
+        if let Some(generation) = slot.generation.checked_add(1) {
+            slot.generation = generation;
+            self.leaf_free.push(index);
+        } else {
+            slot.value = LeafValue::Retired;
+        }
+        #[cfg(debug_assertions)]
+        self.clear_leaf_alloc_site(index);
         Ok(())
     }
 }
@@ -2055,28 +2243,32 @@ pub(super) fn var_ref_edges(var_ref: &VarRefData) -> Edges {
     raw_value_edges(&var_ref.value)
 }
 
+/// True when a data payload owns neither a heap edge nor an atom, so a
+/// replacement can commit without any retain, release, or zero-queue work.
+pub(super) const fn raw_value_is_immediate(value: &RawValue) -> bool {
+    matches!(
+        value,
+        RawValue::Undefined
+            | RawValue::Null
+            | RawValue::Bool(_)
+            | RawValue::Int(_)
+            | RawValue::Float(_)
+            | RawValue::ShortBigInt(_)
+    )
+}
+
 pub(super) fn property_slot_edges(slot: &PropertySlot) -> Edges {
     let mut edges = Edges::new();
     match slot {
         PropertySlot::Data(value) => edges.extend(raw_value_edge(value)),
         PropertySlot::VarRef(var_ref) => edges.push(RawId::VarRef(*var_ref)),
-        PropertySlot::Accessor { get, set } => {
-            edges.extend(get.iter().chain(set.iter()).copied().map(RawId::Object))
-        }
-        PropertySlot::AutoInit(
-            AutoInitProperty::FunctionPrototype { realm }
-            | AutoInitProperty::NativeBuiltin { realm, .. }
-            | AutoInitProperty::String { realm, .. }
-            | AutoInitProperty::ArrayUnscopables { realm }
-            | AutoInitProperty::Math { realm }
-            | AutoInitProperty::Reflect { realm }
-            | AutoInitProperty::Json { realm }
-            | AutoInitProperty::Atomics { realm },
-        ) => edges.push(RawId::Context(*realm)),
-        #[cfg(test)]
-        PropertySlot::AutoInit(AutoInitProperty::FailureProbe { realm }) => {
-            edges.push(RawId::Context(*realm))
-        }
+        PropertySlot::Accessor { get, set } => edges.extend(
+            get.option()
+                .into_iter()
+                .chain(set.option())
+                .map(RawId::Object),
+        ),
+        PropertySlot::AutoInit(initializer) => edges.push(RawId::Context(initializer.realm())),
     }
     edges
 }
@@ -2595,6 +2787,33 @@ impl Heap {
         }
     }
 
+    pub(super) fn record_leaf_alloc_site(
+        &mut self,
+        index: u32,
+        generation: u32,
+        kind: HeapNodeKind,
+    ) {
+        if !super::ownership::alloc_site_capture_enabled() {
+            return;
+        }
+        let backtrace = super::ownership::compact_backtrace();
+        let index = index as usize;
+        if self.leaf_alloc_sites.len() <= index {
+            self.leaf_alloc_sites.resize_with(index + 1, || None);
+        }
+        self.leaf_alloc_sites[index] = Some(AllocSite {
+            generation,
+            kind,
+            backtrace,
+        });
+    }
+
+    pub(super) fn clear_leaf_alloc_site(&mut self, index: u32) {
+        if let Some(site) = self.leaf_alloc_sites.get_mut(index as usize) {
+            *site = None;
+        }
+    }
+
     /// Print the edge ledger for every node that survived runtime teardown.
     ///
     /// Survivors are the externally rooted nodes; each line carries its
@@ -2611,6 +2830,7 @@ impl Heap {
             roots.len(),
             self.alloc_sites
                 .iter()
+                .chain(self.leaf_alloc_sites.iter())
                 .filter(|site| site.is_some())
                 .count(),
         );
@@ -2632,6 +2852,39 @@ impl Heap {
                     printed += 1;
                 }
             }
+            for (index, slot) in self.leaf_slots.iter().enumerate() {
+                if printed == 8 {
+                    break;
+                }
+                if slot.is_live() {
+                    self.print_leaf_alloc_site(index, slot);
+                    printed += 1;
+                }
+            }
+        }
+    }
+
+    fn print_leaf_alloc_site(&self, index: usize, slot: &LeafSlot) {
+        let Some(kind) = slot.value.kind() else {
+            return;
+        };
+        eprintln!(
+            "[ledger] leaf#{index} {kind:?} residual={}",
+            slot.strong.get()
+        );
+        let site = self
+            .leaf_alloc_sites
+            .get(index)
+            .and_then(|site| site.as_ref())
+            .filter(|site| site.generation == slot.generation);
+        match site {
+            Some(site) => eprintln!(
+                "[ledger] leaf#{index} created {:?} at {}",
+                site.kind, site.backtrace
+            ),
+            None => eprintln!(
+                "[ledger] leaf#{index} no creation backtrace recorded (set QJS_EDGE_LEDGER=1)"
+            ),
         }
     }
 
@@ -2707,9 +2960,6 @@ impl Heap {
                             Some(name) => format!("bytecode:{}", name.to_utf8_lossy()),
                             None => "bytecode:<anon>".to_string(),
                         },
-                        NodeData::String(text) => {
-                            text.to_utf8_lossy().chars().take(60).collect::<String>()
-                        }
                         _ => String::new(),
                     };
                     roots.push((

@@ -362,10 +362,7 @@ impl Runtime {
                 };
                 (
                     PropertyFlags::accessor(enumerable, configurable),
-                    PropertySlot::Accessor {
-                        get: id(get)?,
-                        set: id(set)?,
-                    },
+                    PropertySlot::accessor(id(get)?, id(set)?),
                 )
             }
         };
@@ -465,16 +462,16 @@ impl Runtime {
                     object,
                     key,
                     PropertyFlags::accessor(enumerable, configurable),
-                    PropertySlot::Accessor {
-                        get: get.map(|value| match value {
+                    PropertySlot::accessor(
+                        get.map(|value| match value {
                             RawValue::Object(id) => id,
                             _ => unreachable!("validated accessor"),
                         }),
-                        set: set.map(|value| match value {
+                        set.map(|value| match value {
                             RawValue::Object(id) => id,
                             _ => unreachable!("validated accessor"),
                         }),
-                    },
+                    ),
                 )
             }
         }
@@ -585,9 +582,22 @@ impl RuntimeState {
                 };
             }
         }
+        // An exclusively owned layout may append in place only when no
+        // canonical successor already exists; otherwise the successor (and the
+        // sharing it enables) would be stranded by an equivalent duplicate.
         if existing.is_none()
             && (dictionary || shape_len >= properties::MIN_UNIQUE_SHAPE_APPEND_ENTRIES)
             && state.heap.shape_strong_count(shape_id)? == 1
+            && (dictionary
+                || state
+                    .canonical_successor(
+                        shape_id,
+                        ShapeEntry {
+                            atom: AtomIdx::from_raw(atom.raw()),
+                            flags,
+                        },
+                    )
+                    .is_none())
         {
             return state.append_selected_unique_layout(
                 SelectedMissingAppend {
@@ -665,7 +675,7 @@ mod selected_append_tests {
                 .is_none()
         );
         let before_atoms = state.atoms.resolve(key.atom()).unwrap().ref_count;
-        let fingerprint = state.shape_fingerprints.get(&shape).unwrap().clone();
+        assert!(state.shape_is_canonical(shape));
         let selected = SelectedMissingAppend {
             object: owner.object_id(),
             shape,
@@ -685,7 +695,6 @@ mod selected_append_tests {
             before_atoms
         );
         assert!(state.heap.shape(shape).unwrap().entries().is_empty());
-        assert_eq!(state.shape_fingerprints.get(&shape), Some(&fingerprint));
-        assert_eq!(state.shape_cache.get(&fingerprint), Some(&shape));
+        assert!(state.shape_is_canonical(shape));
     }
 }

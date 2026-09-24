@@ -25,7 +25,7 @@ use crate::engine::object::operations::{
 use crate::engine::object::property::{
     PropertyDefinitionError, validate_and_apply_property_descriptor,
 };
-use crate::engine::object::shape::{PropertyFlags, ShapeEntry};
+use crate::engine::object::shape::{PropertyFlags, ShapeEntry, extend_fingerprint_hash};
 use crate::engine::object::{
     CallableRef, CompleteOrdinaryPropertyDescriptor, DescriptorField, ObjectRef,
     OrdinaryPropertyDescriptor, PropertyKey,
@@ -89,13 +89,7 @@ impl RuntimeState {
         };
 
         self.unlink_shape_transitions(shape);
-        let unlinked = self.shape_fingerprints.remove(&shape).map(|fingerprint| {
-            let owned_cache_entry = self.shape_cache.get(&fingerprint) == Some(&shape);
-            if owned_cache_entry {
-                self.shape_cache.remove(&fingerprint);
-            }
-            (fingerprint, owned_cache_entry)
-        });
+        let previous_hash = self.remove_shape_cache(shape);
         let result = match selected {
             Some(selected) => {
                 self.heap
@@ -106,15 +100,22 @@ impl RuntimeState {
                 .append_unique_object_property(object, atom, flags, replacement),
         };
         if let Err(error) = result {
-            if let Some((fingerprint, owned_cache_entry)) = unlinked {
-                if owned_cache_entry {
-                    self.shape_cache.insert(fingerprint.clone(), shape);
-                }
-                self.shape_fingerprints.insert(shape, fingerprint);
+            if let Some(hash) = previous_hash {
+                self.insert_shape_cache(shape, hash);
             }
             self.release_atoms(retained_slot_atoms)?;
             self.atoms.release(atom)?;
             return Err(error.into());
+        }
+        // Relink the mutated layout under its successor fingerprint, mirroring
+        // QuickJS's in-place hashed-shape update, so later objects converge on
+        // this shape instead of rebuilding an equivalent private one.
+        if let Some(hash) = previous_hash {
+            let entry = ShapeEntry {
+                atom: AtomIdx::from_raw(atom.raw()),
+                flags,
+            };
+            self.insert_shape_cache(shape, extend_fingerprint_hash(hash, &entry));
         }
         Ok(())
     }
@@ -295,8 +296,8 @@ impl Runtime {
                     flags: entry.flags,
                 },
                 PropertySlot::Accessor { get, set } => PropertySnapshot::Accessor {
-                    get: *get,
-                    set: *set,
+                    get: get.option(),
+                    set: set.option(),
                     flags: entry.flags,
                 },
                 PropertySlot::AutoInit(_) => PropertySnapshot::AutoInit,
@@ -367,8 +368,8 @@ impl Runtime {
                     }
                 }
                 PropertySlot::Accessor { get, set } => Some(CompletePropertyDescriptor::Accessor {
-                    get: get.map(RawValue::Object),
-                    set: set.map(RawValue::Object),
+                    get: get.option().map(RawValue::Object),
+                    set: set.option().map(RawValue::Object),
                     enumerable: flags.enumerable,
                     configurable: flags.configurable,
                 }),
@@ -473,7 +474,7 @@ impl Runtime {
             )
             .map_err(|_| RuntimeError::Invariant("shape index does not fit usize"))?;
             let initializer = match object.slots.get(slot_index) {
-                Some(PropertySlot::AutoInit(initializer)) => *initializer,
+                Some(PropertySlot::AutoInit(initializer)) => **initializer,
                 Some(
                     PropertySlot::Data(_) | PropertySlot::VarRef(_) | PropertySlot::Accessor { .. },
                 ) => return Ok(()),
@@ -1110,8 +1111,8 @@ impl Runtime {
                         }),
                         PropertySlot::Accessor { get, set } => {
                             Ok(CompletePropertyDescriptor::Accessor {
-                                get: get.map(RawValue::Object),
-                                set: set.map(RawValue::Object),
+                                get: get.option().map(RawValue::Object),
+                                set: set.option().map(RawValue::Object),
                                 enumerable: flags.enumerable,
                                 configurable: flags.configurable,
                             })
@@ -1502,8 +1503,8 @@ impl Runtime {
                         }),
                         PropertySlot::Accessor { get, set } => {
                             Ok(CompletePropertyDescriptor::Accessor {
-                                get: get.map(RawValue::Object),
-                                set: set.map(RawValue::Object),
+                                get: get.option().map(RawValue::Object),
+                                set: set.option().map(RawValue::Object),
                                 enumerable: flags.enumerable,
                                 configurable: flags.configurable,
                             })

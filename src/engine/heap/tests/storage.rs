@@ -1311,7 +1311,7 @@ fn shape_prototype_edge_participates_in_cycle_collection() {
     let prototype_shape = heap
         .allocate_shape(Shape::new(Some(object), []).unwrap())
         .unwrap();
-    heap.replace_object_layout(object, prototype_shape, Vec::new())
+    heap.replace_object_layout(object, prototype_shape, Slots::new())
         .unwrap();
 
     assert_eq!(
@@ -1391,6 +1391,30 @@ fn property_slot_transaction_retains_before_publish_and_marks_cleanup_failures()
 }
 
 #[test]
+fn immediate_property_replacement_skips_the_transactional_edges() {
+    let mut heap = Heap::new();
+    let shape = one_slot_shape(&mut heap);
+    let object = heap
+        .allocate_object(ObjectData::ordinary(
+            shape,
+            vec![PropertySlot::Data(RawValue::Int(7))],
+        ))
+        .unwrap();
+    let cleanup = heap
+        .replace_object_slot(object, 0, PropertySlot::Data(RawValue::Bool(true)))
+        .unwrap();
+    assert_eq!(cleanup, HeapCleanup::default());
+    assert!(matches!(
+        heap.object(object).unwrap().slots[0],
+        PropertySlot::Data(RawValue::Bool(true))
+    ));
+    assert_eq!(heap.object_strong_count(object), Ok(1));
+    heap.release_object(object).unwrap();
+    heap.release_shape(shape).unwrap();
+    assert_eq!(heap.counts().live, 0);
+}
+
+#[test]
 fn property_slot_transaction_keeps_new_symbol_owned_after_post_publish_failure() {
     use crate::engine::api::runtime::Runtime;
     use crate::engine::object::{DescriptorField, OrdinaryPropertyDescriptor};
@@ -1455,7 +1479,7 @@ fn shared_value_leaves_release_once_and_drain_older_queued_work() {
     for id in [RawId::String(string), RawId::BigInt(bigint)] {
         heap.retain_raw(id, 1).unwrap();
         assert_eq!(heap.release_reference(id).unwrap(), None);
-        assert_eq!(heap.live_node(id).unwrap().strong.get(), 1);
+        assert_eq!(heap.live_leaf_slot(id).unwrap().strong.get(), 1);
     }
     heap.release_raw_no_drain(RawId::String(string)).unwrap();
     heap.retain_raw(RawId::BigInt(bigint), 1).unwrap();
@@ -1465,9 +1489,35 @@ fn shared_value_leaves_release_once_and_drain_older_queued_work() {
         .unwrap();
     assert_eq!(cleanup.finalized_strings, 1);
     assert_eq!(
-        heap.live_node(RawId::BigInt(bigint)).unwrap().strong.get(),
+        heap.live_leaf_slot(RawId::BigInt(bigint))
+            .unwrap()
+            .strong
+            .get(),
         1
     );
     assert_eq!(heap.release_bigint(bigint).unwrap().finalized_bigints, 1);
     assert_eq!(heap.counts().live, 0);
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn accessor_refs_pack_the_null_sentinel_into_eight_bytes() {
+    use std::mem::size_of;
+    assert_eq!(size_of::<AccessorRef>(), 8);
+    assert_eq!(AccessorRef::NONE.option(), None);
+    let getter = ObjectId {
+        index: 7,
+        generation: 3,
+    };
+    assert_eq!(
+        AccessorRef::from_option(Some(getter)).option(),
+        Some(getter)
+    );
+    let slot = PropertySlot::accessor(None, Some(getter));
+    let PropertySlot::Accessor { get, set } = slot else {
+        panic!("accessor constructor produced a data slot");
+    };
+    assert_eq!(get.option(), None);
+    assert_eq!(set.option(), Some(getter));
+    assert_eq!(size_of::<PropertySlot>(), 24);
 }

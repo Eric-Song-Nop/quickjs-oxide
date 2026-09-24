@@ -413,6 +413,9 @@ per-runtime 表下帧不可能持有外来句柄，该收敛符合 §2 边界原
 契约改进未随附 promotion），且任何源码演进都会改变工作区指纹（T1/T2 亦然）；
 `--focused` 按设计拒绝过旧源码，未跑。基线 promotion（重跑 full → 派生
 focused → 更新 `current.conf`/`docs/status.md`）留作独立事项。
+**2026-09-24 后续**：该独立事项已完成——覆盖契约对齐（`0e72387f`）+
+基线晋升（`f69e545c`），`--check`/`--focused`/`--full` 全部认证通过，
+详见 [阶段 D 实施计划](s3-d-plan.md) §4 D 收尾记录。
 `python3 scripts/checks/check-source-layout.py` 通过（698 个 reachable
 Rust 文件）。证据：`target/s3-a-t2-test262-197162f5/`（full.log、TSV/JSONL、
 status.json）。
@@ -541,4 +544,7 @@ annotate 归因留 A4 可选复核。`bigint256` cycles 持平。限制：shippe
   `s3-a-plan.md` §8.13（提交 `c1805e9d`）。
 - 实施结果记入 `s3-a-plan.md` 新增 §8.14 或
   `s3-full-rerun-results.md` 后续轮次；A4 决策矩阵引用本计划结论。
+- A4 决策已完成：[A4/D/B 决策报告](s3-a4-d-b-decision.md)（保留 16B、
+  D 优先、B 重设计后置）；后续 D 按
+  [阶段 D 实施计划](s3-d-plan.md) 执行。
 - B 的重新设计独立立项，不继承本计划。

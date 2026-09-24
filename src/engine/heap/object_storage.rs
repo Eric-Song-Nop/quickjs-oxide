@@ -30,9 +30,7 @@ impl Heap {
             NodeData::Shape(_)
             | NodeData::VarRef(_)
             | NodeData::Context(_)
-            | NodeData::FunctionBytecode(_)
-            | NodeData::String(_)
-            | NodeData::BigInt(_) => Err(HeapError::Invariant(
+            | NodeData::FunctionBytecode(_) => Err(HeapError::Invariant(
                 "typed object lookup reached another node payload",
             )),
         }
@@ -122,9 +120,7 @@ impl Heap {
             NodeData::Object(_)
             | NodeData::VarRef(_)
             | NodeData::Context(_)
-            | NodeData::FunctionBytecode(_)
-            | NodeData::String(_)
-            | NodeData::BigInt(_) => Err(HeapError::Invariant(
+            | NodeData::FunctionBytecode(_) => Err(HeapError::Invariant(
                 "typed shape lookup reached another node payload",
             )),
         }
@@ -151,9 +147,7 @@ impl Heap {
             NodeData::Object(_)
             | NodeData::VarRef(_)
             | NodeData::Context(_)
-            | NodeData::FunctionBytecode(_)
-            | NodeData::String(_)
-            | NodeData::BigInt(_) => Err(HeapError::Invariant(
+            | NodeData::FunctionBytecode(_) => Err(HeapError::Invariant(
                 "typed mutable shape lookup reached another node payload",
             )),
         }
@@ -166,9 +160,7 @@ impl Heap {
             NodeData::Object(_)
             | NodeData::Shape(_)
             | NodeData::VarRef(_)
-            | NodeData::FunctionBytecode(_)
-            | NodeData::String(_)
-            | NodeData::BigInt(_) => Err(HeapError::Invariant(
+            | NodeData::FunctionBytecode(_) => Err(HeapError::Invariant(
                 "typed context lookup reached another node payload",
             )),
         }
@@ -731,6 +723,35 @@ impl Heap {
         slot_index: usize,
         replacement: PropertySlot,
     ) -> Result<HeapCleanup, SlotReplacementError> {
+        // Fast path: both payloads are immediate scalars, so neither side owns
+        // an edge or an atom and releasing the old value cannot reclaim the
+        // receiver. Every live slot matches its shape storage (allocation and
+        // every replacement enforce it) and the replacement is a scalar, so
+        // the storage validation is redundant here. The transactional
+        // retain/release machinery is a no-op for the same reason.
+        if let PropertySlot::Data(new) = &replacement {
+            if raw_value_is_immediate(new) {
+                let object = self.object_mut(id).map_err(|error| SlotReplacementError {
+                    error,
+                    published: false,
+                })?;
+                let old_is_immediate = matches!(
+                    object.slots.get(slot_index),
+                    Some(PropertySlot::Data(old)) if raw_value_is_immediate(old)
+                );
+                if old_is_immediate {
+                    let slot = object.slots.get_mut(slot_index).ok_or(HeapError::Invariant(
+                        "immediate property slot disappeared before replacement",
+                    ));
+                    let slot = slot.map_err(|error| SlotReplacementError {
+                        error,
+                        published: false,
+                    })?;
+                    *slot = replacement;
+                    return Ok(HeapCleanup::default());
+                }
+            }
+        }
         self.validate_replacement_slot(id, slot_index, &replacement)
             .map_err(|error| SlotReplacementError {
                 error,
@@ -1099,7 +1120,7 @@ impl Heap {
         &mut self,
         id: ObjectId,
         shape: ShapeId,
-        slots: Vec<PropertySlot>,
+        slots: Slots,
     ) -> Result<HeapCleanup, HeapError> {
         self.validate_property_layout(shape, &slots)?;
         let replacement_prototype = self.shape(shape)?.prototype();
@@ -2203,6 +2224,9 @@ impl Heap {
         &self,
         id: RawId,
     ) -> Result<usize, HeapError> {
+        // A leaf handle can never alias a shared slot successfully: shared
+        // payload kinds never report `String`/`BigInt`, so the kind check
+        // below rejects it. No separate leaf test is needed on this hot path.
         let index = id.index() as usize;
         let slot = self.slots.get(index).ok_or(HeapError::Stale {
             index: id.index(),
