@@ -29,7 +29,6 @@ use crate::engine::compiler::parser::context::StatementPosition;
 use crate::engine::compiler::parser::diagnostics::IdentifierContext;
 use crate::engine::compiler::parser::diagnostics::source_offset;
 use crate::engine::compiler::parser::diagnostics::source_span;
-use crate::engine::compiler::parser::diagnostics::validate_identifier_reservation;
 use crate::engine::value::JsString;
 use crate::engine::value::PrimitiveValue as Value;
 
@@ -305,6 +304,7 @@ impl<'source> Parser<'source> {
         self.expect_punctuator(Punctuator::RightParen)?;
 
         let scope = self.push_scope(ScopeKind::With);
+        let with_name = self.names.intern(WITH_OBJECT_LOCAL_NAME);
         let local = {
             let function = self.current_ir_mut();
             if function.locals.len() >= MAX_LOCAL_VARIABLES {
@@ -315,11 +315,11 @@ impl<'source> Parser<'source> {
             }
             let local = u16::try_from(function.locals.len())
                 .map_err(|_| Error::new(ErrorKind::JsInternal, "too many local variables"))?;
-            function.locals.push(WITH_OBJECT_LOCAL_NAME.to_owned());
+            function.locals.push(with_name);
             function.ir.add_binding(
                 scope,
                 scope,
-                WITH_OBJECT_LOCAL_NAME.to_owned(),
+                with_name,
                 BindingStorage::Local(local),
                 BindingKind::WithObject,
                 None,
@@ -560,22 +560,22 @@ impl<'source> Parser<'source> {
                 } else if self.is_punctuator(Punctuator::LeftBracket) {
                     self.parse_catch_array_binding_pattern()?;
                 } else {
-                    let token = self.current().clone();
+                    let token = *self.current();
                     let TokenKind::Identifier(identifier) = token.kind else {
                         return Err(self.syntax_here("identifier expected"));
                     };
                     if identifier.escaped_reserved_word {
                         return Err(self.syntax_here("identifier expected"));
                     }
-                    validate_identifier_reservation(
+                    self.validate_identifier_reservation(
                         &identifier,
                         token.span,
                         self.current_ir().strict,
                         IdentifierContext::Variable,
                     )?;
+                    let name = self.intern_identifier(&identifier);
                     let invalid_strict_name = self.current_ir().strict
-                        && matches!(identifier.value.as_str(), "eval" | "arguments");
-                    let name = identifier.value;
+                        && matches!(self.names.name(name), "eval" | "arguments");
                     self.advance()?;
                     if invalid_strict_name {
                         return Err(Error::syntax(
@@ -584,16 +584,16 @@ impl<'source> Parser<'source> {
                         ));
                     }
                     self.register_lexical_binding(
-                        &name,
+                        name,
                         token.span,
                         self.current().span,
                         false,
                         false,
                     )?;
-                    let catch_binding =
-                        self.current_ir()
-                            .binding_id_in_scope(catch_scope, &name)
-                            .ok_or_else(|| Error::internal("catch binding was not registered"))?;
+                    let catch_binding = self
+                        .current_ir()
+                        .binding_id_in_scope(catch_scope, name)
+                        .ok_or_else(|| Error::internal("catch binding was not registered"))?;
                     self.current_ir_mut().bindings[catch_binding.0].is_catch_parameter = true;
                     self.emit_identifier(name, token.span, IdentifierAccess::Initialize)?;
                 }
@@ -664,9 +664,11 @@ impl<'source> Parser<'source> {
 
             let saved_eval_ret = if matches!(completion, StatementCompletion::Eval) {
                 let eval_ret = self.eval_ret_local()?;
-                let saved = self
-                    .current_ir_mut()
-                    .add_synthetic_local(SyntheticLocalKind::FinallySavedEvalCompletion)?;
+                let function = &mut self.functions[self.current_function];
+                let saved = function.add_synthetic_local(
+                    SyntheticLocalKind::FinallySavedEvalCompletion,
+                    &mut self.names,
+                )?;
                 self.emit_instruction(Instruction::GetLocal(eval_ret))?;
                 self.emit_instruction(Instruction::PutLocal(saved))?;
                 self.set_eval_ret_undefined()?;
@@ -809,33 +811,33 @@ impl<'source> Parser<'source> {
             } else if self.is_punctuator(Punctuator::LeftBrace) {
                 self.parse_object_binding_declaration(ForAssignmentDeclaration::Lexical, is_const)?;
             } else {
-                let token = self.current().clone();
+                let token = *self.current();
                 let TokenKind::Identifier(identifier) = token.kind else {
                     return Err(self.syntax_here("variable name expected"));
                 };
-                validate_identifier_reservation(
+                self.validate_identifier_reservation(
                     &identifier,
                     token.span,
                     self.current_ir().strict,
                     IdentifierContext::Variable,
                 )?;
-                if identifier.value == "let" {
+                if self.identical_name(&identifier, "let") {
                     return Err(Error::syntax(
                         "'let' is not a valid lexical identifier",
                         source_span(token.span),
                     ));
                 }
-                let name = identifier.value;
+                let name = self.intern_identifier(&identifier);
                 let strict = self.current_ir().strict;
                 self.advance()?;
-                if strict && matches!(name.as_str(), "eval" | "arguments") {
+                if strict && matches!(self.names.name(name), "eval" | "arguments") {
                     return Err(Error::syntax(
                         "invalid variable name in strict mode",
                         source_span(self.current().span),
                     ));
                 }
                 self.register_lexical_binding(
-                    &name,
+                    name,
                     token.span,
                     self.current().span,
                     is_const,
@@ -847,7 +849,7 @@ impl<'source> Parser<'source> {
                     self.parse_assignment()?;
                     if let Some(definition) = self.take_anonymous_function_definition() {
                         let name_constant = self.add_constant(IrConstant::Primitive(
-                            Value::String(JsString::try_from_utf8(&name)?),
+                            Value::String(JsString::try_from_utf8(self.names.name(name))?),
                         ))?;
                         self.emit_anonymous_set_name(
                             definition,
@@ -900,26 +902,26 @@ impl<'source> Parser<'source> {
             } else if self.is_punctuator(Punctuator::LeftBrace) {
                 self.parse_object_binding_declaration(ForAssignmentDeclaration::Var, false)?;
             } else {
-                let token = self.current().clone();
+                let token = *self.current();
                 let TokenKind::Identifier(identifier) = token.kind else {
                     return Err(self.syntax_here("variable name expected"));
                 };
-                validate_identifier_reservation(
+                self.validate_identifier_reservation(
                     &identifier,
                     token.span,
                     self.current_ir().strict,
                     IdentifierContext::Variable,
                 )?;
                 let strict = self.current_ir().strict;
-                let name = identifier.value;
+                let name = self.intern_identifier(&identifier);
                 self.advance()?;
-                if strict && matches!(name.as_str(), "eval" | "arguments") {
+                if strict && matches!(self.names.name(name), "eval" | "arguments") {
                     return Err(Error::syntax(
                         "invalid variable name in strict mode",
                         source_span(self.current().span),
                     ));
                 }
-                self.register_var_binding(&name, token.span, self.current().span)?;
+                self.register_var_binding(name, token.span, self.current().span)?;
 
                 let initializer_span = self.current().span;
                 if self.consume_punctuator(Punctuator::Equal)? {
@@ -929,7 +931,7 @@ impl<'source> Parser<'source> {
                     if object_environment {
                         self.emit_at(
                             IrOp::IdentifierReference {
-                                name: name.clone(),
+                                name,
                                 span: token.span,
                                 scope: initializer_scope,
                                 access: IdentifierReferenceAccess::Prepare,
@@ -944,7 +946,7 @@ impl<'source> Parser<'source> {
                         // applies to this initializer. Keep that contextual name
                         // separate from the child bytecode's intrinsic func_name.
                         let name_constant = self.add_constant(IrConstant::Primitive(
-                            Value::String(JsString::try_from_utf8(&name)?),
+                            Value::String(JsString::try_from_utf8(self.names.name(name))?),
                         ))?;
                         self.emit_anonymous_set_name(
                             definition,

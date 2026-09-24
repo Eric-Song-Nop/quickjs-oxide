@@ -98,11 +98,11 @@ impl<'source> Parser<'source> {
         let new_span = self.current().span;
         self.advance()?;
         if self.consume_punctuator(Punctuator::Dot)? {
-            let token = self.current().clone();
+            let token = *self.current();
             let TokenKind::Identifier(identifier) = token.kind else {
                 return Err(self.syntax_here("expecting target"));
             };
-            if identifier.value != "target" || identifier.has_escape {
+            if !self.is_unescaped_name(&identifier, "target") {
                 return Err(self.syntax_here("expecting target"));
             }
             if matches!(self.current_ir().kind, FunctionKind::Eval(EvalKind::None)) {
@@ -120,7 +120,7 @@ impl<'source> Parser<'source> {
                 FunctionKind::Arrow | FunctionKind::Eval(EvalKind::Direct)
             ) {
                 self.emit_identifier(
-                    NEW_TARGET_LOCAL_NAME.to_owned(),
+                    self.pseudo_name(NEW_TARGET_LOCAL_NAME),
                     new_span,
                     IdentifierAccess::Get,
                 )?;
@@ -199,13 +199,13 @@ impl<'source> Parser<'source> {
             // mutate the derived constructor's [[Prototype]], but that mutation
             // affects only a later super() call.
             self.emit_identifier(
-                ACTIVE_FUNCTION_LOCAL_NAME.to_owned(),
+                self.pseudo_name(ACTIVE_FUNCTION_LOCAL_NAME),
                 super_span,
                 IdentifierAccess::Get,
             )?;
             self.emit_instruction(Instruction::GetSuper)?;
             self.emit_identifier(
-                NEW_TARGET_LOCAL_NAME.to_owned(),
+                self.pseudo_name(NEW_TARGET_LOCAL_NAME),
                 super_span,
                 IdentifierAccess::Get,
             )?;
@@ -225,12 +225,12 @@ impl<'source> Parser<'source> {
             }
             self.emit_instruction(Instruction::Dup)?;
             self.emit_identifier(
-                THIS_LOCAL_NAME.to_owned(),
+                self.pseudo_name(THIS_LOCAL_NAME),
                 super_span,
                 IdentifierAccess::InitializeDerivedThis,
             )?;
             self.emit_identifier(
-                ACTIVE_FUNCTION_LOCAL_NAME.to_owned(),
+                self.pseudo_name(ACTIVE_FUNCTION_LOCAL_NAME),
                 super_span,
                 IdentifierAccess::Get,
             )?;
@@ -256,12 +256,12 @@ impl<'source> Parser<'source> {
         }
 
         self.emit_identifier(
-            THIS_LOCAL_NAME.to_owned(),
+            self.pseudo_name(THIS_LOCAL_NAME),
             super_span,
             IdentifierAccess::Get,
         )?;
         self.emit_identifier(
-            HOME_OBJECT_LOCAL_NAME.to_owned(),
+            self.pseudo_name(HOME_OBJECT_LOCAL_NAME),
             super_span,
             IdentifierAccess::Get,
         )?;
@@ -270,7 +270,7 @@ impl<'source> Parser<'source> {
         let member_span = self.current().span;
         if self.is_punctuator(Punctuator::Dot) {
             self.advance()?;
-            let token = self.current().clone();
+            let token = *self.current();
             let name = match token.kind {
                 TokenKind::PrivateIdentifier(_) => {
                     return Err(Error::syntax(
@@ -278,7 +278,7 @@ impl<'source> Parser<'source> {
                         source_span(token.span),
                     ));
                 }
-                TokenKind::Identifier(identifier) => identifier.value,
+                TokenKind::Identifier(identifier) => self.identifier_text(&identifier).into_owned(),
                 TokenKind::Keyword(keyword) => keyword.as_str().to_owned(),
                 _ => return Err(self.syntax_here("expecting field name")),
             };
@@ -311,7 +311,7 @@ impl<'source> Parser<'source> {
             let exact_meta = matches!(
                 &self.current().kind,
                 TokenKind::Identifier(identifier)
-                    if identifier.value == "meta" && !identifier.has_escape
+                    if self.is_unescaped_name(identifier, "meta")
             );
             if !exact_meta {
                 return Err(self.syntax_here("meta expected"));

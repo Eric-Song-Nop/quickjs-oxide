@@ -28,7 +28,6 @@ use crate::engine::compiler::parser::context::MemberReference;
 use crate::engine::compiler::parser::context::Parser;
 use crate::engine::compiler::parser::context::PowerMode;
 use crate::engine::compiler::parser::diagnostics::source_offset;
-use crate::engine::compiler::private_reference;
 use crate::engine::value::JsString;
 use crate::engine::value::PrimitiveValue as Value;
 
@@ -121,7 +120,9 @@ impl<'source> Parser<'source> {
         // starts with the identifier token itself. Parenthesized lvalues are
         // valid References but intentionally do not trigger NamedEvaluation.
         let direct_identifier_name = match &self.current().kind {
-            TokenKind::Identifier(identifier) => Some(identifier.value.clone()),
+            TokenKind::Identifier(identifier) => {
+                Some(self.identifier_text(identifier).into_owned())
+            }
             _ => None,
         };
         self.parse_conditional()?;
@@ -164,7 +165,8 @@ impl<'source> Parser<'source> {
             if let Some(target) =
                 self.promote_tail_identifier_get(IdentifierReferenceAccess::Get)?
             {
-                let infer_name = direct_identifier_name.as_deref() == Some(target.name.as_str());
+                let infer_name =
+                    direct_identifier_name.as_deref() == Some(self.names.name(target.name));
                 return self.parse_logical_identifier_assignment(target, logical, infer_name);
             }
             return self.parse_logical_member_assignment(logical);
@@ -236,11 +238,11 @@ impl<'source> Parser<'source> {
             self.parse_assignment()?;
             self.inherit_source_marker_at(rhs_start, source_offset(target.span)?)?;
             let anonymous_rhs = self.take_anonymous_function_definition();
-            if direct_identifier_name.as_deref() == Some(target.name.as_str())
+            if direct_identifier_name.as_deref() == Some(self.names.name(target.name))
                 && let Some(definition) = anonymous_rhs
             {
                 let name_constant = self.add_constant(IrConstant::Primitive(Value::String(
-                    JsString::try_from_utf8(&target.name)?,
+                    JsString::try_from_utf8(self.names.name(target.name))?,
                 )))?;
                 self.emit_anonymous_set_name(definition, Instruction::SetName(name_constant))?;
             }
@@ -316,7 +318,7 @@ impl<'source> Parser<'source> {
         let anonymous_rhs = self.take_anonymous_function_definition();
         if infer_name && let Some(definition) = anonymous_rhs {
             let name_constant = self.add_constant(IrConstant::Primitive(Value::String(
-                JsString::try_from_utf8(&target.name)?,
+                JsString::try_from_utf8(self.names.name(target.name))?,
             )))?;
             self.emit_anonymous_set_name(definition, Instruction::SetName(name_constant))?;
         }
@@ -361,7 +363,8 @@ impl<'source> Parser<'source> {
         &self,
         target: &IdentifierReference,
     ) -> Result<(), Error> {
-        if self.current_ir().strict && matches!(target.name.as_str(), "eval" | "arguments") {
+        if self.current_ir().strict && matches!(self.names.name(target.name), "eval" | "arguments")
+        {
             return Err(self.syntax_here("invalid lvalue in strict mode"));
         }
         Ok(())
@@ -1079,10 +1082,10 @@ impl<'source> Parser<'source> {
         if self.is_punctuator(Punctuator::Dot) {
             let member_span = self.current().span;
             self.advance()?;
-            let token = self.current().clone();
+            let token = *self.current();
             let name = match token.kind {
                 TokenKind::PrivateIdentifier(identifier) => {
-                    let name = private_reference::private_binding_name(&identifier.value);
+                    let name = self.intern_private_identifier(&identifier);
                     self.advance()?;
                     let operation =
                         self.emit_private_field_get(name, token.span, source_offset(member_span)?)?;
@@ -1090,7 +1093,7 @@ impl<'source> Parser<'source> {
                     self.anonymous_function_definition = None;
                     return Ok(true);
                 }
-                TokenKind::Identifier(identifier) => identifier.value,
+                TokenKind::Identifier(identifier) => self.identifier_text(&identifier).into_owned(),
                 TokenKind::Keyword(keyword) => keyword.as_str().to_owned(),
                 _ => return Err(self.syntax_here("expecting field name")),
             };
@@ -1198,7 +1201,7 @@ impl<'source> Parser<'source> {
         };
         let object_environment = self.parser_scope_has_authored_with(function_id, *scope)?;
         let reference = IdentifierReference {
-            name: name.clone(),
+            name: *name,
             span: *span,
             scope: *scope,
             object_environment,
@@ -1212,7 +1215,7 @@ impl<'source> Parser<'source> {
                 ));
             };
             *op = IrOp::IdentifierReference {
-                name: reference.name.clone(),
+                name: reference.name,
                 span: reference.span,
                 scope: reference.scope,
                 access: reference_access,
@@ -1260,30 +1263,32 @@ impl<'source> Parser<'source> {
     pub(in crate::engine::compiler) fn take_direct_eval_scope(
         &mut self,
     ) -> Result<Option<ScopeId>, Error> {
-        let function = self.current_ir_mut();
-        if function.context.last_identifier_reference != function.ops.len().checked_sub(1) {
-            return Ok(None);
-        }
-        let Some(SpannedIrOp {
-            op:
-                IrOp::Identifier {
-                    name,
-                    scope,
-                    access: IdentifierAccess::Get,
-                    ..
-                },
-            ..
-        }) = function.ops.last()
-        else {
-            return Err(Error::internal(
-                "identifier Reference marker did not point to a getter",
-            ));
+        let (name, scope) = {
+            let function = self.current_ir_mut();
+            if function.context.last_identifier_reference != function.ops.len().checked_sub(1) {
+                return Ok(None);
+            }
+            let Some(SpannedIrOp {
+                op:
+                    IrOp::Identifier {
+                        name,
+                        scope,
+                        access: IdentifierAccess::Get,
+                        ..
+                    },
+                ..
+            }) = function.ops.last()
+            else {
+                return Err(Error::internal(
+                    "identifier Reference marker did not point to a getter",
+                ));
+            };
+            (*name, *scope)
         };
-        if name != "eval" {
+        if self.names.name(name) != "eval" {
             return Ok(None);
         }
-        let scope = *scope;
-        function.context.last_identifier_reference = None;
+        self.current_ir_mut().context.last_identifier_reference = None;
         Ok(Some(scope))
     }
 
@@ -1316,7 +1321,7 @@ impl<'source> Parser<'source> {
         };
         let object_environment = self.parser_scope_has_authored_with(function_id, *scope)?;
         let reference = IdentifierReference {
-            name: name.clone(),
+            name: *name,
             span: *span,
             scope: *scope,
             object_environment,
@@ -1330,7 +1335,7 @@ impl<'source> Parser<'source> {
                 ));
             };
             *op = IrOp::IdentifierReference {
-                name: reference.name.clone(),
+                name: reference.name,
                 span: reference.span,
                 scope: reference.scope,
                 access: IdentifierReferenceAccess::Prepare,
@@ -1479,7 +1484,7 @@ impl<'source> Parser<'source> {
                 *access = PrivateFieldAccess::GetKeepReceiver;
                 (
                     MemberReference::Private {
-                        name: name.clone(),
+                        name: *name,
                         span: *span,
                         scope: *scope,
                         site,

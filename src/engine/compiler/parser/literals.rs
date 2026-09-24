@@ -22,10 +22,10 @@ use crate::engine::compiler::parser::context::Parser;
 use crate::engine::compiler::parser::diagnostics::source_offset;
 use crate::engine::compiler::parser::diagnostics::source_span;
 use crate::engine::compiler::parser::diagnostics::strict_reserved_identifier;
-use crate::engine::compiler::parser::diagnostics::validate_identifier;
 use crate::engine::compiler::pseudo_binding::THIS_LOCAL_NAME;
 use crate::engine::value::JsString;
 use crate::engine::value::PrimitiveValue as Value;
+use std::borrow::Cow;
 use std::rc::Rc;
 
 impl<'source> Parser<'source> {
@@ -45,7 +45,7 @@ impl<'source> Parser<'source> {
         ) {
             self.relex_current_with_goal(LexicalGoal::RegExp)?;
         }
-        let token = self.current().clone();
+        let token = *self.current();
         self.anonymous_function_definition = None;
         match token.kind {
             TokenKind::Keyword(Keyword::Null) => {
@@ -69,7 +69,7 @@ impl<'source> Parser<'source> {
                     )
                 {
                     self.emit_identifier(
-                        THIS_LOCAL_NAME.to_owned(),
+                        self.pseudo_name(THIS_LOCAL_NAME),
                         token.span,
                         IdentifierAccess::Get,
                     )?;
@@ -102,7 +102,7 @@ impl<'source> Parser<'source> {
                     ));
                 }
                 self.advance()?;
-                self.emit_atom_string(JsString::try_from_utf16(string.value.utf16)?)?;
+                self.emit_atom_string(self.decode_string_literal(token.span)?)?;
             }
             TokenKind::Punctuator(Punctuator::LeftParen) => {
                 self.advance()?;
@@ -119,23 +119,21 @@ impl<'source> Parser<'source> {
                 self.parse_template_literal()?;
             }
             TokenKind::Identifier(ref identifier)
-                if identifier.value == "async"
-                    && !identifier.has_escape
-                    && self.async_function_ahead() =>
+                if self.is_unescaped_name(identifier, "async") && self.async_function_ahead() =>
             {
                 self.parse_function_expression()?;
             }
             TokenKind::Identifier(identifier) => {
-                self.reject_forbidden_identifier_reference(&identifier.value, token.span)?;
-                validate_identifier(
+                let name = self.intern_identifier(&identifier);
+                self.reject_forbidden_identifier_reference(self.names.name(name), token.span)?;
+                self.validate_identifier(
                     &identifier,
                     token.span,
                     self.current_ir().strict,
                     IdentifierContext::Reference,
                 )?;
                 self.advance()?;
-                let operation =
-                    self.emit_identifier(identifier.value, token.span, IdentifierAccess::Get)?;
+                let operation = self.emit_identifier(name, token.span, IdentifierAccess::Get)?;
                 self.current_ir_mut().context.last_identifier_reference = Some(operation);
             }
             TokenKind::Keyword(Keyword::Function) => {
@@ -409,7 +407,11 @@ use num_bigint::BigUint;
 pub(in crate::engine::compiler) fn parse_number(
     number: &crate::engine::compiler::lexer::NumberLiteral<'_>,
 ) -> Result<Value, String> {
-    let raw = number.raw.replace('_', "");
+    let raw = if number.raw.contains('_') {
+        Cow::Owned(number.raw.replace('_', ""))
+    } else {
+        Cow::Borrowed(number.raw)
+    };
     if let NumberKind::BigInt(radix) = number.kind {
         let literal = raw
             .strip_suffix('n')

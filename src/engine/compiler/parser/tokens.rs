@@ -1,5 +1,7 @@
 //! Token lookahead, lexical goals and diagnostic cursor.
 
+use std::borrow::Cow;
+
 use crate::engine::api::error::Error;
 use crate::engine::code::function::metadata::EvalKind;
 
@@ -8,16 +10,20 @@ use crate::engine::compiler::lexer::Keyword;
 use crate::engine::compiler::lexer::LexContext;
 use crate::engine::compiler::lexer::LexicalGoal;
 use crate::engine::compiler::lexer::Punctuator;
+use crate::engine::compiler::lexer::Span;
+use crate::engine::compiler::lexer::TemplatePart;
 use crate::engine::compiler::lexer::TemplatePartKind;
 use crate::engine::compiler::lexer::Token;
 use crate::engine::compiler::lexer::TokenKind;
 use crate::engine::compiler::lexer::quickjs_simple_lookahead_is_of;
 use crate::engine::compiler::model::ir::function::FunctionKind;
+use crate::engine::compiler::names::NameId;
 use crate::engine::compiler::parser::context::ForHeadDelimiter;
 use crate::engine::compiler::parser::context::ForIterationKind;
 use crate::engine::compiler::parser::context::Parser;
 use crate::engine::compiler::parser::diagnostics::lex_error;
 use crate::engine::compiler::pseudo_binding::NEW_TARGET_LOCAL_NAME;
+use crate::engine::value::JsString;
 
 use crate::engine::compiler::parser::diagnostics::source_span;
 
@@ -49,13 +55,134 @@ impl<'source> Parser<'source> {
         matches!(self.current().kind, TokenKind::Punctuator(current) if current == punctuator)
     }
 
+    /// Decoded identifier text, matching the retired `Identifier.value`.
+    /// Private identifiers exclude their leading `#`; escaped spellings decode
+    /// through a lexer clone so `source_text` carriers survive.
+    pub(in crate::engine::compiler) fn identifier_text(
+        &self,
+        identifier: &Identifier<'source>,
+    ) -> Cow<'source, str> {
+        let raw = identifier.raw.strip_prefix('#').unwrap_or(identifier.raw);
+        if !identifier.has_escape {
+            return Cow::Borrowed(raw);
+        }
+        Cow::Owned(self.lexer.decode_identifier_text(identifier.raw))
+    }
+
+    /// Intern an authored identifier's decoded text. A repeated spelling hits
+    /// the table without allocating; escaped spellings decode on this cold
+    /// path exactly like `identifier_text`.
+    pub(in crate::engine::compiler) fn intern_identifier(
+        &mut self,
+        identifier: &Identifier<'source>,
+    ) -> NameId {
+        let raw = identifier.raw.strip_prefix('#').unwrap_or(identifier.raw);
+        if !identifier.has_escape {
+            return self.names.intern(raw);
+        }
+        let decoded = self.lexer.decode_identifier_text(identifier.raw);
+        self.names.intern(&decoded)
+    }
+
+    /// Intern the `#name` binding-key spelling of a private identifier. The
+    /// decoded identifier body is interned separately by `intern_identifier`.
+    pub(in crate::engine::compiler) fn intern_private_identifier(
+        &mut self,
+        identifier: &Identifier<'source>,
+    ) -> NameId {
+        let mut binding = String::with_capacity(identifier.raw.len().saturating_add(1));
+        binding.push('#');
+        if identifier.has_escape {
+            binding.push_str(&self.lexer.decode_identifier_text(identifier.raw));
+        } else {
+            binding.push_str(identifier.raw.strip_prefix('#').unwrap_or(identifier.raw));
+        }
+        self.names.intern(&binding)
+    }
+
+    /// Intern one synthetic compiler name. The parser is the only caller.
+    pub(in crate::engine::compiler) fn intern_name(&mut self, name: &str) -> NameId {
+        self.names.intern(name)
+    }
+
+    /// Read back a name interned by the parser prologue. Shared synthetic
+    /// binding names are interned before parsing so hot emit sites never
+    /// allocate and never need a second mutable borrow of the parser.
+    pub(in crate::engine::compiler) fn pseudo_name(&self, name: &str) -> NameId {
+        self.names
+            .lookup(name)
+            .expect("synthetic binding name must be pre-interned")
+    }
+
+    /// Contextual-keyword comparison over decoded identifier text.
+    pub(in crate::engine::compiler) fn identical_name(
+        &self,
+        identifier: &Identifier<'source>,
+        expected: &str,
+    ) -> bool {
+        self.identifier_text(identifier) == expected
+    }
+
+    /// Comparison for sites that must reject escaped spellings, such as plain
+    /// contextual-keyword checks.
+    pub(in crate::engine::compiler) fn is_unescaped_name(
+        &self,
+        identifier: &Identifier<'source>,
+        expected: &str,
+    ) -> bool {
+        !identifier.has_escape && identifier.raw == expected
+    }
+
+    /// Cooked value of a committed string literal, re-derived through a lexer
+    /// clone so `source_text` carriers and the injected string limit survive.
+    pub(in crate::engine::compiler) fn decode_string_literal(
+        &self,
+        span: Span,
+    ) -> Result<JsString, Error> {
+        let value = self
+            .lexer
+            .decode_string_literal(span.start)
+            .map_err(lex_error)?;
+        Ok(JsString::try_from_utf16(value.utf16)?)
+    }
+
+    /// Raw value of a committed template part, re-derived through a lexer clone
+    /// so `source_text` carriers and the injected string limit survive.
+    pub(in crate::engine::compiler) fn decode_template_raw_value(
+        &self,
+        part: &TemplatePart<'source>,
+        span: Span,
+    ) -> Result<JsString, Error> {
+        let value = self
+            .lexer
+            .decode_template_raw_value(span.start, template_part_is_initial(part.kind))
+            .map_err(lex_error)?;
+        Ok(JsString::try_from_utf16(value.utf16)?)
+    }
+
+    /// Cooked value of a committed template part. `None` mirrors the retired
+    /// `TemplatePart.cooked`: a malformed escape has no cooked text.
+    pub(in crate::engine::compiler) fn decode_template_cooked(
+        &self,
+        part: &TemplatePart<'source>,
+        span: Span,
+    ) -> Result<Option<JsString>, Error> {
+        if part.invalid_escape.is_some() {
+            return Ok(None);
+        }
+        let value = self
+            .lexer
+            .decode_template_cooked_value(span.start, template_part_is_initial(part.kind))
+            .map_err(lex_error)?;
+        Ok(Some(JsString::try_from_utf16(value.utf16)?))
+    }
+
     /// `of` is a QuickJS pseudo-keyword: escapes prevent it from acting as
     /// the for-of delimiter even though the decoded identifier text matches.
     pub(in crate::engine::compiler) fn is_for_of_keyword(&self) -> bool {
         matches!(
             &self.current().kind,
-            TokenKind::Identifier(identifier)
-                if identifier.value == "of" && !identifier.has_escape
+            TokenKind::Identifier(identifier) if self.is_unescaped_name(identifier, "of")
         )
     }
 
@@ -104,7 +231,7 @@ impl<'source> Parser<'source> {
                 match &token.kind {
                     TokenKind::Keyword(Keyword::In) => return Some(ForIterationKind::In),
                     TokenKind::Identifier(identifier)
-                        if identifier.value == "of" && !identifier.has_escape =>
+                        if self.is_unescaped_name(identifier, "of") =>
                     {
                         return Some(ForIterationKind::Of);
                     }
@@ -289,7 +416,7 @@ impl<'source> Parser<'source> {
         let TokenKind::Identifier(identifier) = &self.current().kind else {
             return Ok(false);
         };
-        if identifier.value != "let" || identifier.has_escape {
+        if !self.is_unescaped_name(identifier, "let") {
             return Ok(false);
         }
 
@@ -324,7 +451,7 @@ impl<'source> Parser<'source> {
         if identifier.escaped_reserved_word {
             return None;
         }
-        let label_name = identifier.value.clone();
+        let label_name = self.identifier_text(identifier).into_owned();
         let mut lexer = self.lexer.clone();
         lexer.seek(self.current().span.end);
         let Ok(next) = lexer.next_token() else {
@@ -365,7 +492,7 @@ impl<'source> Parser<'source> {
         let TokenKind::Identifier(identifier) = &self.current().kind else {
             return false;
         };
-        if identifier.value != "async" || identifier.has_escape {
+        if !self.is_unescaped_name(identifier, "async") {
             return false;
         }
         let mut lexer = self.lexer.clone();
@@ -394,9 +521,14 @@ impl<'source> Parser<'source> {
                 | FunctionKind::Module
                 | FunctionKind::Eval(EvalKind::Indirect) => return false,
                 FunctionKind::Eval(EvalKind::Direct) => {
-                    return function
-                        .binding_from_scope(function.ir.var_scope, NEW_TARGET_LOCAL_NAME)
-                        .is_some();
+                    return self
+                        .names
+                        .lookup(NEW_TARGET_LOCAL_NAME)
+                        .is_some_and(|name| {
+                            function
+                                .binding_from_scope(function.ir.var_scope, name)
+                                .is_some()
+                        });
                 }
                 FunctionKind::Eval(EvalKind::None) => return false,
                 FunctionKind::Arrow => {
@@ -526,7 +658,6 @@ impl<'source> Parser<'source> {
         start: usize,
         inherited_strict: bool,
     ) -> Result<bool, Error> {
-        let use_strict = "use strict".encode_utf16().collect::<Vec<_>>();
         let position = self.tokens[start].span.start;
         let mut lexer = self.lexer.clone();
         lexer.seek(position);
@@ -539,7 +670,7 @@ impl<'source> Parser<'source> {
         loop {
             let candidate = match &token.kind {
                 TokenKind::String(literal) => {
-                    !literal.has_escape && literal.value.utf16 == use_strict
+                    !literal.has_escape && literal.raw[1..literal.raw.len() - 1] == *"use strict"
                 }
                 _ => return Ok(found_strict),
             };
@@ -577,6 +708,13 @@ impl<'source> Parser<'source> {
     ) -> Error {
         Error::unsupported(message, source_span(self.current().span))
     }
+}
+
+fn template_part_is_initial(kind: TemplatePartKind) -> bool {
+    matches!(
+        kind,
+        TemplatePartKind::NoSubstitution | TemplatePartKind::Head
+    )
 }
 
 pub(in crate::engine::compiler) fn quickjs_directive_asi_token(kind: &TokenKind<'_>) -> bool {
@@ -631,7 +769,7 @@ pub(in crate::engine::compiler) fn for_head_regexp_allowed_after(kind: &TokenKin
     if matches!(
         kind,
         TokenKind::Identifier(identifier)
-            if !identifier.has_escape && matches!(identifier.value.as_str(), "of" | "yield")
+            if !identifier.has_escape && matches!(identifier.raw, "of" | "yield")
     ) {
         return true;
     }

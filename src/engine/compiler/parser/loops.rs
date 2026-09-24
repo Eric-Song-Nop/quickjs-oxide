@@ -27,7 +27,6 @@ use crate::engine::compiler::parser::context::StatementPosition;
 use crate::engine::compiler::parser::diagnostics::IdentifierContext;
 use crate::engine::compiler::parser::diagnostics::source_offset;
 use crate::engine::compiler::parser::diagnostics::source_span;
-use crate::engine::compiler::parser::diagnostics::validate_identifier_reservation;
 use crate::engine::compiler::relocation::relocate_ir_fragment;
 
 impl<'source> Parser<'source> {
@@ -334,7 +333,7 @@ impl<'source> Parser<'source> {
                     .as_ref()
                     .ok_or_else(|| Error::internal("for-in var initializer lost its binding"))?;
                 self.emit_identifier_inherited(
-                    initializer.name.clone(),
+                    initializer.name,
                     initializer.span,
                     initializer.scope,
                     IdentifierAccess::Put,
@@ -505,32 +504,32 @@ impl<'source> Parser<'source> {
                     is_const,
                 );
             }
-            let token = self.current().clone();
+            let token = *self.current();
             let TokenKind::Identifier(identifier) = token.kind else {
                 return Err(self.syntax_here("variable name expected"));
             };
-            validate_identifier_reservation(
+            self.validate_identifier_reservation(
                 &identifier,
                 token.span,
                 self.current_ir().strict,
                 IdentifierContext::Variable,
             )?;
-            if identifier.value == "let" {
+            if self.identical_name(&identifier, "let") {
                 return Err(Error::syntax(
                     "'let' is not a valid lexical identifier",
                     source_span(token.span),
                 ));
             }
-            let name = identifier.value;
+            let name = self.intern_identifier(&identifier);
             let strict = self.current_ir().strict;
             self.advance()?;
-            if strict && matches!(name.as_str(), "eval" | "arguments") {
+            if strict && matches!(self.names.name(name), "eval" | "arguments") {
                 return Err(Error::syntax(
                     "invalid variable name in strict mode",
                     source_span(self.current().span),
                 ));
             }
-            self.register_lexical_binding(&name, token.span, self.current().span, is_const, false)?;
+            self.register_lexical_binding(name, token.span, self.current().span, is_const, false)?;
             self.emit_identifier_at(
                 name,
                 token.span,
@@ -563,28 +562,28 @@ impl<'source> Parser<'source> {
                     false,
                 );
             }
-            let token = self.current().clone();
+            let token = *self.current();
             let TokenKind::Identifier(identifier) = token.kind else {
                 return Err(self.syntax_here("variable name expected"));
             };
-            validate_identifier_reservation(
+            self.validate_identifier_reservation(
                 &identifier,
                 token.span,
                 self.current_ir().strict,
                 IdentifierContext::Variable,
             )?;
             let strict = self.current_ir().strict;
-            let name = identifier.value;
+            let name = self.intern_identifier(&identifier);
             self.advance()?;
-            if strict && matches!(name.as_str(), "eval" | "arguments") {
+            if strict && matches!(self.names.name(name), "eval" | "arguments") {
                 return Err(Error::syntax(
                     "invalid variable name in strict mode",
                     source_span(self.current().span),
                 ));
             }
-            self.register_var_binding(&name, token.span, self.current().span)?;
+            self.register_var_binding(name, token.span, self.current().span)?;
             let initializer = IdentifierReference {
-                name: name.clone(),
+                name,
                 span: token.span,
                 scope: self.current_ir().context.current_scope,
                 object_environment: false,
@@ -603,9 +602,7 @@ impl<'source> Parser<'source> {
         }
 
         let async_span = match &self.current().kind {
-            TokenKind::Identifier(identifier)
-                if identifier.value == "async" && !identifier.has_escape =>
-            {
+            TokenKind::Identifier(identifier) if self.is_unescaped_name(identifier, "async") => {
                 Some(self.current().span)
             }
             _ => None,

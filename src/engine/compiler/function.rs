@@ -1,7 +1,6 @@
 use crate::engine::compiler::parser::diagnostics::IdentifierContext;
 use crate::engine::compiler::parser::diagnostics::source_offset;
 use crate::engine::compiler::parser::diagnostics::source_span;
-use crate::engine::compiler::parser::diagnostics::validate_identifier;
 
 use crate::engine::api::error::Error;
 use crate::engine::code::bytecode::{DefineMethodKind, Instruction};
@@ -17,6 +16,7 @@ use crate::engine::compiler::model::ir::function::FunctionSourceInfo;
 use crate::engine::compiler::model::ir::function::ParentLink;
 use crate::engine::compiler::model::ir::function::SuperCapabilities;
 use crate::engine::compiler::model::ir::{FunctionId, IrConstant, IrOp, SpannedIrOp};
+use crate::engine::compiler::names::NameId;
 use crate::engine::compiler::parser::builder::FunctionBuilder;
 use crate::engine::compiler::parser::context::AnonymousFunctionDefinition;
 use crate::engine::compiler::parser::context::Parser;
@@ -26,7 +26,7 @@ use crate::source::SourceOffset;
 pub(super) struct ParsedFunctionDefinition {
     pub(super) constant: u32,
     pub(super) child: FunctionId,
-    pub(super) name: Option<(String, Span)>,
+    pub(super) name: Option<(NameId, Span)>,
 }
 
 pub(super) struct FunctionDefinitionHeader<'source> {
@@ -169,10 +169,15 @@ impl<'source> Parser<'source> {
         } else {
             BytecodeFunctionKind::Normal
         };
-        let name = match self.current().kind.clone() {
+        let name = match self.current().kind {
             TokenKind::Identifier(identifier) => {
                 let span = self.current().span;
-                validate_identifier(&identifier, span, false, IdentifierContext::FunctionName)?;
+                self.validate_identifier(
+                    &identifier,
+                    span,
+                    false,
+                    IdentifierContext::FunctionName,
+                )?;
                 self.advance()?;
                 Some((identifier, span))
             }
@@ -187,7 +192,6 @@ impl<'source> Parser<'source> {
                 let span = self.current().span;
                 let identifier = Identifier {
                     raw: "yield",
-                    value: "yield".to_owned(),
                     has_escape: false,
                     keyword_hint: Some(crate::engine::compiler::lexer::Keyword::Yield),
                     escaped_reserved_word: false,
@@ -206,7 +210,6 @@ impl<'source> Parser<'source> {
                 let span = self.current().span;
                 let identifier = Identifier {
                     raw: "await",
-                    value: "await".to_owned(),
                     has_escape: false,
                     keyword_hint: Some(crate::engine::compiler::lexer::Keyword::Await),
                     escaped_reserved_word: false,
@@ -242,7 +245,7 @@ impl<'source> Parser<'source> {
                 BytecodeFunctionKind::Generator | BytecodeFunctionKind::AsyncGenerator
             )
             && let Some((identifier, span)) = &header.name
-            && identifier.value == "yield"
+            && self.identical_name(identifier, "yield")
             && (!header.parent_context.generator
                 || header.parent_context.strict
                 || identifier.has_escape
@@ -262,7 +265,7 @@ impl<'source> Parser<'source> {
                 BytecodeFunctionKind::Async | BytecodeFunctionKind::AsyncGenerator
             )
             && let Some((identifier, span)) = &header.name
-            && identifier.value == "await"
+            && self.identical_name(identifier, "await")
             && (!header.parent_context.async_function
                 || header.parent_context.module
                 || identifier.has_escape
@@ -418,7 +421,7 @@ impl<'source> Parser<'source> {
         let parent_strict = self.functions[parent].strict;
         let function_name = function_name_token
             .as_ref()
-            .map(|(identifier, _)| identifier.value.clone());
+            .map(|(identifier, _)| self.intern_identifier(identifier));
         let child = self.functions.len();
         let parent_scope = self.functions[parent].context.current_scope;
         let super_capabilities = match options.kind {
@@ -459,6 +462,7 @@ impl<'source> Parser<'source> {
                 strict: parent_strict,
                 super_capabilities,
             },
+            &mut self.names,
         )?);
         self.functions[child].execution_kind = options.execution_kind;
         self.current_function = child;
@@ -550,13 +554,18 @@ impl<'source> Parser<'source> {
                     }
                     continue;
                 }
-                let token = self.current().clone();
+                let token = *self.current();
                 let TokenKind::Identifier(identifier) = token.kind else {
                     return Err(self.syntax_here("missing formal parameter"));
                 };
-                validate_identifier(&identifier, token.span, false, IdentifierContext::Argument)?;
-                parameter_tokens.push((identifier.clone(), token.span));
-                let parameter = identifier.value;
+                self.validate_identifier(
+                    &identifier,
+                    token.span,
+                    false,
+                    IdentifierContext::Argument,
+                )?;
+                parameter_tokens.push((identifier, token.span));
+                let parameter = self.intern_identifier(&identifier);
                 self.advance()?;
                 if is_rest {
                     self.register_rest_identifier_parameter(parameter, token.span)?;
@@ -620,7 +629,7 @@ impl<'source> Parser<'source> {
         if strict {
             let strict_validation_span = self.current().span;
             if let Some((identifier, _)) = &function_name_token {
-                validate_identifier(
+                self.validate_identifier(
                     identifier,
                     strict_validation_span,
                     true,
@@ -628,7 +637,7 @@ impl<'source> Parser<'source> {
                 )?;
             }
             for (identifier, _) in &parameter_tokens {
-                validate_identifier(
+                self.validate_identifier(
                     identifier,
                     strict_validation_span,
                     true,
@@ -649,7 +658,7 @@ impl<'source> Parser<'source> {
         }
         self.functions[child].strict = strict;
         if options.derived_class_constructor {
-            self.functions[child].allocate_derived_constructor_pseudo_bindings()?;
+            self.functions[child].allocate_derived_constructor_pseudo_bindings(&mut self.names)?;
         }
         if options.class_constructor {
             // Parameter parsing may replace the initial body scope with a
@@ -720,7 +729,8 @@ impl<'source> Parser<'source> {
         Ok(ParsedFunctionDefinition {
             constant,
             child,
-            name: function_name_token.map(|(identifier, span)| (identifier.value, span)),
+            name: function_name_token
+                .map(|(identifier, span)| (self.intern_identifier(&identifier), span)),
         })
     }
 }

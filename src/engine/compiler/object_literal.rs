@@ -1,7 +1,6 @@
 use crate::engine::compiler::parser::diagnostics::IdentifierContext;
 use crate::engine::compiler::parser::diagnostics::source_offset;
 use crate::engine::compiler::parser::diagnostics::source_span;
-use crate::engine::compiler::parser::diagnostics::validate_identifier;
 use crate::engine::compiler::parser::literals::parse_number;
 
 use crate::engine::api::error::Error;
@@ -93,17 +92,17 @@ impl<'source> Parser<'source> {
                     self.emit_instruction(Instruction::Drop)?;
                 }
             } else {
-                let token = self.current().clone();
+                let token = *self.current();
                 let mut shorthand = None;
                 let mut method_prefix = None;
                 let key = match token.kind {
                     TokenKind::Identifier(identifier) => {
-                        let name = identifier.value.clone();
+                        let name = self.identifier_text(&identifier).into_owned();
                         // IdentifierName accepts escaped reserved words as a
                         // property key, but QuickJS does not reinterpret that
                         // key as an IdentifierReference shorthand.
                         if !identifier.escaped_reserved_word {
-                            shorthand = Some(identifier.clone());
+                            shorthand = Some(identifier);
                         }
                         if !identifier.has_escape
                             && matches!(name.as_str(), "get" | "set" | "async")
@@ -125,7 +124,7 @@ impl<'source> Parser<'source> {
                             ));
                         }
                         self.advance()?;
-                        JsString::try_from_utf16(string.value.utf16)?
+                        self.decode_string_literal(token.span)?
                     }
                     TokenKind::Number(number) => {
                         if self.current_ir().strict
@@ -259,13 +258,14 @@ impl<'source> Parser<'source> {
                     // misses object shorthand and can capture an enclosing
                     // binding. Static-block `await` arrives as a keyword and
                     // therefore takes the grammar's `expecting ':'` branch.
-                    validate_identifier(
+                    self.validate_identifier(
                         &identifier,
                         token.span,
                         self.current_ir().strict,
                         IdentifierContext::Reference,
                     )?;
-                    self.emit_identifier(identifier.value, token.span, IdentifierAccess::Get)?;
+                    let name = self.intern_identifier(&identifier);
+                    self.emit_identifier(name, token.span, IdentifierAccess::Get)?;
                     let key_constant =
                         self.add_constant(IrConstant::Primitive(Value::String(key)))?;
                     self.emit_instruction(Instruction::DefineField(key_constant))?;
@@ -289,11 +289,11 @@ impl<'source> Parser<'source> {
     /// evaluates and canonicalizes a computed key before creating the accessor
     /// closure, so the typed stack retains that key until DefineMethodComputed.
     fn parse_object_method_property_name(&mut self) -> Result<ObjectMethodPropertyKey, Error> {
-        let token = self.current().clone();
+        let token = *self.current();
         let key = match token.kind {
             TokenKind::Identifier(identifier) => {
                 self.advance()?;
-                JsString::try_from_utf8(&identifier.value)?
+                JsString::try_from_utf8(&self.identifier_text(&identifier))?
             }
             TokenKind::Keyword(keyword) => {
                 self.advance()?;
@@ -307,7 +307,7 @@ impl<'source> Parser<'source> {
                     ));
                 }
                 self.advance()?;
-                JsString::try_from_utf16(string.value.utf16)?
+                self.decode_string_literal(token.span)?
             }
             TokenKind::Number(number) => {
                 if self.current_ir().strict

@@ -3,6 +3,10 @@ use super::*;
 #[test]
 fn string_constant_lookup_preserves_first_literal_and_append_ordinals() {
     let mut tree = Parser::parse("", JsString::from_static("<constant-index>")).unwrap();
+    let name = tree.names.intern("name");
+    let other = tree.names.intern("other");
+    let name_string = tree.names.js_string(name).unwrap();
+    let other_string = tree.names.js_string(other).unwrap();
     let function = &mut tree.functions[0];
     let start = function.constants.len() as u32;
     let literal = || {
@@ -12,13 +16,16 @@ fn string_constant_lookup_preserves_first_literal_and_append_ordinals() {
     };
     assert_eq!(function.append_constant(literal()).unwrap(), start);
     assert_eq!(function.append_constant(literal()).unwrap(), start + 1);
-    assert_eq!(ensure_string_constant(function, "name").unwrap(), start);
     assert_eq!(
-        ensure_string_constant(function, "other").unwrap(),
+        ensure_string_constant(function, name_string).unwrap(),
+        start
+    );
+    assert_eq!(
+        ensure_string_constant(function, other_string).unwrap(),
         start + 2
     );
     assert_eq!(
-        ensure_string_constant(function, "other").unwrap(),
+        ensure_string_constant(function, tree.names.js_string(other).unwrap()).unwrap(),
         start + 2
     );
     assert_eq!(function.constants.len(), start as usize + 3);
@@ -33,12 +40,18 @@ fn scope_name_lookup_selects_the_last_duplicate_parameter() {
     .unwrap();
     let function = &tree.functions[1];
     let scope = &function.scopes[function.var_scope.0];
-    let binding = scope.binding_named("value").unwrap();
+    let binding = scope
+        .binding_named(tree.names.lookup("value").unwrap())
+        .unwrap();
     assert_eq!(
         function.bindings[binding.0].storage,
         BindingStorage::Argument(1)
     );
-    assert!(scope.binding_named("missing").is_none());
+    assert!(
+        tree.names
+            .lookup("missing")
+            .is_none_or(|id| scope.binding_named(id).is_none())
+    );
 }
 
 #[test]
@@ -47,7 +60,7 @@ fn string_too_long_lex_error_maps_to_js_internal() {
     let error = lex_error(LexError {
         kind: LexErrorKind::StringTooLong,
         span: Span::new(position, position),
-        message: "string too long".to_owned(),
+        message: "string too long",
     });
 
     assert_eq!(error.kind(), ErrorKind::JsInternal);
@@ -86,7 +99,11 @@ fn parser_records_quickjs_scope_boundaries_and_child_definition_sites() {
     let parent_scope_kind = |name: &str| {
         let function = tree.functions[1..]
             .iter()
-            .find(|function| function.function_name.as_deref() == Some(name))
+            .find(|function| {
+                function
+                    .function_name
+                    .is_some_and(|id| tree.names.name(id) == name)
+            })
             .unwrap_or_else(|| panic!("missing parsed child {name}"));
         let scope = function
             .parent
@@ -117,7 +134,7 @@ fn var_bindings_keep_root_storage_and_first_declaration_scope() {
     let parameters = function
         .bindings
         .iter()
-        .filter(|binding| binding.name == "a")
+        .filter(|binding| tree.names.name(binding.name) == "a")
         .map(|binding| binding.storage)
         .collect::<Vec<_>>();
     assert_eq!(
@@ -127,7 +144,7 @@ fn var_bindings_keep_root_storage_and_first_declaration_scope() {
     let x = function
         .bindings
         .iter()
-        .find(|binding| binding.name == "x")
+        .find(|binding| tree.names.name(binding.name) == "x")
         .expect("function-scoped x binding");
     assert_eq!(x.storage_scope.0, 0);
     assert_eq!(x.declaration_scope.0, 2);
@@ -159,23 +176,24 @@ fn definition_scope_selects_same_named_sibling_bindings() {
     let right_scope = tree.functions[2].parent.unwrap().definition_scope;
     assert_ne!(left_scope, right_scope);
 
+    let shadow = tree.names.intern("shadow");
     let root = &mut tree.functions[0];
     let left_local = u16::try_from(root.locals.len()).unwrap();
-    root.locals.push("shadow".to_owned());
+    root.locals.push(shadow);
     root.add_binding(
         left_scope,
         left_scope,
-        "shadow".to_owned(),
+        shadow,
         BindingStorage::Local(left_local),
         BindingKind::Normal,
         None,
     );
     let right_local = u16::try_from(root.locals.len()).unwrap();
-    root.locals.push("shadow".to_owned());
+    root.locals.push(shadow);
     root.add_binding(
         right_scope,
         right_scope,
-        "shadow".to_owned(),
+        shadow,
         BindingStorage::Local(right_local),
         BindingKind::Normal,
         None,
@@ -203,13 +221,14 @@ fn ancestor_lookup_uses_each_function_definition_scope() {
         ScopeKind::FunctionBody
     );
 
+    let shadow = tree.names.intern("shadow");
     let root = &mut tree.functions[0];
     let local = u16::try_from(root.locals.len()).unwrap();
-    root.locals.push("shadow".to_owned());
+    root.locals.push(shadow);
     root.add_binding(
         middle_definition_scope,
         middle_definition_scope,
-        "shadow".to_owned(),
+        shadow,
         BindingStorage::Local(local),
         BindingKind::Normal,
         None,
@@ -265,7 +284,11 @@ fn resolver_uses_source_order_dfs_postorder_for_sibling_relays() {
     let function_id = |name: &str| {
         tree.functions
             .iter()
-            .position(|function| function.function_name.as_deref() == Some(name))
+            .position(|function| {
+                function
+                    .function_name
+                    .is_some_and(|id| tree.names.name(id) == name)
+            })
             .unwrap_or_else(|| panic!("missing parsed function {name}"))
     };
     let middle = function_id("middle");
@@ -295,6 +318,7 @@ fn resolver_uses_source_order_dfs_postorder_for_sibling_relays() {
 #[test]
 fn closure_slots_deduplicate_by_storage_identity_and_reject_metadata_conflicts() {
     let span = Span::new(Position::new(0, 1, 1), Position::new(0, 1, 1));
+    let mut names = NameTable::new();
     let mut function = FunctionIr::new(
         None,
         FunctionKind::Ordinary,
@@ -315,6 +339,7 @@ fn closure_slots_deduplicate_by_storage_identity_and_reject_metadata_conflicts()
             strict: false,
             super_capabilities: SuperCapabilities::NONE,
         },
+        &mut names,
     )
     .unwrap();
     let local = ClosureVariable {

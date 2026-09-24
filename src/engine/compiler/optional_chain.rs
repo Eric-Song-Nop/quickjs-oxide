@@ -17,7 +17,6 @@ use crate::engine::compiler::model::ir::SpannedIrOp;
 use crate::engine::compiler::parser::builder::FunctionBuilder;
 use crate::engine::compiler::parser::context::Parser;
 use crate::engine::compiler::parser::diagnostics::source_offset;
-use crate::engine::compiler::private_reference;
 use crate::engine::value::JsString;
 use crate::engine::value::PrimitiveValue as Value;
 
@@ -93,10 +92,10 @@ impl<'source> Parser<'source> {
             return Ok(());
         }
 
-        let token = self.current().clone();
+        let token = *self.current();
         let name = match token.kind {
             TokenKind::PrivateIdentifier(identifier) => {
-                let name = private_reference::private_binding_name(&identifier.value);
+                let name = self.intern_private_identifier(&identifier);
                 self.advance()?;
                 let operation =
                     self.emit_private_field_get(name, token.span, source_offset(member_span)?)?;
@@ -104,7 +103,7 @@ impl<'source> Parser<'source> {
                 self.anonymous_function_definition = None;
                 return Ok(());
             }
-            TokenKind::Identifier(identifier) => identifier.value,
+            TokenKind::Identifier(identifier) => self.identifier_text(&identifier).into_owned(),
             TokenKind::Keyword(keyword) => keyword.as_str().to_owned(),
             _ => return Err(self.syntax_here("expecting field name")),
         };
