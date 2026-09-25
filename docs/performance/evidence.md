@@ -136,6 +136,19 @@ B1 的解码、二次分类和 C 单槽 TOS 的准入／spill 负结果保留在
 
 B2.2 的旧上界实验只把 `prop_read` 从 752→632 指令／轮（约 1.19 倍工作量改善）；可上线校验保留后的 90–100 指令回收是旧估计，不是实现结果。outlined handler 25–45% cycles 自时间不意味着全部可删除。更早的 V8 对 QuickJS 17.1×／16.6× 差距见 [全量重测历史](../reports/s3-full-rerun-results.md)，不是当前 R0 成绩。
 
+## E46. 本次补全：静态设计证据，不是新增性能测量
+
+对 PR #6 head `6f09205c51f8b34e3c7a90ce406739fe1dd07c48` 的源代码重新核对，得到四项会直接影响实施的约束：
+
+1. `FusionPlan::update` 通过 bit16 识别旧更新跨度，新 flags 必须避免误识别；v1 固定使用 1–13。
+2. `lower_update_expression` 的 postfix 是 PostInc/PostDec + Put，prefix 是 Inc/Dec + Set；索引更新必须暂存到唯一提交点，miss 不能预先修改绑定。
+3. computed assignment 包含 Insert3/PutArrayEl；写跨度要保住原栈契约、尾部 Drop 和 run 的 property_generation 更新，不能仅写 heap 后跳 PC。
+4. 数组 canonical 叶仍做 release-readiness 与可变 Runtime 借用；新 Number-only 读明确使用短期共享借用，不能把通用事务包进新 API。
+
+[冻结规格](numeric-array-spans.md) §8 给出固定源码链接；13 种序列及栈代数来自这些规则。对 pin 上游源码另核对：project 实际使用 `u[++nextValue]` 等前缀更新，advect 的原顺序是 `d0[i0 + row1]`，不能以等价手写表达式冒充原始程序。
+
+本次没有 cargo/rustc，没有取得真实函数 PC/slot 编号或动态覆盖；随附的 [捕获入口](probes/run_dump.py) 和 [test-only 探针](probes/dump_numeric_spans.rs) 是新增诊断源码，不是已跑成功的 receipt。完整函数发布后的 dump、生产 matcher manifest、Rust 编译和每片 A/B 仍须执行，不填造静态站点数或加速数字。
+
 ## 来源
 
 [E41]: https://github.com/pocket-nexus/quickjs-oxide/issues/41#issuecomment-5826405666
