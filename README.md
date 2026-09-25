@@ -62,6 +62,7 @@ the engine does not read or write upstream BC5 images; the previous narrow
 - [Engine module responsibilities](docs/architecture.md)
 - [Current implementation status](docs/status.md)
 - [Primitive VM: final architecture and results](docs/primitive-vm.md)
+- [Safe Rust performance roadmap, evidence and regression gates](docs/performance/README.md)
 - [Profiling and external benchmarks](docs/profiling.md)
 - [Compiler front-end baseline and profiling](docs/compile-benchmark.md)
 - [Lexer/parser front-end refactor plan](docs/lexer-parser-refactor.md)
